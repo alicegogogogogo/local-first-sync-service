@@ -16,6 +16,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// ErrStaleCursor reports that a merge targets a base cursor for an unknown
+// document, or a base cursor greater than the document's current cursor. The
+// caller maps it to 400; nothing is written.
+var ErrStaleCursor = errors.New("baseCursor is unknown or ahead of the current cursor")
+
 // Change is one element of an inbound batch or one row of a listing.
 type Change struct {
 	ID       string          // client-supplied change id, unique per document
@@ -36,6 +41,15 @@ type ListedChange struct {
 	DeviceID string          `json:"deviceId"`
 	Payload  json.RawMessage `json:"payload"`
 	Cursor   int64           `json:"cursor"`
+}
+
+// MergeResult reports the outcome of an accepted MergeChange. Outcome is one
+// of "idempotent", "applied" or "merged".
+type MergeResult struct {
+	ID      string  `json:"id"`
+	Outcome string  `json:"outcome"`
+	Cursor  int64   `json:"cursor"`
+	Result  *Result `json:"result,omitempty"`
 }
 
 // ErrConflict reports that a batch references an existing change id with a
@@ -171,6 +185,155 @@ func (s *Store) PostChanges(documentID string, changes []Change) ([]Result, erro
 		return nil, err
 	}
 	return results, nil
+}
+
+// MergeChange validates and appends one change against a caller-observed base
+// cursor, all within a single serialized transaction.
+//
+//   - An existing id is idempotent only when deviceId and the decoded payload
+//     match (Outcome "idempotent", with the original Result); a mismatch is an
+//     *ErrConflict and nothing is written.
+//   - A new id with baseCursor equal to the current cursor is appended as
+//     "applied".
+//   - A new id with a base cursor behind the current one is appended as
+//     "merged" only when every change after baseCursor carries a JSON object
+//     payload whose top-level keys are disjoint from the new payload's; any
+//     non-object later payload or shared key is an *ErrConflict.
+//
+// A non-zero baseCursor for an unknown document, or a baseCursor greater than
+// the current cursor, returns ErrStaleCursor. An unknown document with
+// baseCursor 0 accepts the first change as "applied".
+func (s *Store) MergeChange(documentID string, baseCursor int64, c Change) (MergeResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return MergeResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Current cursor is the document's high-water mark, 0 when unknown.
+	var current int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&current); err != nil {
+		return MergeResult{}, err
+	}
+	if baseCursor > current || (baseCursor != 0 && current == 0) {
+		return MergeResult{}, ErrStaleCursor
+	}
+
+	// An existing id keeps the original idempotency/conflict rules.
+	var existingDevice string
+	var existingPayload []byte
+	var existingCursor int64
+	err = tx.QueryRow(
+		`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+		documentID, c.ID,
+	).Scan(&existingCursor, &existingDevice, &existingPayload)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// New id; fall through to append logic below.
+	case err != nil:
+		return MergeResult{}, err
+	default:
+		if existingDevice != c.DeviceID || !jsonEqual(existingPayload, c.Payload) {
+			return MergeResult{}, &ErrConflict{ID: c.ID}
+		}
+		return MergeResult{
+			ID:      c.ID,
+			Outcome: "idempotent",
+			Cursor:  existingCursor,
+			Result: &Result{
+				ID:      c.ID,
+				Created: false,
+				Cursor:  existingCursor,
+			},
+		}, nil
+	}
+
+	outcome := "applied"
+	if baseCursor < current {
+		// Merge is allowed only when every change after baseCursor is a JSON
+		// object whose top-level keys do not collide with the new payload's.
+		newKeys, err := objectKeys(c.Payload)
+		if err != nil {
+			if errors.Is(err, errNotObject) {
+				return MergeResult{}, &ErrConflict{ID: c.ID}
+			}
+			return MergeResult{}, err
+		}
+		rows, err := tx.Query(
+			`SELECT payload FROM changes
+			 WHERE document_id = ? AND cursor > ?
+			 ORDER BY cursor ASC`,
+			documentID, baseCursor,
+		)
+		if err != nil {
+			return MergeResult{}, err
+		}
+		for rows.Next() {
+			var laterPayload []byte
+			if err := rows.Scan(&laterPayload); err != nil {
+				_ = rows.Close()
+				return MergeResult{}, err
+			}
+			laterKeys, err := objectKeys(laterPayload)
+			if err != nil {
+				_ = rows.Close()
+				if errors.Is(err, errNotObject) {
+					return MergeResult{}, &ErrConflict{ID: c.ID}
+				}
+				return MergeResult{}, err
+			}
+			for k := range newKeys {
+				if _, clash := laterKeys[k]; clash {
+					_ = rows.Close()
+					return MergeResult{}, &ErrConflict{ID: c.ID}
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return MergeResult{}, err
+		}
+		_ = rows.Close()
+		outcome = "merged"
+	}
+
+	next := current + 1
+	if _, err := tx.Exec(
+		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
+		documentID, next, c.ID, c.DeviceID, []byte(c.Payload),
+	); err != nil {
+		return MergeResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return MergeResult{}, err
+	}
+	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, nil
+}
+
+// errNotObject marks a payload that is not a JSON object.
+var errNotObject = errors.New("payload is not a JSON object")
+
+// objectKeys returns the top-level keys of a JSON object payload. A null,
+// array or scalar payload yields errNotObject.
+func objectKeys(raw json.RawMessage) (map[string]struct{}, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		// Valid JSON that is not an object (array, scalar, null) decodes with
+		// a type error into a map; treat it and malformed JSON as non-object.
+		return nil, errNotObject
+	}
+	if m == nil {
+		return nil, errNotObject
+	}
+	keys := make(map[string]struct{}, len(m))
+	for k := range m {
+		keys[k] = struct{}{}
+	}
+	return keys, nil
 }
 
 // ListChanges returns at most limit changes for documentID whose cursor is

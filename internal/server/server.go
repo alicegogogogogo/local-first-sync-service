@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
@@ -31,6 +32,17 @@ type postRequest struct {
 	Changes  []changeIn `json:"changes"`
 }
 
+type mergeChangeIn struct {
+	ID      string          `json:"id"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type mergeRequest struct {
+	DeviceID   string          `json:"deviceId"`
+	BaseCursor json.RawMessage `json:"baseCursor"`
+	Change     *mergeChangeIn  `json:"change"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
@@ -45,8 +57,28 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleListChanges(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
+		handleMergeChange(s, w, r)
+	})
 
-	return mux
+	// ServeMux treats the empty document segment in /v1/documents//... as an
+	// unclean path and answers with a 307 HTML redirect (a 404 in a real
+	// client). The API contract is a 400 JSON error, so intercept those paths
+	// before the mux sees them.
+	return emptyIDGuard(mux)
+}
+
+// emptyIDGuard rejects requests whose documentID path segment is empty with a
+// 400 JSON error instead of letting ServeMux emit its HTML redirect.
+func emptyIDGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if strings.HasPrefix(p, "/v1/documents//") {
+			writeError(w, http.StatusBadRequest, "documentID must be a non-empty string")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use
@@ -121,6 +153,109 @@ func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func handleMergeChange(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req mergeRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return
+	}
+
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+	// baseCursor must be present and a non-negative integer (no fractions,
+	// strings, booleans or null).
+	if len(req.BaseCursor) == 0 {
+		writeError(w, http.StatusBadRequest, "baseCursor must be a non-negative integer")
+		return
+	}
+	baseCursor, ok := parseNonNegativeInt(req.BaseCursor)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "baseCursor must be a non-negative integer")
+		return
+	}
+	if req.Change == nil {
+		writeError(w, http.StatusBadRequest, "change must be an object")
+		return
+	}
+	if req.Change.ID == "" {
+		writeError(w, http.StatusBadRequest, "change.id must be a non-empty string")
+		return
+	}
+	if len(req.Change.Payload) == 0 || !isJSONObject(req.Change.Payload) {
+		writeError(w, http.StatusBadRequest, "change.payload must be a JSON object")
+		return
+	}
+
+	result, err := s.MergeChange(documentID, baseCursor, store.Change{
+		ID:       req.Change.ID,
+		DeviceID: req.DeviceID,
+		Payload:  req.Change.Payload,
+	})
+	if err != nil {
+		var conflict *store.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrStaleCursor):
+			writeError(w, http.StatusBadRequest, "baseCursor is unknown or greater than the current cursor")
+			return
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "merge conflicts with existing changes: "+conflict.ID)
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to merge change")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// parseNonNegativeInt reports whether raw is a JSON integer >= 0. Floats,
+// strings, booleans, null and negative numbers are rejected.
+func parseNonNegativeInt(raw json.RawMessage) (int64, bool) {
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil || n < 0 {
+		return 0, false
+	}
+	// Guard against values like 1.0 that Unmarshal into int64 on some inputs;
+	// require the literal to contain no fraction or exponent.
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed[0] == '-' {
+		return 0, false
+	}
+	for _, c := range trimmed {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+// isJSONObject reports whether raw decodes to a JSON object (not null, an
+// array or a scalar).
+func isJSONObject(raw json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
+		return false
+	}
+	return true
 }
 
 func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {

@@ -309,3 +309,216 @@ func TestConcurrentBatchesNoDuplicateCursors(t *testing.T) {
 		t.Fatalf("stored rows = %d, want %d", len(rows), goroutines*perBatch)
 	}
 }
+
+func TestMergeAppliedAtCurrentCursor(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	// Unknown document, baseCursor 0 -> applied at cursor 1.
+	r, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Outcome != "applied" || r.Cursor != 1 || r.Result != nil {
+		t.Fatalf("first merge = %+v", r)
+	}
+
+	// baseCursor == current -> applied.
+	r, err = s.MergeChange("doc", 1, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Outcome != "applied" || r.Cursor != 2 {
+		t.Fatalf("second merge = %+v", r)
+	}
+}
+
+func TestMergeUnknownDocRejectsNonZeroBase(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	_, err := s.MergeChange("ghost", 1, Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
+	if !errors.Is(err, ErrStaleCursor) {
+		t.Fatalf("want ErrStaleCursor, got %v", err)
+	}
+
+	// baseCursor ahead of the current cursor is also 400-class.
+	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeChange("doc", 5, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); !errors.Is(err, ErrStaleCursor) {
+		t.Fatalf("ahead cursor want ErrStaleCursor, got %v", err)
+	}
+}
+
+func TestMergeIdempotentExisting(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Repost identical id/payload/device, even with a stale base, is
+	// idempotent and returns the original result.
+	r, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{ "a": 1 }`)})
+	if err != nil {
+		t.Fatalf("idempotent merge: %v", err)
+	}
+	if r.Outcome != "idempotent" || r.Cursor != 1 || r.Result == nil {
+		t.Fatalf("merge result = %+v", r)
+	}
+	if r.Result.ID != "c1" || r.Result.Created || r.Result.Cursor != 1 {
+		t.Fatalf("embedded result = %+v", r.Result)
+	}
+
+	rows, next, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 1 || next != 1 {
+		t.Fatalf("idempotent merge wrote a row: %+v next=%d", rows, next)
+	}
+
+	// Mismatched payload -> conflict, zero write.
+	if _, err := s.MergeChange("doc", 1, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":2}`)}); !errors.As(err, new(*ErrConflict)) {
+		t.Fatalf("payload mismatch want conflict, got %v", err)
+	}
+	// Mismatched device -> conflict.
+	if _, err := s.MergeChange("doc", 1, Change{ID: "c1", DeviceID: "other", Payload: json.RawMessage(`{"a":1}`)}); !errors.As(err, new(*ErrConflict)) {
+		t.Fatalf("device mismatch want conflict, got %v", err)
+	}
+}
+
+func TestMergeBehindDisjointObjects(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	// cursor 1: {"a":1}, cursor 2: {"b":2}
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "a", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+		{ID: "b", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client saw baseCursor 1 (only "a"); new payload {"c":3} shares no
+	// top-level keys with the later {"b":2} -> merged at cursor 3.
+	r, err := s.MergeChange("doc", 1, Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if r.Outcome != "merged" || r.Cursor != 3 {
+		t.Fatalf("merge result = %+v", r)
+	}
+}
+
+func TestMergeBehindConflicts(t *testing.T) {
+	// Later change reuses a top-level key -> 409, zero write.
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "a", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+		{ID: "b", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeChange("doc", 0, Change{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"b":9}`)}); !errors.As(err, new(*ErrConflict)) {
+		t.Fatalf("key clash want conflict, got %v", err)
+	}
+	rows, next, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("conflict merge wrote a row: %+v next=%d", rows, next)
+	}
+
+	// A disjoint-object merge against the same doc is allowed (cursor 3),
+	// proving the earlier 409 was specifically about the key clash.
+	if r, err := s.MergeChange("doc", 0, Change{ID: "y", DeviceID: "dev", Payload: json.RawMessage(`{"z":3}`)}); err != nil || r.Outcome != "merged" || r.Cursor != 3 {
+		t.Fatalf("disjoint merge = %+v err=%v", r, err)
+	}
+
+	// Seed a non-object later payload in a fresh doc to prove the rule.
+	s2, _ := Open("")
+	defer func() { _ = s2.Close() }()
+	if _, err := s2.PostChanges("d2", []Change{
+		{ID: "arr", DeviceID: "dev", Payload: json.RawMessage(`[1,2,3]`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.MergeChange("d2", 0, Change{ID: "o", DeviceID: "dev", Payload: json.RawMessage(`{"k":1}`)}); !errors.As(err, new(*ErrConflict)) {
+		t.Fatalf("array later want conflict, got %v", err)
+	}
+}
+
+func TestMergeConcurrentSerialization(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	// Seed current cursor so most merges race on the same high-water mark.
+	if _, err := s.MergeChange("doc", 0, Change{ID: "seed", DeviceID: "dev", Payload: json.RawMessage(`{"seed":0}`)}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 30
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Every client observed cursor 1; payloads have disjoint keys.
+			_, err := s.MergeChange("doc", 1, Change{
+				ID:       fmt.Sprintf("m%d", i),
+				DeviceID: "dev",
+				Payload:  json.RawMessage(fmt.Sprintf(`{"k%d":%d}`, i, i)),
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	rows, next, err := s.ListChanges("doc", 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != n+1 || next != n+1 {
+		t.Fatalf("rows=%d next=%d want %d/%d", len(rows), next, n+1, n+1)
+	}
+}
+
+func TestMergePersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeChange("doc", 1, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	rows, next, err := s2.ListChanges("doc", 0, 100)
+	if err != nil || len(rows) != 2 || next != 2 {
+		t.Fatalf("after reopen rows=%+v next=%d err=%v", rows, next, err)
+	}
+
+	// A merge that was valid before restart still appends at the right cursor.
+	r, err := s2.MergeChange("doc", 2, Change{ID: "c3", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
+	if err != nil || r.Outcome != "applied" || r.Cursor != 3 {
+		t.Fatalf("post-restart merge = %+v err=%v", r, err)
+	}
+}
