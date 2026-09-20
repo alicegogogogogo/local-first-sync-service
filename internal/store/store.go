@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,6 +29,61 @@ type Result struct {
 	ID      string `json:"id"`
 	Created bool   `json:"created"`
 	Cursor  int64  `json:"cursor"`
+}
+
+// MergeOutcome is the result of a single MergeChange attempt.
+type MergeOutcome string
+
+const (
+	// MergeApplied means the change was appended at the current cursor because
+	// baseCursor equalled the document high-water mark.
+	MergeApplied MergeOutcome = "applied"
+	// MergeMerged means the change was appended even though baseCursor lagged,
+	// because every intervening payload was a JSON object with no top-level
+	// key colliding with the new payload.
+	MergeMerged MergeOutcome = "merged"
+	// MergeIdempotent means the id already existed with matching deviceId and
+	// payload; nothing was written and the original result is returned.
+	MergeIdempotent MergeOutcome = "idempotent"
+)
+
+// MergeResult reports the outcome of a MergeChange call.
+type MergeResult struct {
+	ID      string       `json:"id"`
+	Outcome MergeOutcome `json:"outcome"`
+	// Result carries the original result for an idempotent replay. It is nil
+	// for applied/merged outcomes.
+	Result *Result `json:"result,omitempty"`
+	// Cursor is the cursor of the newly appended change for applied/merged
+	// outcomes, or the original cursor for an idempotent replay.
+	Cursor int64 `json:"cursor"`
+}
+
+// ErrMergeConflict reports that a merge was rejected: either an existing
+// change id carried a different deviceId or payload, or a lagging baseCursor
+// could not be merged because an intervening change's payload was not a JSON
+// object or shared a top-level key with the new payload. Nothing is written.
+type ErrMergeConflict struct {
+	ID     string
+	Reason string
+}
+
+func (e *ErrMergeConflict) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("merge conflict for change %q", e.ID)
+	}
+	return fmt.Sprintf("merge conflict for change %q: %s", e.ID, e.Reason)
+}
+
+// ErrInvalidCursor reports that baseCursor does not name a usable merge base:
+// it is larger than the document's current cursor.
+type ErrInvalidCursor struct {
+	BaseCursor    int64
+	CurrentCursor int64
+}
+
+func (e *ErrInvalidCursor) Error() string {
+	return fmt.Sprintf("baseCursor %d is greater than current cursor %d", e.BaseCursor, e.CurrentCursor)
 }
 
 // ListedChange is one row in a ListChanges response.
@@ -173,6 +229,134 @@ func (s *Store) PostChanges(documentID string, changes []Change) ([]Result, erro
 	return results, nil
 }
 
+// MergeChange validates and appends one change under cursor-based merge
+// semantics, all within a single serialized write transaction.
+//
+// The caller guarantees deviceID and id are non-empty and change.Payload is a
+// JSON object; baseCursor is non-negative. Within the transaction:
+//
+//   - If the document is unknown, only baseCursor 0 is valid (a non-zero
+//     baseCursor yields *ErrInvalidCursor). Otherwise baseCursor must not be
+//     greater than the document's current high-water cursor.
+//   - An existing id follows the original idempotency rule: matching
+//     deviceId and semantically equal payload returns MergeIdempotent with the
+//     original result; a mismatch yields *ErrMergeConflict.
+//   - A new id with baseCursor == current cursor is appended (MergeApplied).
+//   - A new id with baseCursor < current cursor is appended only when every
+//     intervening change (cursor > baseCursor) carries a JSON object payload
+//     whose top-level keys are disjoint from the new payload's keys
+//     (MergeMerged); otherwise *ErrMergeConflict is returned.
+//
+// On any error nothing is written. Concurrent callers serialize on the
+// immediate write transaction, so the cursor and key checks can never be
+// bypassed by a racing commit.
+func (s *Store) MergeChange(documentID, deviceID string, baseCursor int64, change Change) (*MergeResult, error) {
+	if baseCursor < 0 {
+		return nil, &ErrInvalidCursor{BaseCursor: baseCursor}
+	}
+	newFields, ok := JSONObject(change.Payload)
+	if !ok {
+		return nil, fmt.Errorf("merge payload must be a JSON object")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Resolve the document high-water mark and whether the document exists.
+	var current int64
+	var knownCount int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0), COUNT(*) FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&current, &knownCount); err != nil {
+		return nil, err
+	}
+	known := knownCount > 0
+	if (!known && baseCursor > 0) || baseCursor > current {
+		return nil, &ErrInvalidCursor{BaseCursor: baseCursor, CurrentCursor: current}
+	}
+
+	// An existing id keeps the original idempotency/conflict semantics.
+	var existingDevice string
+	var existingPayload []byte
+	var existingCursor int64
+	err = tx.QueryRow(
+		`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+		documentID, change.ID,
+	).Scan(&existingCursor, &existingDevice, &existingPayload)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// New id: fall through to the append checks.
+	case err != nil:
+		return nil, err
+	default:
+		if existingDevice != deviceID || !jsonEqual(existingPayload, change.Payload) {
+			return nil, &ErrMergeConflict{ID: change.ID, Reason: "existing change has different deviceId or payload"}
+		}
+		original := &Result{ID: change.ID, Created: false, Cursor: existingCursor}
+		return &MergeResult{ID: change.ID, Outcome: MergeIdempotent, Result: original, Cursor: existingCursor}, nil
+	}
+
+	outcome := MergeApplied
+	if baseCursor < current {
+		// Inspect every change committed after the client's base. All must be
+		// JSON objects, and none may share a top-level key with the new
+		// payload.
+		rows, err := tx.Query(
+			`SELECT id, payload FROM changes
+			 WHERE document_id = ? AND cursor > ?
+			 ORDER BY cursor ASC`,
+			documentID, baseCursor,
+		)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var interveningID string
+			var interveningPayload []byte
+			if err := rows.Scan(&interveningID, &interveningPayload); err != nil {
+				return nil, err
+			}
+			fields, isObject := JSONObject(interveningPayload)
+			if !isObject {
+				return nil, &ErrMergeConflict{
+					ID:     change.ID,
+					Reason: "intervening change " + interveningID + " payload is not a JSON object",
+				}
+			}
+			for k := range newFields {
+				if _, collision := fields[k]; collision {
+					return nil, &ErrMergeConflict{
+						ID:     change.ID,
+						Reason: "top-level field " + strconv.Quote(k) + " already modified by intervening change " + interveningID,
+					}
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		outcome = MergeMerged
+	}
+
+	nextCursor := current + 1
+	if _, err := tx.Exec(
+		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
+		documentID, nextCursor, change.ID, deviceID, []byte(change.Payload),
+	); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &MergeResult{ID: change.ID, Outcome: outcome, Cursor: nextCursor}, nil
+}
+
 // ListChanges returns at most limit changes for documentID whose cursor is
 // greater than after, in cursor order, together with the cursor to pass as
 // the next after value. An unknown document yields an empty list and cursor 0;
@@ -219,6 +403,22 @@ func (s *Store) ListChanges(documentID string, after, limit int64) ([]ListedChan
 		}
 	}
 	return out, maxCursor, nil
+}
+
+// JSONObject decodes payload and reports the top-level keys when it is a JSON
+// object, or ok=false for any other JSON value (array, scalar, null).
+func JSONObject(payload json.RawMessage) (keys map[string]struct{}, ok bool) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil || m == nil {
+		// m == nil rejects a JSON null (which decodes without error but leaves
+		// the map nil); arrays and scalars fail the type check.
+		return nil, false
+	}
+	keys = make(map[string]struct{}, len(m))
+	for k := range m {
+		keys[k] = struct{}{}
+	}
+	return keys, true
 }
 
 // jsonEqual reports whether two payloads are equal after JSON decoding, so

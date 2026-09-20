@@ -18,6 +18,325 @@ func changes(ids ...string) []Change {
 	return out
 }
 
+func mergeChange(id, device string, payload string) Change {
+	return Change{ID: id, DeviceID: device, Payload: json.RawMessage(payload)}
+}
+
+func TestMergeAppliedNewDocument(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	res, err := s.MergeChange("doc", "dev", 0, mergeChange("c1", "dev", `{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != MergeApplied || res.Cursor != 1 || res.Result != nil {
+		t.Fatalf("result = %+v", res)
+	}
+
+	// Base at the current high-water mark applies again.
+	res, err = s.MergeChange("doc", "dev", 1, mergeChange("c2", "dev", `{"b":2}`))
+	if err != nil || res.Outcome != MergeApplied || res.Cursor != 2 {
+		t.Fatalf("at-head result = %+v err=%v", res, err)
+	}
+}
+
+func TestMergeUnknownDocumentRejectsNonZeroBase(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	_, err := s.MergeChange("ghost", "dev", 1, mergeChange("c1", "dev", `{"a":1}`))
+	var bad *ErrInvalidCursor
+	if !errors.As(err, &bad) || bad.BaseCursor != 1 || bad.CurrentCursor != 0 {
+		t.Fatalf("want ErrInvalidCursor, got %v", err)
+	}
+	rows, _, _ := s.ListChanges("ghost", 0, 10)
+	if len(rows) != 0 {
+		t.Fatalf("unknown-doc rejection wrote rows: %+v", rows)
+	}
+}
+
+func TestMergeBaseBeyondCurrentRejected(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	if _, err := s.PostChanges("doc", changes("a")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.MergeChange("doc", "dev", 5, mergeChange("c", "dev", `{"a":1}`))
+	var bad *ErrInvalidCursor
+	if !errors.As(err, &bad) {
+		t.Fatalf("want ErrInvalidCursor, got %v", err)
+	}
+}
+
+func TestMergeIdempotentExisting(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"k":"v"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same device/payload, lagging base: still idempotent, original result.
+	res, err := s.MergeChange("doc", "dev", 0, mergeChange("x", "dev", `{ "k": "v" }`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Outcome != MergeIdempotent || res.Cursor != 1 || res.Result == nil {
+		t.Fatalf("idempotent result = %+v", res)
+	}
+	if res.Result.Created || res.Result.Cursor != 1 || res.Result.ID != "x" {
+		t.Fatalf("embedded result = %+v", res.Result)
+	}
+
+	// Different payload -> conflict, even with current base.
+	_, err = s.MergeChange("doc", "dev", 1, mergeChange("x", "dev", `{"k":"other"}`))
+	var conflict *ErrMergeConflict
+	if !errors.As(err, &conflict) || conflict.ID != "x" {
+		t.Fatalf("payload mismatch want ErrMergeConflict{x}, got %v", err)
+	}
+	// Different device -> conflict.
+	_, err = s.MergeChange("doc", "other", 1, mergeChange("x", "other", `{"k":"v"}`))
+	if !errors.As(err, &conflict) {
+		t.Fatalf("device mismatch want ErrMergeConflict, got %v", err)
+	}
+
+	rows, _, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 1 {
+		t.Fatalf("conflict paths wrote rows: %+v", rows)
+	}
+}
+
+func TestMergeLaggardDisjointFieldsMerged(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	// Current state: c1 {a}, c2 {b} at cursors 1,2. Client saw cursor 0 and
+	// sends {c}; no key collisions with intervening changes -> merged at 3.
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+		{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.MergeChange("doc", "dev", 0, mergeChange("c3", "dev", `{"c":3}`))
+	if err != nil {
+		t.Fatalf("disjoint merge: %v", err)
+	}
+	if res.Outcome != MergeMerged || res.Cursor != 3 {
+		t.Fatalf("merged result = %+v", res)
+	}
+}
+
+func TestMergeLaggardCollisionRejectedZeroWrite(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+		{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"nested":{"x":1},"b":2}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Top-level key "a" collides with intervening c1.
+	_, err := s.MergeChange("doc", "dev", 0, mergeChange("c3", "dev", `{"a":99,"z":1}`))
+	var conflict *ErrMergeConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("collision want ErrMergeConflict, got %v", err)
+	}
+	rows, _, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 2 {
+		t.Fatalf("collision wrote rows: %+v", rows)
+	}
+
+	// Only changes strictly after baseCursor count: base 1 skips c1, so an
+	// "a" field now merges (c2's keys are nested/b).
+	res, err := s.MergeChange("doc", "dev", 1, mergeChange("c4", "dev", `{"a":99}`))
+	if err != nil || res.Outcome != MergeMerged || res.Cursor != 3 {
+		t.Fatalf("post-base merge = %+v err=%v", res, err)
+	}
+}
+
+func TestMergeLaggardNonObjectInterveningRejected(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+		{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`[1,2,3]`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.MergeChange("doc", "dev", 0, mergeChange("c3", "dev", `{"z":1}`))
+	var conflict *ErrMergeConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("non-object intervening want ErrMergeConflict, got %v", err)
+	}
+	rows, _, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 2 {
+		t.Fatalf("rejected merge wrote rows: %+v", rows)
+	}
+}
+
+func TestMergeRejectsNonObjectPayload(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	for _, payload := range []string{`[1]`, `"x"`, `1`, `true`, `null`} {
+		if _, err := s.MergeChange("doc", "dev", 0, mergeChange("c", "dev", payload)); err == nil {
+			t.Fatalf("payload %s should be rejected", payload)
+		}
+	}
+}
+
+func TestMergePersistenceAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MergeChange("doc", "dev", 0, mergeChange("c2", "dev", `{"b":2}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	rows, next, err := s2.ListChanges("doc", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("after reopen rows = %+v next=%d", rows, next)
+	}
+
+	// Cursor 3 follows the persisted high-water mark; unknown-doc rule
+	// survives restart too.
+	res, err := s2.MergeChange("doc", "dev", 2, mergeChange("c3", "dev", `{"c":3}`))
+	if err != nil || res.Outcome != MergeApplied || res.Cursor != 3 {
+		t.Fatalf("post-restart apply = %+v err=%v", res, err)
+	}
+	if _, err := s2.MergeChange("brand-new", "dev", 1, mergeChange("x", "dev", `{"a":1}`)); err == nil {
+		t.Fatalf("unknown doc non-zero base must be rejected after restart")
+	}
+}
+
+func TestConcurrentMergesNoLostOrDuplicatedRows(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	const goroutines = 24
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			// Every writer believes it is at cursor 0 with a unique field.
+			// Field disjointness is independent of commit order, so each must
+			// merge exactly once with a unique cursor.
+			ch := Change{
+				ID:       fmt.Sprintf("m%d", g),
+				DeviceID: "dev",
+				Payload:  json.RawMessage(fmt.Sprintf(`{"f%d":%d}`, g, g)),
+			}
+			res, err := s.MergeChange("doc", "dev", 0, ch)
+			if err != nil {
+				errCh <- fmt.Errorf("merge %d: %w", g, err)
+				return
+			}
+			if res.Outcome != MergeMerged && res.Outcome != MergeApplied {
+				errCh <- fmt.Errorf("merge %d unexpected outcome %s", g, res.Outcome)
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	rows, next, err := s.ListChanges("doc", 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != goroutines || next != goroutines {
+		t.Fatalf("rows=%d next=%d want %d/%d", len(rows), next, goroutines, goroutines)
+	}
+	seen := make(map[int64]string)
+	for _, r := range rows {
+		if prev, dup := seen[r.Cursor]; dup {
+			t.Fatalf("cursor %d reused by %s and %s", r.Cursor, prev, r.ID)
+		}
+		seen[r.Cursor] = r.ID
+	}
+}
+
+func TestConcurrentMergesCollisionStillRejected(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "seed", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	applied := make(chan int64, goroutines)
+	rejected := 0
+	var mu sync.Mutex
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			// All laggards touch field "a": at most one may succeed, and even
+			// that only if it commits while no later "a" exists — since the
+			// seed already has "a" after base 0, every one must be rejected.
+			_, err := s.MergeChange("doc", "dev", 0, Change{
+				ID:       fmt.Sprintf("collide%d", g),
+				DeviceID: "dev",
+				Payload:  json.RawMessage(`{"a":2}`),
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err == nil {
+				applied <- 1
+			} else {
+				rejected++
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(applied)
+	for range applied {
+		t.Fatalf("laggard merge over existing field a must never apply")
+	}
+	if rejected != goroutines {
+		t.Fatalf("rejected=%d want %d", rejected, goroutines)
+	}
+	rows, _, _ := s.ListChanges("doc", 0, 1000)
+	if len(rows) != 1 {
+		t.Fatalf("collision merges wrote rows: %+v", rows)
+	}
+}
+
 func TestPostAndListBasic(t *testing.T) {
 	s, err := Open("")
 	if err != nil {
