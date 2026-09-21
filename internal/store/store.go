@@ -15,6 +15,13 @@
 // Restore provenance (the snapshot cursor the state came from) is persisted in
 // its own table, so after restart a repeated restore is still distinguishable
 // from an ordinary change and idempotency/conflict decisions are unchanged.
+//
+// Devices and sessions form the registration layer on top of the change log.
+// Registration is idempotent: re-registering a device or re-creating a session
+// for its owning device is a no-op that reports created=false. A session id is
+// globally unique and permanently bound to the device that created it; a
+// creation attempt from another device is a conflict. Deleting a session makes
+// its id unknown again, which also gates the session-scoped changes read path.
 package store
 
 import (
@@ -103,6 +110,26 @@ func (e *ErrRestoreConflict) Error() string {
 	return fmt.Sprintf("change id %q conflicts with the change log", e.ID)
 }
 
+// ErrDeviceNotFound reports that a referenced device was never registered. The
+// caller maps it to 404; nothing is written.
+var ErrDeviceNotFound = errors.New("device not found")
+
+// ErrSessionNotFound reports that a session does not exist for the referenced
+// device — it was never created, belongs to another device, or was deleted
+// (re-delete included). The caller maps it to 404; nothing is written.
+var ErrSessionNotFound = errors.New("session not found")
+
+// ErrSessionConflict reports that a session id is already bound to a different
+// device. The session is left in place and the creation writes nothing; the
+// caller maps it to 409.
+type ErrSessionConflict struct {
+	ID string
+}
+
+func (e *ErrSessionConflict) Error() string {
+	return fmt.Sprintf("session %q belongs to another device", e.ID)
+}
+
 // RestoreResult reports the outcome of an accepted RestoreSnapshot.
 type RestoreResult struct {
 	ID           string `json:"id"`
@@ -172,6 +199,14 @@ CREATE TABLE IF NOT EXISTS restores (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS restores_doc_cursor_idx
 	ON restores(document_id, change_cursor);
+CREATE TABLE IF NOT EXISTS devices (
+	device_id TEXT NOT NULL PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS sessions (
+	session_id TEXT NOT NULL PRIMARY KEY,
+	device_id  TEXT NOT NULL,
+	FOREIGN KEY (device_id) REFERENCES devices(device_id)
+);
 `)
 	return err
 }
@@ -560,6 +595,153 @@ func (s *Store) RestoreSnapshot(documentID string, deviceID, changeID string, sn
 		Cursor:       nextCursor,
 		RestoredFrom: snapshotCursor,
 	}, nil
+}
+
+// RegisterDevice registers deviceID, creating it on first use and reporting
+// whether this call created it. Re-registering an existing device is idempotent
+// (created=false); the commit is synced to disk like every other write.
+func (s *Store) RegisterDevice(deviceID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var exists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE device_id = ?)`,
+		deviceID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	if !exists {
+		if _, err := tx.Exec(
+			`INSERT INTO devices (device_id) VALUES (?)`,
+			deviceID,
+		); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// DeviceExists reports whether deviceID is registered.
+func (s *Store) DeviceExists(deviceID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE device_id = ?)`,
+		deviceID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// CreateSession binds sessionID to deviceID, creating the binding on first use
+// and reporting whether this call created it, all within a single serialized
+// transaction.
+//
+//   - An unknown deviceID returns ErrDeviceNotFound; nothing is written.
+//   - An existing session owned by the same device is idempotent
+//     (created=false).
+//   - An existing session owned by another device returns *ErrSessionConflict;
+//     nothing is written.
+func (s *Store) CreateSession(deviceID, sessionID string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE device_id = ?)`,
+		deviceID,
+	).Scan(&deviceExists); err != nil {
+		return false, err
+	}
+	if !deviceExists {
+		return false, ErrDeviceNotFound
+	}
+
+	var owner string
+	err = tx.QueryRow(
+		`SELECT device_id FROM sessions WHERE session_id = ?`,
+		sessionID,
+	).Scan(&owner)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(
+			`INSERT INTO sessions (session_id, device_id) VALUES (?, ?)`,
+			sessionID, deviceID,
+		); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		if owner != deviceID {
+			return false, &ErrSessionConflict{ID: sessionID}
+		}
+		return false, nil
+	}
+}
+
+// DeleteSession removes sessionID only when it exists and belongs to deviceID.
+// A missing device, a missing session, ownership mismatch and a repeated delete
+// all return ErrSessionNotFound; nothing is written. Deletion is idempotent in
+// the sense that a session id is free afterwards, but the HTTP contract maps
+// the repeat to 404.
+func (s *Store) DeleteSession(deviceID, sessionID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var owner string
+	err = tx.QueryRow(
+		`SELECT device_id FROM sessions WHERE session_id = ?`,
+		sessionID,
+	).Scan(&owner)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return ErrSessionNotFound
+	case err != nil:
+		return err
+	}
+	if owner != deviceID {
+		return ErrSessionNotFound
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM sessions WHERE session_id = ? AND device_id = ?`,
+		sessionID, deviceID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SessionExists reports whether sessionID is currently live (created and not
+// deleted). The owning device is not considered.
+func (s *Store) SessionExists(sessionID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?)`,
+		sessionID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // errNotObject marks a payload that is not a JSON object.

@@ -54,6 +54,14 @@ type restoreRequest struct {
 	SnapshotCursor json.RawMessage `json:"snapshotCursor"`
 }
 
+type deviceRequest struct {
+	DeviceID string `json:"deviceId"`
+}
+
+type sessionRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
@@ -81,19 +89,54 @@ func NewHandler(s *store.Store) http.Handler {
 		handleRestore(s, w, r)
 	})
 
-	// ServeMux treats the empty document segment in /v1/documents//... as an
-	// unclean path and answers with a 307 HTML redirect (a 404 in a real
-	// client). The API contract is a 400 JSON error, so intercept those paths
-	// before the mux sees them.
+	mux.HandleFunc("POST /v1/devices", func(w http.ResponseWriter, r *http.Request) {
+		handleRegisterDevice(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/devices/{deviceID}/sessions", func(w http.ResponseWriter, r *http.Request) {
+		handleCreateSession(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceID}/sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteSession(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionID}/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionChanges(s, w, r)
+	})
+
+	// ServeMux treats any empty wildcard segment in paths like
+	// /v1/documents//... or /v1/devices//sessions//... as an unclean path and
+	// answers with a 307 HTML redirect (a 404 in a real client). The API
+	// contract is a 400 JSON error, so intercept those paths before the mux
+	// sees them.
 	return emptyIDGuard(mux)
 }
 
-// emptyIDGuard rejects requests whose documentID path segment is empty with a
-// 400 JSON error instead of letting ServeMux emit its HTML redirect.
+// emptyIDGuard rejects requests with an empty wildcard path segment with a 400
+// JSON error instead of letting ServeMux emit its HTML redirect (or a plain
+// text 404 for a trailing slash on an empty final segment).
 func emptyIDGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/v1/documents//") {
+		switch {
+		case strings.HasPrefix(p, "/v1/documents//"):
+			writeError(w, http.StatusBadRequest, "documentID must be a non-empty string")
+			return
+		case strings.HasPrefix(p, "/v1/devices//"):
+			// POST /v1/devices//sessions and DELETE
+			// /v1/devices//sessions/{sessionID}: empty deviceId.
+			writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+			return
+		case strings.HasPrefix(p, "/v1/sessions//"):
+			// GET /v1/sessions//documents/{documentID}/changes: empty sessionId.
+			writeError(w, http.StatusBadRequest, "sessionId must be a non-empty string")
+			return
+		case r.Method == http.MethodDelete && strings.HasPrefix(p, "/v1/devices/") &&
+			(strings.Contains(p, "/sessions//") || strings.HasSuffix(p, "/sessions/")):
+			// DELETE /v1/devices/{deviceId}/sessions/ or .../sessions//:
+			// empty sessionId (ServeMux answers plain-text 404/307 otherwise).
+			writeError(w, http.StatusBadRequest, "sessionId must be a non-empty string")
+			return
+		case strings.HasPrefix(p, "/v1/sessions/") && strings.Contains(p, "/documents//"):
+			// GET /v1/sessions/{sessionId}/documents//changes: empty documentID.
 			writeError(w, http.StatusBadRequest, "documentID must be a non-empty string")
 			return
 		}
@@ -377,6 +420,147 @@ func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+func handleRegisterDevice(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	var req deviceRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+
+	created, err := s.RegisterDevice(req.DeviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to register device")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"deviceId": req.DeviceID, "created": created})
+}
+
+func handleCreateSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceID") // route pattern guarantees non-empty
+
+	var req sessionRequest
+	if !decodeStrictJSON(w, r, &req) {
+		return
+	}
+	if req.SessionID == "" {
+		writeError(w, http.StatusBadRequest, "sessionId must be a non-empty string")
+		return
+	}
+
+	created, err := s.CreateSession(deviceID, req.SessionID)
+	if err != nil {
+		var conflict *store.ErrSessionConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "sessionId already belongs to another device: "+req.SessionID)
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to create session")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": req.SessionID, "created": created})
+}
+
+func handleDeleteSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceID")   // route pattern guarantees non-empty
+	sessionID := r.PathValue("sessionID") // route pattern guarantees non-empty
+
+	if err := s.DeleteSession(deviceID, sessionID); err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to delete session")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+}
+
+func handleSessionChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionID")   // route pattern guarantees non-empty
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	q := r.URL.Query()
+
+	after := int64(0)
+	if raw := q.Get("after"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "after must be a non-negative integer")
+			return
+		}
+		after = v
+	}
+
+	limit := int64(defaultListLimit)
+	if raw := q.Get("limit"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 1 || v > maxListLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+			return
+		}
+		limit = v
+	}
+
+	// The session must currently exist; deleted and never-created sessions are
+	// both 404.
+	exists, err := s.SessionExists(sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	// Beyond the session gate the query is the existing per-document changes
+	// read, semantics unchanged.
+	changes, nextCursor, err := s.ListChanges(documentID, after, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list changes")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"changes":    changes,
+		"nextCursor": nextCursor,
+	})
+}
+
+// decodeStrictJSON enforces application/json, decodes exactly one JSON value
+// into v and rejects any trailing content. On failure it writes a 400 JSON
+// error and returns false; no caller writes after that.
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return false
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return false
+	}
+	return true
 }
 
 // parseCursorPath reports whether raw is a decimal non-negative integer and

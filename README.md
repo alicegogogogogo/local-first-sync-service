@@ -114,3 +114,49 @@ go test ./...
 ### 路径中的空文档 ID
 
 `/v1/documents//changes`、`/v1/documents//merge` 等 `documentID` 段为空的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
+
+## 设备与同步会话
+
+### `POST /v1/devices`
+
+仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1"}
+```
+
+- `deviceId` 为非空字符串；类型头不符、JSON 非法、尾随内容、字段缺失或类型错误均返回 `400` JSON 错误且零写入。
+- 首次注册返回 `200` `{"deviceId":"device-1","created":true}`；重复注册幂等返回 `200`、`created=false`。
+
+### `POST /v1/devices/{deviceId}/sessions`
+
+仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"sessionId": "session-1"}
+```
+
+- 路径 `deviceId` 与请求体 `sessionId` 均为非空字符串；类型头、JSON、尾随内容或字段类型不合格均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误且零写入。
+- `sessionId` 全局唯一并永久绑定创建它的设备：首次创建返回 `200` `{"sessionId","created":true}`；同一设备重试幂等返回 `created=false`。
+- `sessionId` 已属于其他设备时返回 `409` JSON 错误且零写入，既有归属不变。
+
+### `DELETE /v1/devices/{deviceId}/sessions/{sessionId}`
+
+- 仅删除该设备名下匹配的会话。成功返回 `200` `{"deleted":true}`。
+- 设备不存在、会话不存在、归属不符或重复删除，均返回 `404` JSON 错误。
+- 删除后该 `sessionId` 重新变为未知（可被任意设备再次创建）；删除同步落盘。
+
+### `GET /v1/sessions/{sessionId}/documents/{documentId}/changes`
+
+会话作用域下的变更读取，是既有 `GET /v1/documents/{documentID}/changes` 的会话门禁版本：
+
+- `sessionId`、`documentId` 路径段均须非空；`after`、`limit` 参数语义与取值范围完全沿用既有 changes 查询，参数非法返回 `400` JSON 错误。
+- 会话必须现存：从未创建或已删除的会话返回 `404` JSON 错误。
+- 会话存在时，响应体、分页（`changes`/`nextCursor`）、未知文档返回空列表且 `nextCursor` 为 `0` 等行为与既有 changes 查询完全一致。
+
+### 路径中的空设备/会话/文档 ID
+
+`/v1/devices//sessions`、`/v1/devices//sessions/s1`、`/v1/devices/d1/sessions/`、`/v1/sessions//documents/d1/changes`、`/v1/sessions/s1/documents//changes` 等任一标识段为空的请求返回 `400` JSON 错误，而不是重定向或 HTML 页面。
+
+设备注册、会话创建与删除均在序列化事务内完成并同步落盘；并发创建不会把一个 `sessionId` 分给两个设备，创建与删除并发不会产生重复或悬挂绑定。进程重启（含崩溃）后注册状态、归属、幂等与冲突判定保持不变。
