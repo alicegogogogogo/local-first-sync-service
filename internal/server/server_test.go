@@ -561,3 +561,213 @@ func TestMergeHTTPZeroWriteOnBadBase(t *testing.T) {
 		t.Fatalf("zero-write violated: %+v next=%d", rows, next)
 	}
 }
+
+func seedDoc(t *testing.T, h http.Handler, doc string, n int) {
+	t.Helper()
+	batch := make([]any, n)
+	for i := range batch {
+		batch[i] = map[string]any{"id": fmt.Sprintf("c%d", i+1), "payload": map[string]any{"n": i + 1}}
+	}
+	w, _ := postJSON(t, h, "/v1/documents/"+doc+"/changes", map[string]any{"deviceId": "dev", "changes": batch})
+	if w.Code != http.StatusOK {
+		t.Fatalf("seed status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSnapshotPostAndGetHTTP(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDoc(t, h, "doc1", 2)
+
+	w, body := postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":2,"state":{"text":"hello","n":1}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("post status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["cursor"].(float64) != 2 || body["created"] != true {
+		t.Fatalf("post body = %v", body)
+	}
+
+	w, body = doRequest(t, h, http.MethodGet, "/v1/documents/doc1/snapshots/2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["cursor"].(float64) != 2 {
+		t.Fatalf("get cursor = %v", body["cursor"])
+	}
+	state, ok := body["state"].(map[string]any)
+	if !ok || state["text"] != "hello" || state["n"].(float64) != 1 {
+		t.Fatalf("get state = %v", body["state"])
+	}
+}
+
+func TestSnapshotRetryAndConflictHTTP(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDoc(t, h, "doc1", 1)
+
+	w, body := postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"v":1}}`)
+	if w.Code != http.StatusOK || body["created"] != true {
+		t.Fatalf("first = %d %v", w.Code, body)
+	}
+
+	// Decoded-equal retry (different key order and number format) is idempotent.
+	w, body = postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"v":1.0}}`)
+	if w.Code != http.StatusOK || body["created"] != false {
+		t.Fatalf("retry = %d %v", w.Code, body)
+	}
+
+	// A different state is a 409 and leaves the snapshot unchanged.
+	w, _ = postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"v":2}}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d", w.Code)
+	}
+	var errBody map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil || errBody["error"] == "" {
+		t.Fatalf("conflict body = %s", w.Body.String())
+	}
+	_, body = doRequest(t, h, http.MethodGet, "/v1/documents/doc1/snapshots/1")
+	if body["state"].(map[string]any)["v"].(float64) != 1 {
+		t.Fatalf("state after conflict = %v", body["state"])
+	}
+}
+
+func TestSnapshotPostRejectsBadInput(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDoc(t, h, "doc1", 2)
+
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"wrong content type", "text/plain", `{"cursor":1,"state":{}}`},
+		{"missing content type", "", `{"cursor":1,"state":{}}`},
+		{"malformed json", "application/json", `{"cursor":1,"state":`},
+		{"trailing content", "application/json", `{"cursor":1,"state":{}}garbage`},
+		{"missing cursor", "application/json", `{"state":{}}`},
+		{"negative cursor", "application/json", `{"cursor":-1,"state":{}}`},
+		{"fractional cursor", "application/json", `{"cursor":1.5,"state":{}}`},
+		{"string cursor", "application/json", `{"cursor":"1","state":{}}`},
+		{"null cursor", "application/json", `{"cursor":null,"state":{}}`},
+		{"missing state", "application/json", `{"cursor":1}`},
+		{"unknown document", "application/json", `{"cursor":1,"state":{}}`},
+		{"cursor zero", "application/json", `{"cursor":0,"state":{}}`},
+		{"cursor ahead", "application/json", `{"cursor":3,"state":{}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := "doc1"
+			if tc.name == "unknown document" {
+				doc = "nope"
+			}
+			r := httptest.NewRequest(http.MethodPost, "/v1/documents/"+doc+"/snapshots", strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("error content type = %q", ct)
+			}
+			var errBody map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil || errBody["error"] == "" {
+				t.Fatalf("error body = %s", w.Body.String())
+			}
+		})
+	}
+
+	// Zero writes: none of the rejected posts created a snapshot.
+	w, _ := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/snapshots/1")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("zero-write violated: get status = %d", w.Code)
+	}
+}
+
+func TestSnapshotGetRejectsBadCursor(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDoc(t, h, "doc1", 1)
+
+	for _, p := range []string{"abc", "-1", "1.5", "+1", "1e3"} {
+		w, _ := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/snapshots/"+p)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("cursor %q status = %d, want 400", p, w.Code)
+		}
+		var errBody map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil || errBody["error"] == "" {
+			t.Fatalf("cursor %q body = %s", p, w.Body.String())
+		}
+	}
+
+	// Empty documentID is a 400 JSON error, not a redirect.
+	w, _ := doRequest(t, h, http.MethodGet, "/v1/documents//snapshots/1")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("empty documentID status = %d", w.Code)
+	}
+}
+
+func TestSnapshotGetMissing(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDoc(t, h, "doc1", 1)
+
+	for _, url := range []string{
+		"/v1/documents/nope/snapshots/1",  // unknown document
+		"/v1/documents/doc1/snapshots/1",  // no snapshot at cursor
+		"/v1/documents/doc1/snapshots/0",  // cursor without snapshot
+		"/v1/documents/doc1/snapshots/99", // cursor without snapshot
+	} {
+		w, _ := doRequest(t, h, http.MethodGet, url)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", url, w.Code)
+		}
+		var errBody map[string]string
+		if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil || errBody["error"] == "" {
+			t.Fatalf("%s body = %s", url, w.Body.String())
+		}
+	}
+}
+
+func TestSnapshotPersistenceAcrossRestartHTTP(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s)
+	seedDoc(t, h, "doc1", 2)
+	w, _ := postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"a":1}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("post status = %d", w.Code)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart: snapshot is readable and retry/conflict semantics hold.
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	h2 := NewHandler(s2)
+
+	w, body := doRequest(t, h2, http.MethodGet, "/v1/documents/doc1/snapshots/1")
+	if w.Code != http.StatusOK || body["state"].(map[string]any)["a"].(float64) != 1 {
+		t.Fatalf("get after restart = %d %v", w.Code, body)
+	}
+	w, body = postJSON(t, h2, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"a":1}}`)
+	if w.Code != http.StatusOK || body["created"] != false {
+		t.Fatalf("retry after restart = %d %v", w.Code, body)
+	}
+	w, _ = postJSON(t, h2, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"a":2}}`)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict after restart = %d", w.Code)
+	}
+
+	// Snapshots left the change log untouched.
+	_, body = doRequest(t, h2, http.MethodGet, "/v1/documents/doc1/changes")
+	if body["nextCursor"].(float64) != 2 {
+		t.Fatalf("nextCursor = %v", body["nextCursor"])
+	}
+}

@@ -5,6 +5,11 @@
 // only when the deviceId and decoded JSON payload match, otherwise it is a
 // conflict. Valid batches commit atomically, so cursors never repeat and no
 // record is partially written, even under concurrent writers.
+//
+// A document may also carry snapshots: caller-supplied JSON states pinned to
+// existing change cursors. Snapshots are write-once per cursor — a matching
+// re-post is idempotent, a differing one a conflict — and live apart from the
+// change log.
 package store
 
 import (
@@ -62,6 +67,25 @@ func (e *ErrConflict) Error() string {
 	return fmt.Sprintf("conflicting change %q for document", e.ID)
 }
 
+// ErrSnapshotBase reports that a snapshot targets an unknown document or a
+// cursor that is not an existing change cursor of the document. The caller
+// maps it to 400; nothing is written.
+var ErrSnapshotBase = errors.New("snapshot cursor is not an existing cursor of the document")
+
+// ErrSnapshotNotFound reports that no snapshot exists for the document and
+// cursor. The caller maps it to 404.
+var ErrSnapshotNotFound = errors.New("snapshot not found")
+
+// ErrSnapshotConflict reports that a snapshot already exists for the document
+// and cursor with a different state. The stored snapshot is left unchanged.
+type ErrSnapshotConflict struct {
+	Cursor int64
+}
+
+func (e *ErrSnapshotConflict) Error() string {
+	return fmt.Sprintf("conflicting snapshot for cursor %d", e.Cursor)
+}
+
 // Store is the durable change log.
 type Store struct {
 	db *sql.DB
@@ -106,6 +130,12 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS changes_doc_cursor_idx
 	ON changes(document_id, cursor);
+CREATE TABLE IF NOT EXISTS snapshots (
+	document_id TEXT NOT NULL,
+	cursor      INTEGER NOT NULL,
+	state       BLOB NOT NULL,
+	PRIMARY KEY (document_id, cursor)
+);
 `)
 	return err
 }
@@ -312,6 +342,80 @@ func (s *Store) MergeChange(documentID string, baseCursor int64, c Change) (Merg
 		return MergeResult{}, err
 	}
 	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, nil
+}
+
+// PutSnapshot stores state as the snapshot of documentID at cursor, creating
+// it on first use and reporting whether this call created it.
+//
+// Only cursors of existing changes are valid snapshot points: an unknown
+// document, a cursor below 1 or a cursor ahead of the document's current
+// cursor yields ErrSnapshotBase and nothing is written. Re-posting a state
+// that decodes equal to the stored one is idempotent (created=false); a
+// different state is an *ErrSnapshotConflict and the stored snapshot is left
+// unchanged. Snapshots are independent of the change log: they neither move
+// the document's cursor nor affect merges.
+func (s *Store) PutSnapshot(documentID string, cursor int64, state json.RawMessage) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var current int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&current); err != nil {
+		return false, err
+	}
+	if current == 0 || cursor < 1 || cursor > current {
+		return false, ErrSnapshotBase
+	}
+
+	var existing []byte
+	err = tx.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, cursor,
+	).Scan(&existing)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(
+			`INSERT INTO snapshots (document_id, cursor, state) VALUES (?, ?, ?)`,
+			documentID, cursor, []byte(state),
+		); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		if !jsonEqual(existing, state) {
+			return false, &ErrSnapshotConflict{Cursor: cursor}
+		}
+		return false, nil
+	}
+}
+
+// GetSnapshot returns the state stored for documentID at cursor. Any miss —
+// unknown document, unknown cursor or absent snapshot — yields
+// ErrSnapshotNotFound.
+func (s *Store) GetSnapshot(documentID string, cursor int64) (json.RawMessage, error) {
+	var state []byte
+	err := s.db.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, cursor,
+	).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, ErrSnapshotNotFound
+	case err != nil:
+		return nil, err
+	default:
+		return json.RawMessage(state), nil
+	}
 }
 
 // errNotObject marks a payload that is not a JSON object.

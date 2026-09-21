@@ -78,6 +78,24 @@ go test ./...
 - 未知文档以 `baseCursor: 0` 提交第一条变更时按 `applied` 处理。
 - 并发提交在序列化事务内完成，落后方无法绕过上述检查；提交同步落盘，重启后记录与 cursor 可读。
 
+### `POST /v1/documents/{documentID}/snapshots`
+
+仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"cursor": 2, "state": {"any": "json"}}
+```
+
+- `cursor` 为非负整数（不接受小数、字符串、布尔或 `null`）；`state` 必填，为任意合法 JSON 值。
+- 仅已知文档的现有 cursor（`1..当前cursor`）可创建快照；未知文档、cursor 为 0 或超过当前 cursor 均返回 `400` JSON 错误且零写入。
+- 同一文档同一 cursor 唯一：首次创建返回 `200` `{"cursor":N,"created":true}`；重试时 `state` 解码相同则幂等返回 `200` `{"cursor":N,"created":false}`，不同则返回 `409` JSON 错误且原快照不变。
+- 快照同步落盘，重启后可读，幂等与冲突判定不变；快照不影响 changes 或 merge。
+
+### `GET /v1/documents/{documentID}/snapshots/{cursor}`
+
+- `cursor` 为十进制非负整数；格式错误或空 `documentID` 返回 `400` JSON 错误。
+- 命中返回 `200` `{"cursor":N,"state":...}`；文档、cursor 或快照不存在返回 `404` JSON 错误。
+
 ### 路径中的空文档 ID
 
 `/v1/documents//changes`、`/v1/documents//merge` 等 `documentID` 段为空的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。

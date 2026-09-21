@@ -43,6 +43,11 @@ type mergeRequest struct {
 	Change     *mergeChangeIn  `json:"change"`
 }
 
+type snapshotPostRequest struct {
+	Cursor json.RawMessage `json:"cursor"`
+	State  json.RawMessage `json:"state"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
@@ -59,6 +64,12 @@ func NewHandler(s *store.Store) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleMergeChange(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		handlePostSnapshot(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
+		handleGetSnapshot(s, w, r)
 	})
 
 	// ServeMux treats the empty document segment in /v1/documents//... as an
@@ -227,8 +238,97 @@ func handleMergeChange(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// parseNonNegativeInt reports whether raw is a JSON integer >= 0. Floats,
-// strings, booleans, null and negative numbers are rejected.
+func handlePostSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req snapshotPostRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return
+	}
+
+	cursor, ok := parseNonNegativeInt(req.Cursor)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+		return
+	}
+	if len(req.State) == 0 {
+		writeError(w, http.StatusBadRequest, "state is required")
+		return
+	}
+
+	created, err := s.PutSnapshot(documentID, cursor, req.State)
+	if err != nil {
+		var conflict *store.ErrSnapshotConflict
+		switch {
+		case errors.Is(err, store.ErrSnapshotBase):
+			writeError(w, http.StatusBadRequest, "document is unknown or cursor is not an existing cursor")
+			return
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "snapshot already exists with a different state")
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to store snapshot")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "created": created})
+}
+
+func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	cursor, ok := parseCursorPath(r.PathValue("cursor"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+		return
+	}
+
+	state, err := s.GetSnapshot(documentID, cursor)
+	if err != nil {
+		if errors.Is(err, store.ErrSnapshotNotFound) {
+			writeError(w, http.StatusNotFound, "snapshot not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load snapshot")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "state": state})
+}
+
+// parseCursorPath reports whether raw is a decimal non-negative integer and
+// returns its value. Signs, fractions and other adornments are rejected.
+func parseCursorPath(raw string) (int64, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// parseNonNegativeInt reports whether raw is a JSON integer >= 0. Floats,// strings, booleans, null and negative numbers are rejected.
 func parseNonNegativeInt(raw json.RawMessage) (int64, bool) {
 	var n int64
 	if err := json.Unmarshal(raw, &n); err != nil || n < 0 {
