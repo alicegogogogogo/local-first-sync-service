@@ -21,6 +21,27 @@ import (
 // caller maps it to 400; nothing is written.
 var ErrStaleCursor = errors.New("baseCursor is unknown or ahead of the current cursor")
 
+// ErrSnapshotCursor reports that a snapshot targets a cursor that is not an
+// existing change cursor for the document (an unknown document, cursor 0, or a
+// cursor past the high-water mark). The caller maps it to 400; nothing is
+// written.
+var ErrSnapshotCursor = errors.New("snapshot cursor is not an existing cursor for the document")
+
+// ErrSnapshotNotFound reports that no snapshot exists for the documentID and
+// cursor. The caller maps it to 404.
+var ErrSnapshotNotFound = errors.New("snapshot not found")
+
+// ErrSnapshotConflict reports that a snapshot already exists at the given
+// cursor with a state that decodes differently. The stored snapshot is left
+// unchanged; the caller maps it to 409.
+type ErrSnapshotConflict struct {
+	Cursor int64
+}
+
+func (e *ErrSnapshotConflict) Error() string {
+	return fmt.Sprintf("snapshot at cursor %d already exists with a different state", e.Cursor)
+}
+
 // Change is one element of an inbound batch or one row of a listing.
 type Change struct {
 	ID       string          // client-supplied change id, unique per document
@@ -106,6 +127,12 @@ CREATE TABLE IF NOT EXISTS changes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS changes_doc_cursor_idx
 	ON changes(document_id, cursor);
+CREATE TABLE IF NOT EXISTS snapshots (
+	document_id TEXT NOT NULL,
+	cursor      INTEGER NOT NULL,
+	state       BLOB NOT NULL,
+	PRIMARY KEY (document_id, cursor)
+);
 `)
 	return err
 }
@@ -382,6 +409,87 @@ func (s *Store) ListChanges(documentID string, after, limit int64) ([]ListedChan
 		}
 	}
 	return out, maxCursor, nil
+}
+
+// Snapshot is a persisted state at one change cursor.
+type Snapshot struct {
+	Cursor int64           `json:"cursor"`
+	State  json.RawMessage `json:"state"`
+}
+
+// PutSnapshot persists state at cursor, all within one serialized
+// transaction.
+//
+// The cursor must be an existing change cursor for the document; otherwise
+// ErrSnapshotCursor is returned and nothing is written. One snapshot per
+// (document, cursor) is kept: re-posting a state that decodes equal to the
+// stored one is idempotent (created=false, no write); a state that decodes
+// differently yields *ErrSnapshotConflict and the stored snapshot is left
+// untouched. Snapshots never modify the change log.
+func (s *Store) PutSnapshot(documentID string, cursor int64, state json.RawMessage) (created bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Only an existing cursor of a known document may carry a snapshot.
+	var known bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ? AND cursor = ?)`,
+		documentID, cursor,
+	).Scan(&known); err != nil {
+		return false, err
+	}
+	if !known {
+		return false, ErrSnapshotCursor
+	}
+
+	var existing []byte
+	switch err := tx.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, cursor,
+	).Scan(&existing); {
+	case errors.Is(err, sql.ErrNoRows):
+		// First snapshot at this cursor.
+		if _, err := tx.Exec(
+			`INSERT INTO snapshots (document_id, cursor, state) VALUES (?, ?, ?)`,
+			documentID, cursor, []byte(state),
+		); err != nil {
+			return false, err
+		}
+		created = true
+	case err != nil:
+		return false, err
+	default:
+		if !jsonEqual(existing, state) {
+			return false, &ErrSnapshotConflict{Cursor: cursor}
+		}
+		// Decoded-equal retry: idempotent, leave the stored bytes untouched.
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return created, nil
+}
+
+// GetSnapshot returns the snapshot for documentID at cursor. A missing
+// document, a cursor without a change, or a cursor without a snapshot all
+// yield ErrSnapshotNotFound; the caller maps it to 404.
+func (s *Store) GetSnapshot(documentID string, cursor int64) (Snapshot, error) {
+	var snap Snapshot
+	err := s.db.QueryRow(
+		`SELECT cursor, state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, cursor,
+	).Scan(&snap.Cursor, &snap.State)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return Snapshot{}, ErrSnapshotNotFound
+	case err != nil:
+		return Snapshot{}, err
+	}
+	return snap, nil
 }
 
 // jsonEqual reports whether two payloads are equal after JSON decoding, so

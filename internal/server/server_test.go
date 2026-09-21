@@ -561,3 +561,347 @@ func TestMergeHTTPZeroWriteOnBadBase(t *testing.T) {
 		t.Fatalf("zero-write violated: %+v next=%d", rows, next)
 	}
 }
+
+func seedDocOverHTTP(t *testing.T, h http.Handler, doc string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		w, _ := postJSON(t, h, "/v1/documents/"+doc+"/changes", map[string]any{
+			"deviceId": "dev",
+			"changes": []any{
+				map[string]any{"id": fmt.Sprintf("c%d", i+1), "payload": map[string]any{"n": i + 1}},
+			},
+		})
+		if w.Code != 200 {
+			t.Fatalf("seed %s: %s", doc, w.Body.String())
+		}
+	}
+}
+
+func TestPostSnapshotHTTPCreateRetryConflict(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 2)
+
+	url := "/v1/documents/doc/snapshots"
+	w, body := postJSON(t, h, url, map[string]any{"cursor": 2, "state": map[string]any{"title": "a", "v": 1}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["cursor"].(float64) != 2 || body["created"] != true {
+		t.Fatalf("create body = %v", body)
+	}
+
+	// Retry with decoded-equal state: 200 created=false.
+	w, body = postJSON(t, h, url, `{"cursor":2,"state":{"v":1.0,"title":"a"}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["created"] != false || body["cursor"].(float64) != 2 {
+		t.Fatalf("retry body = %v", body)
+	}
+
+	// Conflicting state: 409, snapshot unchanged.
+	w, body = postJSON(t, h, url, map[string]any{"cursor": 2, "state": map[string]any{"title": "b"}})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["error"] == nil {
+		t.Fatalf("conflict body = %s", w.Body.String())
+	}
+	snap, err := s.GetSnapshot("doc", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(snap.State, &state); err != nil || state["title"] != "a" {
+		t.Fatalf("conflict mutated snapshot: %s", snap.State)
+	}
+}
+
+func TestPostSnapshotHTTPRejectsBadInput(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 6)
+	const url = "/v1/documents/doc/snapshots"
+
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"wrong content type", "text/plain", `{"cursor":1,"state":{}}`},
+		{"missing content type", "", `{"cursor":1,"state":{}}`},
+		{"malformed json", "application/json", `{`},
+		{"trailing content", "application/json", `{"cursor":1,"state":{}}x`},
+		{"missing cursor", "application/json", `{"state":{}}`},
+		{"null cursor", "application/json", `{"cursor":null,"state":{}}`},
+		{"negative cursor", "application/json", `{"cursor":-1,"state":{}}`},
+		{"float cursor", "application/json", `{"cursor":1.5,"state":{}}`},
+		{"string cursor", "application/json", `{"cursor":"1","state":{}}`},
+		{"boolean cursor", "application/json", `{"cursor":true,"state":{}}`},
+		{"missing state", "application/json", `{"cursor":1}`},
+		{"malformed state", "application/json", `{"cursor":1,"state":{`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, url, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+			}
+			var b map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &b); err != nil || b["error"] == "" {
+				t.Fatalf("body = %q", w.Body.String())
+			}
+		})
+	}
+
+	// state accepts any legal JSON value, including false / 0 / "" / null.
+	// Use a distinct cursor for each so no uniqueness/conflict rule kicks in.
+	legal := []string{"false", "0", `""`, "null", "[1,true,null]", `"str"`}
+	for i, state := range legal {
+		w, body := postJSON(t, h, url, fmt.Sprintf(`{"cursor":%d,"state":%s}`, i+1, state))
+		if w.Code != http.StatusOK {
+			t.Fatalf("state case %d (%s): status=%d body=%s", i, state, w.Code, w.Body.String())
+		}
+		if body["created"] != true {
+			t.Fatalf("state case %d: %v", i, body)
+		}
+	}
+}
+
+func TestPostSnapshotHTTPUnknownCursorZeroWrite(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 2)
+	const url = "/v1/documents/doc/snapshots"
+
+	// Cursor 0, ahead cursor and unknown document are all 400 with zero write.
+	for _, tc := range []struct {
+		url  string
+		body string
+	}{
+		{url, `{"cursor":0,"state":{}}`},
+		{url, `{"cursor":3,"state":{}}`},
+		{"/v1/documents/ghost/snapshots", `{"cursor":1,"state":{}}`},
+	} {
+		r := httptest.NewRequest(http.MethodPost, tc.url, strings.NewReader(tc.body))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s -> status = %d, want 400, body = %s", tc.url, w.Code, w.Body.String())
+		}
+	}
+	if _, err := s.GetSnapshot("doc", 1); err != store.ErrSnapshotNotFound {
+		t.Fatalf("snapshots leaked after rejected writes: %v", err)
+	}
+}
+
+func TestGetSnapshotHTTP(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 2)
+
+	// Seed snapshots at cursors 1 and 2 with varied JSON values.
+	for _, tc := range []struct {
+		cursor int
+		state  string
+	}{
+		{1, `{"k":"v"}`},
+		{2, `[1,{"a":2},null,true]`},
+	} {
+		w, _ := postJSON(t, h, "/v1/documents/doc/snapshots",
+			fmt.Sprintf(`{"cursor":%d,"state":%s}`, tc.cursor, tc.state))
+		if w.Code != 200 {
+			t.Fatalf("seed %d: %s", tc.cursor, w.Body.String())
+		}
+	}
+
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/snapshots/1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["cursor"].(float64) != 1 {
+		t.Fatalf("get cursor = %v", body["cursor"])
+	}
+	state := body["state"].(map[string]any)
+	if state["k"] != "v" {
+		t.Fatalf("get state = %v", body["state"])
+	}
+
+	w, body = doRequest(t, h, http.MethodGet, "/v1/documents/doc/snapshots/2")
+	if w.Code != 200 {
+		t.Fatalf("get 2 status = %d body = %s", w.Code, w.Body.String())
+	}
+	arr := body["state"].([]any)
+	if len(arr) != 4 || arr[0].(float64) != 1 || arr[3] != true {
+		t.Fatalf("get 2 state = %v", body["state"])
+	}
+}
+
+func TestGetSnapshotHTTPNotFound(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 2)
+	w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 1, "state": map[string]any{"x": 1}})
+	if w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+
+	for _, url := range []string{
+		"/v1/documents/doc/snapshots/2",   // known doc/cursor, no snapshot
+		"/v1/documents/doc/snapshots/9",   // cursor without a change
+		"/v1/documents/ghost/snapshots/1", // unknown document
+		"/v1/documents/doc/snapshots/0",   // cursor 0 never has a snapshot
+	} {
+		w, body := doRequest(t, h, http.MethodGet, url)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404, body = %s", url, w.Code, w.Body.String())
+		}
+		if body["error"] == nil {
+			t.Fatalf("%s body = %s", url, w.Body.String())
+		}
+	}
+}
+
+func TestGetSnapshotHTTPBadCursor(t *testing.T) {
+	h, _ := newTestHandler(t)
+	for _, url := range []string{
+		"/v1/documents/doc/snapshots/abc",
+		"/v1/documents/doc/snapshots/-1",
+		"/v1/documents/doc/snapshots/1.5",
+		"/v1/documents/doc/snapshots/",
+	} {
+		w, body := doRequest(t, h, http.MethodGet, url)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want 400, body = %s", url, w.Code, w.Body.String())
+		}
+		if body["error"] == nil {
+			t.Fatalf("%s body = %s", url, w.Body.String())
+		}
+	}
+}
+
+func TestSnapshotsHTTPEmptyDocumentID(t *testing.T) {
+	h, _ := newTestHandler(t)
+
+	cases := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodPost, "/v1/documents//snapshots", `{"cursor":1,"state":{}}`},
+		{http.MethodGet, "/v1/documents//snapshots/1", ""},
+		{http.MethodGet, "/v1/documents/doc/snapshots/", ""},
+	}
+	for _, tc := range cases {
+		var r *http.Request
+		if tc.body != "" {
+			r = httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			r.Header.Set("Content-Type", "application/json")
+		} else {
+			r = httptest.NewRequest(tc.method, tc.path, nil)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s status = %d, want 400", tc.method, tc.path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("%s %s content-type = %q", tc.method, tc.path, ct)
+		}
+	}
+}
+
+func TestSnapshotHTTPPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s)
+	seedDocOverHTTP(t, h, "doc", 2)
+	w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": map[string]any{"hello": "world"}})
+	if w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+	h2 := NewHandler(s2)
+
+	w, body := doRequest(t, h2, http.MethodGet, "/v1/documents/doc/snapshots/2")
+	if w.Code != 200 {
+		t.Fatalf("after reopen status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["cursor"].(float64) != 2 || body["state"].(map[string]any)["hello"] != "world" {
+		t.Fatalf("after reopen body = %v", body)
+	}
+
+	// Same-state retry stays idempotent after restart; different state 409s.
+	w, body = postJSON(t, h2, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": map[string]any{"hello": "world"}})
+	if w.Code != 200 || body["created"] != false {
+		t.Fatalf("retry after restart: %d %v", w.Code, body)
+	}
+	w, _ = postJSON(t, h2, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": map[string]any{"hello": "changed"}})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict after restart status = %d", w.Code)
+	}
+}
+
+func TestSnapshotHTTPConcurrentSameCursor(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedDocOverHTTP(t, h, "doc", 1)
+
+	const n = 30
+	var wg sync.WaitGroup
+	type outcome struct {
+		status  int
+		created bool
+	}
+	outcomes := make(chan outcome, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Every goroutine posts a distinct state, so exactly one must win
+			// with created=true; every other must see 409.
+			w, body := postJSON(t, h, "/v1/documents/doc/snapshots",
+				fmt.Sprintf(`{"cursor":1,"state":{"i":%d}}`, i))
+			oc := outcome{status: w.Code}
+			if v, ok := body["created"].(bool); ok {
+				oc.created = v
+			}
+			outcomes <- oc
+		}(i)
+	}
+	wg.Wait()
+	close(outcomes)
+
+	var winners, conflicts, bad int
+	for oc := range outcomes {
+		switch {
+		case oc.status == http.StatusOK && oc.created:
+			winners++
+		case oc.status == http.StatusConflict:
+			conflicts++
+		default:
+			bad++
+		}
+	}
+	if winners != 1 || conflicts != n-1 || bad != 0 {
+		t.Fatalf("winners=%d conflicts=%d bad=%d, want 1/%d/0", winners, conflicts, bad, n-1)
+	}
+
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/snapshots/1")
+	if w.Code != 200 || body["cursor"].(float64) != 1 || body["state"] == nil {
+		t.Fatalf("snapshot after race = %d %v", w.Code, body)
+	}
+}

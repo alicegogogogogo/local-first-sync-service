@@ -43,6 +43,11 @@ type mergeRequest struct {
 	Change     *mergeChangeIn  `json:"change"`
 }
 
+type snapshotRequest struct {
+	Cursor json.RawMessage `json:"cursor"`
+	State  json.RawMessage `json:"state"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
@@ -60,6 +65,12 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleMergeChange(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		handlePostSnapshot(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
+		handleGetSnapshot(s, w, r)
+	})
 
 	// ServeMux treats the empty document segment in /v1/documents//... as an
 	// unclean path and answers with a 307 HTML redirect (a 404 in a real
@@ -69,12 +80,18 @@ func NewHandler(s *store.Store) http.Handler {
 }
 
 // emptyIDGuard rejects requests whose documentID path segment is empty with a
-// 400 JSON error instead of letting ServeMux emit its HTML redirect.
+// 400 JSON error instead of letting ServeMux emit its HTML redirect. It also
+// catches GET snapshot URLs with an empty cursor segment, which otherwise fail
+// to match a route and surface as a 404.
 func emptyIDGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if strings.HasPrefix(p, "/v1/documents//") {
 			writeError(w, http.StatusBadRequest, "documentID must be a non-empty string")
+			return
+		}
+		if strings.HasPrefix(p, "/v1/documents/") && strings.HasSuffix(p, "/snapshots/") {
+			writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -291,6 +308,92 @@ func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"changes":    changes,
 		"nextCursor": nextCursor,
+	})
+}
+
+func handlePostSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req snapshotRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return
+	}
+
+	// cursor must be present and a non-negative integer.
+	if len(req.Cursor) == 0 {
+		writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+		return
+	}
+	cursor, ok := parseNonNegativeInt(req.Cursor)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+		return
+	}
+	// state must be present and a legal JSON value (including false, 0, ""
+	// or null; only a missing field is rejected).
+	if len(req.State) == 0 {
+		writeError(w, http.StatusBadRequest, "state must be a JSON value")
+		return
+	}
+	if !json.Valid(req.State) {
+		writeError(w, http.StatusBadRequest, "state must be a JSON value")
+		return
+	}
+
+	created, err := s.PutSnapshot(documentID, cursor, req.State)
+	if err != nil {
+		var conflict *store.ErrSnapshotConflict
+		switch {
+		case errors.Is(err, store.ErrSnapshotCursor):
+			writeError(w, http.StatusBadRequest, "snapshot cursor must be an existing cursor of a known document")
+			return
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "snapshot already exists at cursor with a different state")
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to persist snapshot")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "created": created})
+}
+
+func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	cursor, err := strconv.ParseInt(r.PathValue("cursor"), 10, 64)
+	if err != nil || cursor < 0 {
+		writeError(w, http.StatusBadRequest, "cursor must be a non-negative integer")
+		return
+	}
+
+	snap, err := s.GetSnapshot(documentID, cursor)
+	if err != nil {
+		if errors.Is(err, store.ErrSnapshotNotFound) {
+			writeError(w, http.StatusNotFound, "snapshot not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to read snapshot")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cursor": snap.Cursor,
+		"state":  snap.State,
 	})
 }
 

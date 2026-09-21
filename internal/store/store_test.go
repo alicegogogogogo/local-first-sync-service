@@ -522,3 +522,233 @@ func TestMergePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("post-restart merge = %+v err=%v", r, err)
 	}
 }
+
+func seedDoc(t *testing.T, s *Store, doc string, n int) {
+	t.Helper()
+	batch := make([]Change, n)
+	for i := range batch {
+		batch[i] = Change{
+			ID:       fmt.Sprintf("c%d", i+1),
+			DeviceID: "dev",
+			Payload:  json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1)),
+		}
+	}
+	if _, err := s.PostChanges(doc, batch); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotCreateIdempotentConflict(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	seedDoc(t, s, "doc", 2)
+
+	// First snapshot at cursor 2: created.
+	created, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"title":"a","v":1}`))
+	if err != nil || !created {
+		t.Fatalf("first snapshot = %v, %v", created, err)
+	}
+
+	// Decoded-equal retry (reordered keys, whitespace, 1 vs 1.0): not created.
+	created, err = s.PutSnapshot("doc", 2, json.RawMessage(`{ "v": 1.0, "title": "a" }`))
+	if err != nil || created {
+		t.Fatalf("equal retry created=%v err=%v", created, err)
+	}
+
+	// Different state: conflict, stored snapshot untouched.
+	_, err = s.PutSnapshot("doc", 2, json.RawMessage(`{"title":"b"}`))
+	var conflict *ErrSnapshotConflict
+	if !errors.As(err, &conflict) || conflict.Cursor != 2 {
+		t.Fatalf("want *ErrSnapshotConflict{2}, got %v", err)
+	}
+	snap, err := s.GetSnapshot("doc", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !jsonEqual(snap.State, json.RawMessage(`{"title":"a","v":1}`)) {
+		t.Fatalf("conflict mutated snapshot: %s", snap.State)
+	}
+
+	// Another cursor of the same document gets its own snapshot.
+	created, err = s.PutSnapshot("doc", 1, json.RawMessage(`[1,2,3]`))
+	if err != nil || !created {
+		t.Fatalf("cursor 1 snapshot = %v, %v", created, err)
+	}
+	snap, err = s.GetSnapshot("doc", 1)
+	if err != nil || string(snap.State) != `[1,2,3]` || snap.Cursor != 1 {
+		t.Fatalf("get cursor 1 = %+v, %v", snap, err)
+	}
+}
+
+func TestSnapshotRejectsUnknownCursor(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	seedDoc(t, s, "doc", 2)
+
+	// Cursor 0 is never a change cursor.
+	if _, err := s.PutSnapshot("doc", 0, json.RawMessage(`{}`)); !errors.Is(err, ErrSnapshotCursor) {
+		t.Fatalf("cursor 0 want ErrSnapshotCursor, got %v", err)
+	}
+	// Cursor past the high-water mark.
+	if _, err := s.PutSnapshot("doc", 3, json.RawMessage(`{}`)); !errors.Is(err, ErrSnapshotCursor) {
+		t.Fatalf("ahead cursor want ErrSnapshotCursor, got %v", err)
+	}
+	// Unknown document.
+	if _, err := s.PutSnapshot("ghost", 1, json.RawMessage(`{}`)); !errors.Is(err, ErrSnapshotCursor) {
+		t.Fatalf("unknown doc want ErrSnapshotCursor, got %v", err)
+	}
+
+	// Zero write on all the above failures.
+	if _, err := s.GetSnapshot("doc", 0); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("snapshot leaked after rejected writes: %v", err)
+	}
+
+	// Snapshots live per document: the same cursor in two known documents is
+	// independent, and rejected writes on one never touch the other.
+	seedDoc(t, s, "doc2", 1)
+	created, err := s.PutSnapshot("doc2", 1, json.RawMessage(`{"from":"doc2"}`))
+	if err != nil || !created {
+		t.Fatalf("doc2 snapshot = %v, %v", created, err)
+	}
+	if _, err := s.GetSnapshot("doc", 1); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("doc2 snapshot leaked into doc: %v", err)
+	}
+
+	created, err = s.PutSnapshot("doc", 1, json.RawMessage(`{"from":"doc"}`))
+	if err != nil || !created {
+		t.Fatalf("doc snapshot = %v, %v", created, err)
+	}
+	snap, err := s.GetSnapshot("doc2", 1)
+	if err != nil || !jsonEqual(snap.State, json.RawMessage(`{"from":"doc2"}`)) {
+		t.Fatalf("doc snapshot disturbed doc2: %+v err=%v", snap, err)
+	}
+	snap, err = s.GetSnapshot("doc", 1)
+	if err != nil || !jsonEqual(snap.State, json.RawMessage(`{"from":"doc"}`)) {
+		t.Fatalf("doc snapshot read = %+v err=%v", snap, err)
+	}
+}
+
+func TestSnapshotGetNotFound(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	seedDoc(t, s, "doc", 2)
+
+	if _, err := s.GetSnapshot("doc", 1); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("missing snapshot want ErrSnapshotNotFound, got %v", err)
+	}
+	if _, err := s.GetSnapshot("doc", 9); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("cursor without change want ErrSnapshotNotFound, got %v", err)
+	}
+	if _, err := s.GetSnapshot("ghost", 1); !errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("unknown document want ErrSnapshotNotFound, got %v", err)
+	}
+}
+
+func TestSnapshotDoesNotAffectChanges(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	seedDoc(t, s, "doc", 2)
+
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"x":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "c3", DeviceID: "dev", Payload: json.RawMessage(`{"n":3}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, next, err := s.ListChanges("doc", 0, 100)
+	if err != nil || len(rows) != 3 || next != 3 {
+		t.Fatalf("changes after snapshot rows=%+v next=%d err=%v", rows, next, err)
+	}
+
+	// Merge still sees a contiguous change log and appends at cursor 4.
+	r, err := s.MergeChange("doc", 3, Change{ID: "c4", DeviceID: "dev", Payload: json.RawMessage(`{"z":4}`)})
+	if err != nil || r.Outcome != "applied" || r.Cursor != 4 {
+		t.Fatalf("merge after snapshot = %+v err=%v", r, err)
+	}
+}
+
+func TestSnapshotPersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedDoc(t, s, "doc", 2)
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"k":"v"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	snap, err := s2.GetSnapshot("doc", 2)
+	if err != nil {
+		t.Fatalf("snapshot after reopen: %v", err)
+	}
+	if snap.Cursor != 2 || string(snap.State) != `{"k":"v"}` {
+		t.Fatalf("snapshot after reopen = %+v", snap)
+	}
+
+	// Idempotent retry and conflict judgment survive restart unchanged.
+	created, err := s2.PutSnapshot("doc", 2, json.RawMessage(`{"k":"v"}`))
+	if err != nil || created {
+		t.Fatalf("retry after reopen created=%v err=%v", created, err)
+	}
+	if _, err := s2.PutSnapshot("doc", 2, json.RawMessage(`{"k":"other"}`)); !errors.As(err, new(*ErrSnapshotConflict)) {
+		t.Fatalf("conflict after reopen want conflict, got %v", err)
+	}
+}
+
+func TestSnapshotConcurrentSameCursor(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	seedDoc(t, s, "doc", 1)
+
+	const n = 20
+	var wg sync.WaitGroup
+	creations, conflicts := 0, 0
+	var mu sync.Mutex
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Half the goroutines post the same state, half a distinct one.
+			state := fmt.Sprintf(`{"i":%d}`, i%2)
+			created, err := s.PutSnapshot("doc", 1, json.RawMessage(state))
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil && created:
+				creations++
+			case errors.As(err, new(*ErrSnapshotConflict)):
+				conflicts++
+			case err == nil:
+				// idempotent retry
+			default:
+				t.Errorf("unexpected err: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	if creations != 1 {
+		t.Fatalf("want exactly 1 creation, got %d (conflicts=%d)", creations, conflicts)
+	}
+	snap, err := s.GetSnapshot("doc", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Cursor != 1 {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+}

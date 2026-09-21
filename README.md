@@ -81,3 +81,32 @@ go test ./...
 ### 路径中的空文档 ID
 
 `/v1/documents//changes`、`/v1/documents//merge` 等 `documentID` 段为空的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
+
+### `POST /v1/documents/{documentID}/snapshots`
+
+为变更日志某个已有 cursor 持久化一份状态快照。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"cursor": 2, "state": {"any": "json"}}
+```
+
+- `documentID` 非空；`cursor` 为非负整数（不接受小数、字符串、布尔或 `null`）；`state` 必填且为任意合法 JSON 值（对象、数组、`false`、`0`、`""`、`null` 等均可）。
+- 只有已知文档的**现有 cursor**可以创建快照（cursor 从 1 开始，cursor `0` 或超过当前高水位均拒绝）；否则返回 `400` 且零写入。
+- 同一文档同一 cursor 仅保留一份快照：
+  - 首次创建返回 `200`：`{"cursor":N,"created":true}`。
+  - 重试且 `state` 解码后与已存值相同（键序、空白、`1` 与 `1.0` 等差异忽略）返回 `200` 且 `"created":false`，不改写已存内容。
+  - `state` 解码后不同返回 `409` JSON 错误，已存快照保持不变。
+- 校验与写入在同一个序列化事务内完成；并发提交下同一 cursor 恰好一个创建成功。提交同步落盘，重启后快照可读，幂等与冲突判定不变。
+- 快照不影响 changes 与 merge：游标分配、增量读取、合并规则完全不变。
+
+### `GET /v1/documents/{documentID}/snapshots/{cursor}`
+
+读取一份快照：
+
+- `cursor` 路径段为十进制非负整数；格式错误、空 cursor 段或空 `documentID` 返回 `400` JSON 错误。
+- 命中返回 `200`：`{"cursor":N,"state":...}`，`state` 为创建时提交的 JSON 值。
+- 文档不存在、cursor 没有对应变更、或该 cursor 没有快照，均返回 `404` JSON 错误。
+
+### 错误响应
+
+所有接口错误均为 `application/json`：`{"error": "..."}`。
