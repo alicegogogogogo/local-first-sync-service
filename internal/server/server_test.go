@@ -373,6 +373,7 @@ func TestEmptyDocumentIDReturnsJSON400(t *testing.T) {
 		{http.MethodGet, "/v1/documents//changes", ""},
 		{http.MethodPost, "/v1/documents//changes", `{"deviceId":"d","changes":[{"id":"c","payload":1}]}`},
 		{http.MethodPost, "/v1/documents//merge", `{"deviceId":"d","baseCursor":0,"change":{"id":"c","payload":{}}}`},
+		{http.MethodPost, "/v1/documents//restore", `{"deviceId":"d","changeId":"c","snapshotCursor":1}`},
 	}
 	for _, tc := range cases {
 		var r *http.Request
@@ -769,5 +770,313 @@ func TestSnapshotPersistenceAcrossRestartHTTP(t *testing.T) {
 	_, body = doRequest(t, h2, http.MethodGet, "/v1/documents/doc1/changes")
 	if body["nextCursor"].(float64) != 2 {
 		t.Fatalf("nextCursor = %v", body["nextCursor"])
+	}
+}
+
+func restoreBody(t *testing.T, h http.Handler, doc string, body any) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	return postJSON(t, h, "/v1/documents/"+doc+"/restore", body)
+}
+
+// seedSnapshotViaHTTP posts n changes and stores state at snapshot cursor at.
+func seedSnapshotViaHTTP(t *testing.T, h http.Handler, doc string, n, at int, state string) {
+	t.Helper()
+	seedDoc(t, h, doc, n)
+	w, _ := postJSON(t, h, "/v1/documents/"+doc+"/snapshots",
+		fmt.Sprintf(`{"cursor":%d,"state":%s}`, at, state))
+	if w.Code != http.StatusOK {
+		t.Fatalf("seed snapshot status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRestoreHTTPSuccess(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedSnapshotViaHTTP(t, h, "doc1", 2, 2, `{"text":"hello"}`)
+
+	w, body := restoreBody(t, h, "doc1", map[string]any{
+		"deviceId":       "dev-A",
+		"changeId":       "restore-1",
+		"snapshotCursor": float64(2),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["id"] != "restore-1" || body["created"] != true ||
+		body["cursor"].(float64) != 3 || body["restoredFrom"].(float64) != 2 {
+		t.Fatalf("restore body = %v", body)
+	}
+
+	// The restore appears as an ordinary change whose payload is the snapshot
+	// state.
+	w, body = doRequest(t, h, http.MethodGet, "/v1/documents/doc1/changes?after=2")
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	list := body["changes"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("changes = %v", list)
+	}
+	row := list[0].(map[string]any)
+	if row["id"] != "restore-1" || row["deviceId"] != "dev-A" {
+		t.Fatalf("restore row = %v", row)
+	}
+	if row["payload"].(map[string]any)["text"] != "hello" {
+		t.Fatalf("payload = %v", row["payload"])
+	}
+}
+
+func TestRestoreHTTPIdempotentAndConflict(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshotViaHTTP(t, h, "doc1", 2, 1, `{"v":1}`)
+	// doc1 already has cursors 1 and 2; add a second snapshot at cursor 2.
+	w2, _ := postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":2,"state":{"v":2}}`)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("seed snapshot 2 = %d body=%s", w2.Code, w2.Body.String())
+	}
+	first, body := restoreBody(t, h, "doc1", map[string]any{
+		"deviceId":       "dev",
+		"changeId":       "r1",
+		"snapshotCursor": float64(1),
+	})
+	if first.Code != http.StatusOK {
+		t.Fatal(first.Body.String())
+	}
+	if body["created"] != true || body["cursor"].(float64) != 3 {
+		t.Fatalf("first = %v", body)
+	}
+
+	// Identical restore: 200, created=false, first cursor.
+	w, body := restoreBody(t, h, "doc1", map[string]any{
+		"deviceId":       "dev",
+		"changeId":       "r1",
+		"snapshotCursor": float64(1),
+	})
+	if w.Code != http.StatusOK || body["created"] != false || body["cursor"].(float64) != 3 {
+		t.Fatalf("idempotent = %d %v body=%s", w.Code, body, w.Body.String())
+	}
+
+	// Different deviceId -> 409 zero write.
+	before, _, _ := s.ListChanges("doc1", 0, 100)
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"device mismatch", map[string]any{"deviceId": "other", "changeId": "r1", "snapshotCursor": float64(1)}},
+		{"source mismatch", map[string]any{"deviceId": "dev", "changeId": "r1", "snapshotCursor": float64(2)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, b := restoreBody(t, h, "doc1", tc.body)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409, body = %s", w.Code, w.Body.String())
+			}
+			if b["error"] == nil {
+				t.Fatalf("error body = %s", w.Body.String())
+			}
+		})
+	}
+	after, _, _ := s.ListChanges("doc1", 0, 100)
+	if len(after) != len(before) {
+		t.Fatalf("conflict wrote rows: before=%d after=%d", len(before), len(after))
+	}
+
+	// An id already used by an ordinary change conflicts as well.
+	w, _ = postJSON(t, h, "/v1/documents/doc1/changes", map[string]any{
+		"deviceId": "dev",
+		"changes":  []any{map[string]any{"id": "plain", "payload": map[string]any{"p": 1}}},
+	})
+	if w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	w, _ = restoreBody(t, h, "doc1", map[string]any{
+		"deviceId":       "dev",
+		"changeId":       "plain",
+		"snapshotCursor": float64(1),
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("ordinary-id restore status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRestoreHTTPNotFound(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshotViaHTTP(t, h, "doc1", 2, 1, `{"v":1}`)
+
+	for _, tc := range []struct {
+		name   string
+		doc    string
+		cursor float64
+	}{
+		{"unknown document", "ghost", 1},
+		{"cursor without snapshot", "doc1", 2},
+		{"cursor ahead", "doc1", 99},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, body := restoreBody(t, h, tc.doc, map[string]any{
+				"deviceId":       "dev",
+				"changeId":       "rX",
+				"snapshotCursor": tc.cursor,
+			})
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404, body = %s", w.Code, w.Body.String())
+			}
+			if body["error"] == nil {
+				t.Fatalf("error body = %s", w.Body.String())
+			}
+		})
+	}
+
+	// Zero writes: doc1 still ends at cursor 2.
+	rows, next, _ := s.ListChanges("doc1", 0, 100)
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("404 restore wrote rows: %+v next=%d", rows, next)
+	}
+}
+
+func TestRestoreHTTPRejectsBadInput(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshotViaHTTP(t, h, "doc1", 1, 1, `{"v":1}`)
+	const url = "/v1/documents/doc1/restore"
+
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"wrong content type", "text/plain", `{"deviceId":"d","changeId":"r","snapshotCursor":1}`},
+		{"missing content type", "", `{"deviceId":"d","changeId":"r","snapshotCursor":1}`},
+		{"json suffix content type", "application/vnd.api+json", `{"deviceId":"d","changeId":"r","snapshotCursor":1}`},
+		{"malformed json", "application/json", `{`},
+		{"trailing content", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":1}x`},
+		{"missing deviceId", "application/json", `{"changeId":"r","snapshotCursor":1}`},
+		{"empty deviceId", "application/json", `{"deviceId":"","changeId":"r","snapshotCursor":1}`},
+		{"numeric deviceId", "application/json", `{"deviceId":7,"changeId":"r","snapshotCursor":1}`},
+		{"missing changeId", "application/json", `{"deviceId":"d","snapshotCursor":1}`},
+		{"empty changeId", "application/json", `{"deviceId":"d","changeId":"","snapshotCursor":1}`},
+		{"numeric changeId", "application/json", `{"deviceId":"d","changeId":5,"snapshotCursor":1}`},
+		{"missing snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r"}`},
+		{"null snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":null}`},
+		{"zero snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":0}`},
+		{"negative snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":-1}`},
+		{"fractional snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":1.5}`},
+		{"string snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":"1"}`},
+		{"boolean snapshotCursor", "application/json", `{"deviceId":"d","changeId":"r","snapshotCursor":true}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, url, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("content type = %q", ct)
+			}
+			var b map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &b); err != nil || b["error"] == "" {
+				t.Fatalf("body = %s", w.Body.String())
+			}
+		})
+	}
+
+	// All rejected requests were zero-write.
+	rows, next, _ := s.ListChanges("doc1", 0, 100)
+	if len(rows) != 1 || next != 1 {
+		t.Fatalf("zero-write violated: %+v next=%d", rows, next)
+	}
+
+	// Empty documentID is a 400 JSON error, not a mux redirect.
+	r := httptest.NewRequest(http.MethodPost, "/v1/documents//restore",
+		strings.NewReader(`{"deviceId":"d","changeId":"r","snapshotCursor":1}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || w.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("empty doc = %d %q body=%s", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+	}
+}
+
+func TestRestoreHTTPPersistenceAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s)
+	seedSnapshotViaHTTP(t, h, "doc1", 1, 1, `{"a":1}`)
+	w, _ := restoreBody(t, h, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": float64(1),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	h2 := NewHandler(s2)
+
+	w, body := restoreBody(t, h2, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": float64(1),
+	})
+	if w.Code != http.StatusOK || body["created"] != false || body["cursor"].(float64) != 2 {
+		t.Fatalf("idempotent after restart = %d %v", w.Code, body)
+	}
+}
+
+func TestRestoreHTTPConcurrentUniqueCursors(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedSnapshotViaHTTP(t, h, "doc1", 1, 1, `{"v":1}`)
+
+	const n = 30
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	cursors := make(chan float64, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w, body := restoreBody(t, h, "doc1", map[string]any{
+				"deviceId":       "dev",
+				"changeId":       fmt.Sprintf("r%02d", i),
+				"snapshotCursor": float64(1),
+			})
+			if w.Code != http.StatusOK {
+				errs <- fmt.Errorf("restore %d status %d: %s", i, w.Code, w.Body.String())
+				return
+			}
+			cursors <- body["cursor"].(float64)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	close(cursors)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	seen := make(map[float64]bool, n)
+	for c := range cursors {
+		if seen[c] {
+			t.Fatalf("duplicate cursor %v", c)
+		}
+		seen[c] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("got %d cursors, want %d", len(seen), n)
+	}
+	for c := float64(2); c <= n+1; c++ {
+		if !seen[c] {
+			t.Fatalf("cursors not contiguous, missing %v", c)
+		}
 	}
 }

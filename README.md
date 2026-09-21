@@ -96,6 +96,22 @@ go test ./...
 - `cursor` 为十进制非负整数；格式错误或空 `documentID` 返回 `400` JSON 错误。
 - 命中返回 `200` `{"cursor":N,"state":...}`；文档、cursor 或快照不存在返回 `404` JSON 错误。
 
+### `POST /v1/documents/{documentID}/restore`
+
+基于快照做历史恢复。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "changeId": "change-9", "snapshotCursor": 2}
+```
+
+- `documentID`、`deviceId`、`changeId` 均为非空字符串；`snapshotCursor` 为正整数（不接受小数、字符串、布尔、`null` 或缺失，也不接受 0）。
+- 类型头错误、JSON 非法、尾随内容、空 `documentID` 或任一字段无效均返回 `400` JSON 错误且零写入。
+- `snapshotCursor` 未命中该文档的快照（包含未知文档、cursor 无快照）返回 `404` JSON 错误且零写入。
+- 命中后在单事务内把该快照的 `state` 作为 payload，以 `deviceId`、`changeId` 追加一条**普通 change**：旧记录不变，cursor 在文档当前高水位上加一并连续分配。
+- 成功返回 `200`：`{"id":changeId,"created":true,"cursor":N,"restoredFrom":snapshotCursor}`。恢复出的记录可经 `GET .../changes` 读到，形态与普通 change 一致。
+- 同一文档的同一 `changeId` 仅当 `deviceId`、`snapshotCursor`、来源快照 state 全部相同时才幂等：返回 `200`、`created=false`、cursor 为首次值、`restoredFrom` 为原快照 cursor。该 id 已被普通 change（经 `/changes` 或 `/merge` 写入）占用，或任一要素不符，返回 `409` JSON 错误且零写入。
+- 恢复来源（provenance）同步落盘，重启后幂等与冲突判定不变；并发恢复在序列化事务内完成，cursor 唯一且连续。
+
 ### 路径中的空文档 ID
 
 `/v1/documents//changes`、`/v1/documents//merge` 等 `documentID` 段为空的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。

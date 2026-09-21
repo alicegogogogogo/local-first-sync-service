@@ -48,6 +48,12 @@ type snapshotPostRequest struct {
 	State  json.RawMessage `json:"state"`
 }
 
+type restoreRequest struct {
+	DeviceID       string          `json:"deviceId"`
+	ChangeID       string          `json:"changeId"`
+	SnapshotCursor json.RawMessage `json:"snapshotCursor"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
@@ -70,6 +76,9 @@ func NewHandler(s *store.Store) http.Handler {
 	})
 	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetSnapshot(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
+		handleRestore(s, w, r)
 	})
 
 	// ServeMux treats the empty document segment in /v1/documents//... as an
@@ -308,6 +317,66 @@ func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "state": state})
+}
+
+func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
+
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	var req restoreRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return
+	}
+
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+	if req.ChangeID == "" {
+		writeError(w, http.StatusBadRequest, "changeId must be a non-empty string")
+		return
+	}
+	// snapshotCursor must be present and a positive integer (no fractions,
+	// strings, booleans, null or zero).
+	if len(req.SnapshotCursor) == 0 {
+		writeError(w, http.StatusBadRequest, "snapshotCursor must be a positive integer")
+		return
+	}
+	snapshotCursor, ok := parseNonNegativeInt(req.SnapshotCursor)
+	if !ok || snapshotCursor < 1 {
+		writeError(w, http.StatusBadRequest, "snapshotCursor must be a positive integer")
+		return
+	}
+
+	result, err := s.RestoreSnapshot(documentID, req.DeviceID, req.ChangeID, snapshotCursor)
+	if err != nil {
+		var conflict *store.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrSnapshotNotFound):
+			writeError(w, http.StatusNotFound, "snapshot not found")
+			return
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "change id already exists with different deviceId, source snapshot or state: "+conflict.ID)
+			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to restore snapshot")
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 // parseCursorPath reports whether raw is a decimal non-negative integer and
