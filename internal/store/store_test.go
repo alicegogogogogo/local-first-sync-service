@@ -713,3 +713,305 @@ func TestSnapshotConcurrentPuts(t *testing.T) {
 		t.Fatalf("creators = %d, want 1", creators)
 	}
 }
+
+func TestRestoreAppendsSnapshotState(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := s.RestoreSnapshot("doc", "dev", "r1", 2)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if r.ID != "r1" || !r.Created || r.Cursor != 3 || r.RestoredFrom != 2 {
+		t.Fatalf("restore result = %+v", r)
+	}
+
+	// The restore is an ordinary change carrying the snapshot state; old rows
+	// are unchanged and the cursor advanced by exactly one.
+	rows, next, err := s.ListChanges("doc", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 || next != 3 {
+		t.Fatalf("rows = %+v next=%d", rows, next)
+	}
+	last := rows[2]
+	if last.ID != "r1" || last.DeviceID != "dev" || last.Cursor != 3 || !jsonEqual(last.Payload, json.RawMessage(`{"v":2}`)) {
+		t.Fatalf("restored row = %+v", last)
+	}
+	if rows[0].ID != "c1" || rows[1].ID != "c2" {
+		t.Fatalf("old rows changed: %+v", rows)
+	}
+
+	// A second restore appends again with a new cursor.
+	r, err = s.RestoreSnapshot("doc", "dev", "r2", 2)
+	if err != nil || !r.Created || r.Cursor != 4 {
+		t.Fatalf("second restore = %+v err=%v", r, err)
+	}
+}
+
+func TestRestoreSnapshotMiss(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, docCursor := range map[string]struct {
+		doc    string
+		cursor int64
+	}{
+		"unknown document":        {"nope", 1},
+		"cursor without snapshot": {"doc", 1},
+		"cursor ahead":            {"doc", 99},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := s.RestoreSnapshot(docCursor.doc, "dev", "r", docCursor.cursor)
+			if !errors.Is(err, ErrSnapshotNotFound) {
+				t.Fatalf("err = %v, want ErrSnapshotNotFound", err)
+			}
+		})
+	}
+
+	// Zero writes: nothing was appended.
+	rows, next, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("zero-write violated: rows=%d next=%d", len(rows), next)
+	}
+}
+
+func TestRestoreIdempotentRepeat(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 1, json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := s.RestoreSnapshot("doc", "dev", "r1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Identical repeat is idempotent: created=false, first cursor, and no new
+	// row even when the document advanced in the meantime.
+	if _, err := s.PostChanges("doc", []Change{
+		{ID: "later", DeviceID: "dev", Payload: json.RawMessage(`{"x":1}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.RestoreSnapshot("doc", "dev", "r1", 1)
+	if err != nil {
+		t.Fatalf("repeat: %v", err)
+	}
+	if again.Created || again.Cursor != first.Cursor || again.RestoredFrom != 1 {
+		t.Fatalf("repeat result = %+v, want created=false cursor=%d", again, first.Cursor)
+	}
+	rows, next, _ := s.ListChanges("doc", 0, 100)
+	if len(rows) != 3 || next != 3 {
+		t.Fatalf("idempotent repeat appended: rows=%d next=%d", len(rows), next)
+	}
+}
+
+func TestRestoreConflicts(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 1, json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"v":2}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	mustConflict := func(name, deviceID, changeID string, snapshotCursor int64) {
+		t.Helper()
+		before, beforeNext, _ := s.ListChanges("doc", 0, 100)
+		_, err := s.RestoreSnapshot("doc", deviceID, changeID, snapshotCursor)
+		var conflict *ErrRestoreConflict
+		if !errors.As(err, &conflict) {
+			t.Fatalf("%s: err = %v, want *ErrRestoreConflict", name, err)
+		}
+		after, afterNext, _ := s.ListChanges("doc", 0, 100)
+		if len(after) != len(before) || afterNext != beforeNext {
+			t.Fatalf("%s wrote rows: before=%d after=%d", name, len(before), len(after))
+		}
+	}
+
+	// An ordinary change occupies the id.
+	mustConflict("ordinary change id", "dev", "c1", 1)
+
+	// A successful restore first.
+	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Different deviceId, different source state/cursor are all 409.
+	mustConflict("device mismatch", "other", "r1", 1)
+	mustConflict("snapshotCursor mismatch with different state", "dev", "r1", 2)
+}
+
+func TestRestoreCursorMismatchWithEqualState(t *testing.T) {
+	// A different snapshotCursor is a conflict even when the states decode
+	// equal: snapshotCursor is part of the idempotency key.
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 1, json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"v":1.0}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 2); !errors.As(err, new(*ErrRestoreConflict)) {
+		t.Fatalf("equal state, different snapshotCursor: err = %v, want conflict", err)
+	}
+}
+
+func TestRestorePersistsAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 1, json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	// Provenance survives the restart: identical replay is still idempotent.
+	r, err := s2.RestoreSnapshot("doc", "dev", "r1", 1)
+	if err != nil || r.Created || r.Cursor != 2 || r.RestoredFrom != 1 {
+		t.Fatalf("replay after restart = %+v err=%v", r, err)
+	}
+	// A differing device is still a conflict after restart.
+	if _, err := s2.RestoreSnapshot("doc", "other", "r1", 1); !errors.As(err, new(*ErrRestoreConflict)) {
+		t.Fatalf("conflict after restart err = %v", err)
+	}
+	// The appended change reads back with the snapshot state.
+	rows, next, err := s2.ListChanges("doc", 0, 100)
+	if err != nil || len(rows) != 2 || next != 2 || !jsonEqual(rows[1].Payload, json.RawMessage(`{"v":1}`)) {
+		t.Fatalf("rows after restart = %+v next=%d err=%v", rows, next, err)
+	}
+}
+
+func TestRestoreConcurrent(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 1, json.RawMessage(`{"v":1}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r, err := s.RestoreSnapshot("doc", "dev", fmt.Sprintf("r%d", i), 1)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if !r.Created || r.RestoredFrom != 1 {
+				errCh <- fmt.Errorf("restore %d bad result %+v", i, r)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	rows, next, err := s.ListChanges("doc", 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != n+1 || next != n+1 {
+		t.Fatalf("rows=%d next=%d want %d/%d", len(rows), next, n+1, n+1)
+	}
+	seen := map[int64]bool{}
+	for _, r := range rows[1:] {
+		if seen[r.Cursor] {
+			t.Fatalf("duplicate cursor %d", r.Cursor)
+		}
+		seen[r.Cursor] = true
+	}
+	for c := int64(2); c <= n+1; c++ {
+		if !seen[c] {
+			t.Fatalf("cursors not contiguous, missing %d", c)
+		}
+	}
+
+	// Concurrent identical restores: exactly one creator, rest idempotent.
+	var mu sync.Mutex
+	creators := 0
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := s.RestoreSnapshot("doc", "dev", "same", 1)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if r.Cursor != n+2 {
+				t.Errorf("idempotent cursor = %d, want %d", r.Cursor, n+2)
+			}
+			if r.Created {
+				mu.Lock()
+				creators++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if creators != 1 {
+		t.Fatalf("creators = %d, want 1", creators)
+	}
+}

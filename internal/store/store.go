@@ -10,6 +10,11 @@
 // existing change cursors. Snapshots are write-once per cursor — a matching
 // re-post is idempotent, a differing one a conflict — and live apart from the
 // change log.
+//
+// A restore appends an ordinary change whose payload is a snapshot's state.
+// Restore provenance (the snapshot cursor the state came from) is persisted in
+// its own table, so after restart a repeated restore is still distinguishable
+// from an ordinary change and idempotency/conflict decisions are unchanged.
 package store
 
 import (
@@ -86,6 +91,26 @@ func (e *ErrSnapshotConflict) Error() string {
 	return fmt.Sprintf("conflicting snapshot for cursor %d", e.Cursor)
 }
 
+// ErrRestoreConflict reports that a restore references a change id that is
+// already taken by an ordinary change, or by a prior restore whose deviceId,
+// snapshot cursor or source state differs. Nothing is written; the caller maps
+// it to 409.
+type ErrRestoreConflict struct {
+	ID string
+}
+
+func (e *ErrRestoreConflict) Error() string {
+	return fmt.Sprintf("change id %q conflicts with the change log", e.ID)
+}
+
+// RestoreResult reports the outcome of an accepted RestoreSnapshot.
+type RestoreResult struct {
+	ID           string `json:"id"`
+	Created      bool   `json:"created"`
+	Cursor       int64  `json:"cursor"`
+	RestoredFrom int64  `json:"restoredFrom"`
+}
+
 // Store is the durable change log.
 type Store struct {
 	db *sql.DB
@@ -136,6 +161,17 @@ CREATE TABLE IF NOT EXISTS snapshots (
 	state       BLOB NOT NULL,
 	PRIMARY KEY (document_id, cursor)
 );
+CREATE TABLE IF NOT EXISTS restores (
+	document_id     TEXT NOT NULL,
+	change_id       TEXT NOT NULL,
+	device_id       TEXT NOT NULL,
+	snapshot_cursor INTEGER NOT NULL,
+	change_cursor   INTEGER NOT NULL,
+	state           BLOB NOT NULL,
+	PRIMARY KEY (document_id, change_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS restores_doc_cursor_idx
+	ON restores(document_id, change_cursor);
 `)
 	return err
 }
@@ -416,6 +452,114 @@ func (s *Store) GetSnapshot(documentID string, cursor int64) (json.RawMessage, e
 	default:
 		return json.RawMessage(state), nil
 	}
+}
+
+// RestoreSnapshot appends one ordinary change whose payload is the state of
+// documentID's snapshot at snapshotCursor, all within a single serialized
+// transaction.
+//
+//   - A snapshot miss (unknown document or a cursor without a snapshot)
+//     returns ErrSnapshotNotFound; nothing is written.
+//   - If changeID already belongs to a prior restore, the call is idempotent
+//     only when deviceId, snapshotCursor and the decoded source state all
+//     match; the first result (created=false, original cursor) is returned.
+//   - If changeID is taken by an ordinary change, or a restore whose provenance
+//     differs, the call returns *ErrRestoreConflict; nothing is written.
+//
+// Otherwise a new change is appended with the next document cursor and the
+// restore provenance is recorded. Old rows are never modified.
+func (s *Store) RestoreSnapshot(documentID string, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// The snapshot must exist; its state is the payload to append.
+	var state []byte
+	err = tx.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, snapshotCursor,
+	).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return RestoreResult{}, ErrSnapshotNotFound
+	case err != nil:
+		return RestoreResult{}, err
+	}
+
+	// Resolve the change id: an ordinary row and a prior restore are handled
+	// differently, so consult both tables.
+	var existingCursor int64
+	var existingDevice string
+	var existingPayload []byte
+	err = tx.QueryRow(
+		`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+		documentID, changeID,
+	).Scan(&existingCursor, &existingDevice, &existingPayload)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// New id; fall through to append below.
+	case err != nil:
+		return RestoreResult{}, err
+	default:
+		var restDevice string
+		var restSnapshotCursor int64
+		var restState []byte
+		err = tx.QueryRow(
+			`SELECT device_id, snapshot_cursor, state FROM restores WHERE document_id = ? AND change_id = ?`,
+			documentID, changeID,
+		).Scan(&restDevice, &restSnapshotCursor, &restState)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// The id belongs to an ordinary change (or a batch/merge change),
+			// not a restore: never treat it as an idempotent restore.
+			return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+		case err != nil:
+			return RestoreResult{}, err
+		default:
+			if restDevice != deviceID || restSnapshotCursor != snapshotCursor || !jsonEqual(restState, state) {
+				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			return RestoreResult{
+				ID:           changeID,
+				Created:      false,
+				Cursor:       existingCursor,
+				RestoredFrom: snapshotCursor,
+			}, nil
+		}
+	}
+
+	var nextCursor int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&nextCursor); err != nil {
+		return RestoreResult{}, err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
+		documentID, nextCursor, changeID, deviceID, state,
+	); err != nil {
+		return RestoreResult{}, err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO restores (document_id, change_id, device_id, snapshot_cursor, change_cursor, state)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		documentID, changeID, deviceID, snapshotCursor, nextCursor, state,
+	); err != nil {
+		return RestoreResult{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return RestoreResult{}, err
+	}
+	return RestoreResult{
+		ID:           changeID,
+		Created:      true,
+		Cursor:       nextCursor,
+		RestoredFrom: snapshotCursor,
+	}, nil
 }
 
 // errNotObject marks a payload that is not a JSON object.

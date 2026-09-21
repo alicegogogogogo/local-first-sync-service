@@ -373,6 +373,7 @@ func TestEmptyDocumentIDReturnsJSON400(t *testing.T) {
 		{http.MethodGet, "/v1/documents//changes", ""},
 		{http.MethodPost, "/v1/documents//changes", `{"deviceId":"d","changes":[{"id":"c","payload":1}]}`},
 		{http.MethodPost, "/v1/documents//merge", `{"deviceId":"d","baseCursor":0,"change":{"id":"c","payload":{}}}`},
+		{http.MethodPost, "/v1/documents//restore", `{"deviceId":"d","changeId":"c","snapshotCursor":1}`},
 	}
 	for _, tc := range cases {
 		var r *http.Request
@@ -769,5 +770,300 @@ func TestSnapshotPersistenceAcrossRestartHTTP(t *testing.T) {
 	_, body = doRequest(t, h2, http.MethodGet, "/v1/documents/doc1/changes")
 	if body["nextCursor"].(float64) != 2 {
 		t.Fatalf("nextCursor = %v", body["nextCursor"])
+	}
+}
+
+func restoreJSON(t *testing.T, h http.Handler, doc string, body any) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	return postJSON(t, h, "/v1/documents/"+doc+"/restore", body)
+}
+
+// seedSnapshot creates n changes in doc and stores a snapshot at cursor n.
+func seedSnapshot(t *testing.T, h http.Handler, doc string, n int, state string) {
+	t.Helper()
+	seedDoc(t, h, doc, n)
+	w, _ := postJSON(t, h, "/v1/documents/"+doc+"/snapshots", fmt.Sprintf(`{"cursor":%d,"state":%s}`, n, state))
+	if w.Code != http.StatusOK {
+		t.Fatalf("seed snapshot status = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRestoreHTTPSuccess(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedSnapshot(t, h, "doc1", 2, `{"text":"hello","n":1}`)
+
+	w, body := restoreJSON(t, h, "doc1", map[string]any{
+		"deviceId":       "dev-A",
+		"changeId":       "restore-1",
+		"snapshotCursor": 2,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	if body["id"] != "restore-1" || body["created"] != true ||
+		body["cursor"].(float64) != 3 || body["restoredFrom"].(float64) != 2 {
+		t.Fatalf("restore body = %v", body)
+	}
+
+	// The appended change is ordinary and carries the snapshot state.
+	w, list := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/changes?after=2")
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	rows := list["changes"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if row["id"] != "restore-1" || row["deviceId"] != "dev-A" || row["cursor"].(float64) != 3 {
+		t.Fatalf("restored change = %v", row)
+	}
+	state := row["payload"].(map[string]any)
+	if state["text"] != "hello" || state["n"].(float64) != 1 {
+		t.Fatalf("restored payload = %v", row["payload"])
+	}
+	if list["nextCursor"].(float64) != 3 {
+		t.Fatalf("nextCursor = %v", list["nextCursor"])
+	}
+
+	// The snapshot itself is still readable and old rows untouched.
+	w, snap := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/snapshots/2")
+	if w.Code != http.StatusOK || snap["state"].(map[string]any)["text"] != "hello" {
+		t.Fatalf("snapshot after restore = %d %v", w.Code, snap)
+	}
+}
+
+func TestRestoreHTTPValidation(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshot(t, h, "doc1", 2, `{"v":2}`)
+	const url = "/v1/documents/doc1/restore"
+
+	cases := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"wrong content type", "text/plain", `{"deviceId":"d","changeId":"c","snapshotCursor":2}`},
+		{"missing content type", "", `{"deviceId":"d","changeId":"c","snapshotCursor":2}`},
+		{"json suffix content type", "application/vnd.api+json", `{"deviceId":"d","changeId":"c","snapshotCursor":2}`},
+		{"malformed json", "application/json", `{`},
+		{"trailing content", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":2}garbage`},
+		{"missing deviceId", "application/json", `{"changeId":"c","snapshotCursor":2}`},
+		{"empty deviceId", "application/json", `{"deviceId":"","changeId":"c","snapshotCursor":2}`},
+		{"numeric deviceId", "application/json", `{"deviceId":7,"changeId":"c","snapshotCursor":2}`},
+		{"missing changeId", "application/json", `{"deviceId":"d","snapshotCursor":2}`},
+		{"empty changeId", "application/json", `{"deviceId":"d","changeId":"","snapshotCursor":2}`},
+		{"numeric changeId", "application/json", `{"deviceId":"d","changeId":7,"snapshotCursor":2}`},
+		{"missing snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c"}`},
+		{"null snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":null}`},
+		{"zero snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":0}`},
+		{"negative snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":-1}`},
+		{"fractional snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":2.5}`},
+		{"string snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":"2"}`},
+		{"boolean snapshotCursor", "application/json", `{"deviceId":"d","changeId":"c","snapshotCursor":true}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, url, strings.NewReader(tc.body))
+			if tc.contentType != "" {
+				r.Header.Set("Content-Type", tc.contentType)
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+				t.Fatalf("content type = %q", ct)
+			}
+			var b map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &b); err != nil || b["error"] == "" {
+				t.Fatalf("body = %q", w.Body.String())
+			}
+		})
+	}
+
+	// Zero writes: none of the rejected requests appended a change.
+	rows, next, err := s.ListChanges("doc1", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("zero-write violated: rows=%d next=%d", len(rows), next)
+	}
+}
+
+func TestRestoreHTTPSnapshotMiss(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshot(t, h, "doc1", 2, `{"v":2}`)
+
+	for _, tc := range []struct {
+		name string
+		doc  string
+		body any
+	}{
+		{"unknown document", "ghost", map[string]any{"deviceId": "d", "changeId": "c", "snapshotCursor": 1}},
+		{"cursor without snapshot", "doc1", map[string]any{"deviceId": "d", "changeId": "c", "snapshotCursor": 1}},
+		{"cursor ahead", "doc1", map[string]any{"deviceId": "d", "changeId": "c", "snapshotCursor": 99}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, body := restoreJSON(t, h, tc.doc, tc.body)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404, body = %s", w.Code, w.Body.String())
+			}
+			if body["error"] == nil {
+				t.Fatalf("body = %s", w.Body.String())
+			}
+		})
+	}
+
+	// Zero writes.
+	rows, next, _ := s.ListChanges("doc1", 0, 100)
+	if len(rows) != 2 || next != 2 {
+		t.Fatalf("zero-write violated: rows=%d next=%d", len(rows), next)
+	}
+}
+
+func TestRestoreHTTPIdempotentAndConflict(t *testing.T) {
+	h, s := newTestHandler(t)
+	seedSnapshot(t, h, "doc1", 2, `{"v":1}`)
+	// A second snapshot with a different state for the mismatch cases.
+	w, _ := postJSON(t, h, "/v1/documents/doc1/snapshots", `{"cursor":1,"state":{"v":9}}`)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+
+	// First restore: created at cursor 3.
+	w, body := restoreJSON(t, h, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": 2,
+	})
+	if w.Code != http.StatusOK || body["created"] != true || body["cursor"].(float64) != 3 {
+		t.Fatalf("first restore = %d %v", w.Code, body)
+	}
+
+	// Identical repeat: 200, created=false, first cursor.
+	w, body = restoreJSON(t, h, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": 2,
+	})
+	if w.Code != http.StatusOK || body["created"] != false || body["cursor"].(float64) != 3 ||
+		body["restoredFrom"].(float64) != 2 {
+		t.Fatalf("idempotent restore = %d %v", w.Code, body)
+	}
+
+	before, beforeNext, _ := s.ListChanges("doc1", 0, 100)
+
+	conflicts := []struct {
+		name string
+		body any
+	}{
+		{"device mismatch", map[string]any{"deviceId": "other", "changeId": "r1", "snapshotCursor": 2}},
+		{"snapshotCursor mismatch", map[string]any{"deviceId": "dev", "changeId": "r1", "snapshotCursor": 1}},
+		{"ordinary change occupies id", map[string]any{"deviceId": "dev", "changeId": "c1", "snapshotCursor": 2}},
+	}
+	for _, tc := range conflicts {
+		t.Run(tc.name, func(t *testing.T) {
+			w, body := restoreJSON(t, h, "doc1", tc.body)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409, body = %s", w.Code, w.Body.String())
+			}
+			if body["error"] == nil {
+				t.Fatalf("body = %s", w.Body.String())
+			}
+		})
+	}
+
+	// All conflicts zero-write; the idempotent repeat added nothing either.
+	after, afterNext, _ := s.ListChanges("doc1", 0, 100)
+	if len(after) != len(before) || afterNext != beforeNext {
+		t.Fatalf("writes leaked: before=%d/%d after=%d/%d", len(before), beforeNext, len(after), afterNext)
+	}
+}
+
+func TestRestoreHTTPPersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(s)
+	seedSnapshot(t, h, "doc1", 1, `{"a":1}`)
+	w, _ := restoreJSON(t, h, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": 1,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore status = %d", w.Code)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+	h2 := NewHandler(s2)
+
+	// Provenance survives: identical replay is idempotent with the first cursor.
+	w, body := restoreJSON(t, h2, "doc1", map[string]any{
+		"deviceId": "dev", "changeId": "r1", "snapshotCursor": 1,
+	})
+	if w.Code != http.StatusOK || body["created"] != false || body["cursor"].(float64) != 2 {
+		t.Fatalf("replay after restart = %d %v", w.Code, body)
+	}
+	// A differing device is still a 409 after restart.
+	w, _ = restoreJSON(t, h2, "doc1", map[string]any{
+		"deviceId": "other", "changeId": "r1", "snapshotCursor": 1,
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("conflict after restart = %d", w.Code)
+	}
+	// The appended change with snapshot state reads back.
+	w, list := doRequest(t, h2, http.MethodGet, "/v1/documents/doc1/changes?after=1")
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	rows := list["changes"].([]any)
+	if len(rows) != 1 || rows[0].(map[string]any)["payload"].(map[string]any)["a"].(float64) != 1 {
+		t.Fatalf("restored change after restart = %v", rows)
+	}
+}
+
+func TestRestoreHTTPConcurrent(t *testing.T) {
+	h, _ := newTestHandler(t)
+	seedSnapshot(t, h, "doc1", 1, `{"v":1}`)
+
+	const n = 30
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			w, _ := restoreJSON(t, h, "doc1", map[string]any{
+				"deviceId": "dev", "changeId": fmt.Sprintf("r%02d", i), "snapshotCursor": 1,
+			})
+			if w.Code != http.StatusOK {
+				errs <- fmt.Errorf("restore %d status %d: %s", i, w.Code, w.Body.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/changes?limit=1000")
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// 1 seeded change + n restores; cursors contiguous 1..n+1.
+	if got := len(body["changes"].([]any)); got != n+1 {
+		t.Fatalf("stored %d changes, want %d", got, n+1)
+	}
+	if body["nextCursor"].(float64) != n+1 {
+		t.Fatalf("nextCursor = %v, want %d", body["nextCursor"], n+1)
 	}
 }
