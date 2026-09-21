@@ -63,7 +63,21 @@ go test ./...
 
 - `sessionId`、`documentId` 均为非空字符串；空段返回 `400` JSON 错误而非重定向。
 - `after`、`limit` 非法返回 `400` JSON 错误（参数校验先于会话存在性检查）。
-- 会话不存在或已删除返回 `404` JSON 错误；会话存在时读取结果与既有 changes 查询逐字相同。
+- 会话不存在或已删除返回 `404` JSON 错误；会话所属设备已被撤回该文档权限时返回 `403` JSON 错误，且不返回 `changes` 或 `nextCursor`；其余情况读取结果与既有 changes 查询逐字相同。
+
+### `POST /v1/documents/{documentID}/permissions`
+
+按文档和设备持久化访问权限。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "action": "revoke"}
+```
+
+- `deviceId` 为非空字符串，`action` 为 `"grant"` 或 `"revoke"`；类型头不符、JSON 非法、尾随内容、字段缺失或类型错误、`action` 取值非法均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误且零写入。
+- 每个（文档， 设备）对初始为已授权。成功返回 `200` `{"deviceId":"device-1","authorized":false,"changed":true}`：`revoke` 首次置为未授权（`changed=true`），重试幂等（`changed=false`）；`grant` 恢复授权，已授权时重试不改（`changed=false`）。
+- 权限变更在序列化事务内完成并同步落盘：并发 grant/revoke 各自完整提交，重启后状态与幂等判定不变。
+- 撤回不删除变更、快照或会话，也不影响 documents changes、merge、restore；仅会话视角的 changes 读取返回 `403`。
 
 ### `POST /v1/documents/{documentID}/changes`
 

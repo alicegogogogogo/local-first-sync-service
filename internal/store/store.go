@@ -24,6 +24,13 @@
 // another device is a conflict, never silently re-homed. Deletes are
 // owner-scoped and hard: a repeat delete, another device, and a cross-device
 // path all miss with 404, after which the id is free to be created again.
+//
+// Document permissions sit on top of registration: every (document, device)
+// pair starts authorized, and a grant or revoke is recorded per pair. Writes
+// are serialized in one transaction and committed to disk, so concurrent
+// grant/revoke calls each land as a complete state and survive a restart.
+// Revoking never deletes changes, snapshots or sessions; it only gates the
+// session-scoped change listing.
 package store
 
 import (
@@ -210,6 +217,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_device_idx
 	ON sessions(device_id);
+CREATE TABLE IF NOT EXISTS document_permissions (
+	document_id TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	authorized  INTEGER NOT NULL,
+	PRIMARY KEY (document_id, device_id)
+);
 `)
 	return err
 }
@@ -731,6 +744,103 @@ func (s *Store) SessionExists(sessionID string) (bool, error) {
 		return false, err
 	}
 	return exists, nil
+}
+
+// SessionDevice returns the id of the device that owns the live session
+// sessionID. A session that was never created or was deleted yields
+// ErrSessionNotFound.
+func (s *Store) SessionDevice(sessionID string) (string, error) {
+	var deviceID string
+	err := s.db.QueryRow(
+		`SELECT device_id FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&deviceID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", ErrSessionNotFound
+	case err != nil:
+		return "", err
+	default:
+		return deviceID, nil
+	}
+}
+
+// SetDocumentPermission grants or revokes deviceID's access to documentID and
+// reports whether the stored permission actually changed.
+//
+// Every device starts authorized for every document, so the first revoke is
+// the first write for the pair (changed=true); repeating a state that already
+// holds writes nothing and reports changed=false. An unregistered device
+// yields ErrDeviceNotFound and nothing is written. The lookup and the write
+// run in one serialized transaction, so concurrent grant/revoke calls each
+// commit completely and the final state matches the last committed action.
+func (s *Store) SetDocumentPermission(documentID, deviceID string, authorized bool) (changed bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, deviceID,
+	).Scan(&deviceExists); err != nil {
+		return false, err
+	}
+	if !deviceExists {
+		return false, ErrDeviceNotFound
+	}
+
+	current := true // devices start authorized; a row only records a deviation
+	var stored int
+	err = tx.QueryRow(
+		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No row: the default (authorized) holds.
+	case err != nil:
+		return false, err
+	default:
+		current = stored != 0
+	}
+	if current == authorized {
+		return false, tx.Commit()
+	}
+
+	v := 0
+	if authorized {
+		v = 1
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO document_permissions (document_id, device_id, authorized) VALUES (?, ?, ?)
+		 ON CONFLICT (document_id, device_id) DO UPDATE SET authorized = excluded.authorized`,
+		documentID, deviceID, v,
+	); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DocumentAuthorized reports whether deviceID currently holds permission for
+// documentID. Devices start authorized, so an absent row means authorized.
+func (s *Store) DocumentAuthorized(documentID, deviceID string) (bool, error) {
+	var stored int
+	err := s.db.QueryRow(
+		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		return stored != 0, nil
+	}
 }
 
 // errNotObject marks a payload that is not a JSON object.
