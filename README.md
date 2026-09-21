@@ -64,6 +64,20 @@ go test ./...
 - `sessionId`、`documentId` 均为非空字符串；空段返回 `400` JSON 错误而非重定向。
 - `after`、`limit` 非法返回 `400` JSON 错误（参数校验先于会话存在性检查）。
 - 会话不存在或已删除返回 `404` JSON 错误；会话存在时读取结果与既有 changes 查询逐字相同。
+- 会话所属设备对该文档的权限已被撤回时返回 `403` JSON 错误，不返回 `changes` 或 `nextCursor`；撤回不删除任何变更、快照或会话，重新授权后读取恢复。
+
+### `POST /v1/documents/{documentID}/permissions`
+
+按文档和设备持久化访问权限，初始状态为已授权。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "action": "grant"}
+```
+
+- `documentID`、`deviceId` 均为非空字符串；`action` 为 `"grant"` 或 `"revoke"`。
+- 非法 Content-Type、JSON、尾随内容或字段返回 `400` JSON 错误且零写入；设备未注册返回 `404` JSON 错误。
+- 成功返回 `200`：`{"deviceId","authorized","changed"}`。`revoke` 首次置 `authorized=false`（`changed=true`），重复撤回 `changed=false`；`grant` 置 `authorized=true`，对已授权设备重复授权 `changed=false`。
+- 权限变更串行提交并落盘，重启后权限状态与幂等语义不变。
 
 ### `POST /v1/documents/{documentID}/changes`
 

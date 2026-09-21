@@ -58,6 +58,11 @@ type deviceRequest struct {
 	DeviceID string `json:"deviceId"`
 }
 
+type permissionRequest struct {
+	DeviceID string `json:"deviceId"`
+	Action   string `json:"action"`
+}
+
 type sessionRequest struct {
 	SessionID string `json:"sessionId"`
 }
@@ -118,6 +123,9 @@ func NewHandler(s *store.Store) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleRestore(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
+		handleSetPermission(s, w, r)
 	})
 
 	// ServeMux treats any empty path segment (the doubled slash in
@@ -527,6 +535,53 @@ func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// handleSetPermission grants or revokes a registered device's permission for
+// one document. The request shape is validated fully before anything is
+// written: a wrong content type, malformed JSON, trailing content, an empty
+// deviceId or an unknown action all fail with 400 and leave the store
+// untouched. An unregistered device is a 404. Every (document, device) pair
+// starts authorized, so the first revoke flips the state (changed=true) while
+// a repeat revoke, or a grant of an already-authorized device, reports
+// changed=false.
+func handleSetPermission(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	var req permissionRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+	var authorized bool
+	switch req.Action {
+	case "grant":
+		authorized = true
+	case "revoke":
+		authorized = false
+	default:
+		writeError(w, http.StatusBadRequest, `action must be "grant" or "revoke"`)
+		return
+	}
+
+	changed, err := s.SetPermission(documentID, req.DeviceID, authorized)
+	if err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to set permission")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deviceId":   req.DeviceID,
+		"authorized": authorized,
+		"changed":    changed,
+	})
+}
+
 // parseCursorPath reports whether raw is a decimal non-negative integer and
 // returns its value. Signs, fractions and other adornments are rejected.
 func parseCursorPath(raw string) (int64, bool) {
@@ -605,7 +660,9 @@ func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // handleSessionChanges is the session-scoped view of the existing change log:
 // both path identifiers must be non-empty (the empty-segment guard rejects
 // those before routing) and the session must currently exist, after which the
-// query behaves exactly like GET /v1/documents/{documentID}/changes.
+// query behaves exactly like GET /v1/documents/{documentID}/changes — unless
+// the session's owning device has been revoked permission for the document,
+// in which case the read is denied with a 403 and no page data.
 func handleSessionChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
@@ -617,13 +674,23 @@ func handleSessionChanges(s *store.Store, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	exists, err := s.SessionExists(sessionID)
+	deviceID, err := s.SessionDevice(sessionID)
 	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to look up session")
 		return
 	}
-	if !exists {
-		writeError(w, http.StatusNotFound, "session not found")
+
+	authorized, err := s.IsAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
 		return
 	}
 

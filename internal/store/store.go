@@ -24,6 +24,11 @@
 // another device is a conflict, never silently re-homed. Deletes are
 // owner-scoped and hard: a repeat delete, another device, and a cross-device
 // path all miss with 404, after which the id is free to be created again.
+//
+// Permissions gate a device's access to one document. Every (document,
+// device) pair starts authorized; a revoke stores an explicit denial and a
+// grant restores access. The state is persisted like everything else, so a
+// restart changes neither the effective permission nor idempotency.
 package store
 
 import (
@@ -210,6 +215,12 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_device_idx
 	ON sessions(device_id);
+CREATE TABLE IF NOT EXISTS permissions (
+	document_id TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	authorized  INTEGER NOT NULL,
+	PRIMARY KEY (document_id, device_id)
+);
 `)
 	return err
 }
@@ -731,6 +742,107 @@ func (s *Store) SessionExists(sessionID string) (bool, error) {
 		return false, err
 	}
 	return exists, nil
+}
+
+// SessionDevice returns the id of the device that owns the live session
+// sessionID. A missing or deleted session yields ErrSessionNotFound.
+func (s *Store) SessionDevice(sessionID string) (string, error) {
+	var deviceID string
+	err := s.db.QueryRow(
+		`SELECT device_id FROM sessions WHERE id = ?`, sessionID,
+	).Scan(&deviceID)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", ErrSessionNotFound
+	case err != nil:
+		return "", err
+	default:
+		return deviceID, nil
+	}
+}
+
+// SetPermission records whether deviceID is authorized for documentID and
+// reports whether the effective state changed. Permissions default to
+// authorized: a device with no stored row is authorized, so granting an
+// unrecorded device and revoking an already-revoked one both report
+// changed=false and write nothing. An unregistered device yields
+// ErrDeviceNotFound and nothing is written. The device check, the state
+// resolution and the write run in one serialized transaction, so concurrent
+// grant/revoke calls cannot interleave, and every change is committed to disk
+// before the call returns.
+func (s *Store) SetPermission(documentID, deviceID string, authorized bool) (changed bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, deviceID,
+	).Scan(&deviceExists); err != nil {
+		return false, err
+	}
+	if !deviceExists {
+		return false, ErrDeviceNotFound
+	}
+
+	var stored bool
+	err = tx.QueryRow(
+		`SELECT authorized FROM permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No row means the default: authorized.
+		if authorized {
+			return false, tx.Commit()
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO permissions (document_id, device_id, authorized) VALUES (?, ?, 0)`,
+			documentID, deviceID,
+		); err != nil {
+			return false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return false, err
+		}
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+
+	if stored == authorized {
+		return false, tx.Commit()
+	}
+	if _, err := tx.Exec(
+		`UPDATE permissions SET authorized = ? WHERE document_id = ? AND device_id = ?`,
+		authorized, documentID, deviceID,
+	); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// IsAuthorized reports whether deviceID currently holds permission for
+// documentID. A device with no stored row is authorized by default.
+func (s *Store) IsAuthorized(documentID, deviceID string) (bool, error) {
+	var authorized bool
+	err := s.db.QueryRow(
+		`SELECT authorized FROM permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&authorized)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, err
+	default:
+		return authorized, nil
+	}
 }
 
 // errNotObject marks a payload that is not a JSON object.
