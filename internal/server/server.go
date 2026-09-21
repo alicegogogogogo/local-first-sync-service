@@ -54,12 +54,51 @@ type restoreRequest struct {
 	SnapshotCursor json.RawMessage `json:"snapshotCursor"`
 }
 
+type deviceRequest struct {
+	DeviceID string `json:"deviceId"`
+}
+
+type sessionRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	mux.HandleFunc("POST /v1/devices", func(w http.ResponseWriter, r *http.Request) {
+		handleRegisterDevice(s, w, r)
+	})
+	// Non-POST verbs on the exact collection path: the method-less pattern is
+	// less specific than POST above, so it only catches the rest and answers a
+	// JSON 404 instead of ServeMux's slash redirect.
+	mux.HandleFunc("/v1/devices", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "unknown device path")
+	})
+	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "unknown session path")
+	})
+	mux.HandleFunc("POST /v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, r *http.Request) {
+		handleCreateSession(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteSession(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionChanges(s, w, r)
+	})
+	// Any other path under the new namespaces is a JSON 404 rather than
+	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
+	// Exact method-patterns above take precedence over these subtree patterns.
+	mux.HandleFunc("/v1/devices/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "unknown device/session path")
+	})
+	mux.HandleFunc("/v1/sessions/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "unknown session path")
 	})
 
 	mux.HandleFunc("POST /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
@@ -81,20 +120,38 @@ func NewHandler(s *store.Store) http.Handler {
 		handleRestore(s, w, r)
 	})
 
-	// ServeMux treats the empty document segment in /v1/documents//... as an
-	// unclean path and answers with a 307 HTML redirect (a 404 in a real
-	// client). The API contract is a 400 JSON error, so intercept those paths
-	// before the mux sees them.
+	// ServeMux treats any empty path segment (the doubled slash in
+	// /v1/documents//..., /v1/devices//sessions or
+	// /v1/sessions//documents/...) as an unclean path and answers with a 307
+	// HTML redirect (a 404 in a real client). The API contract is a 400 JSON
+	// error for an empty identifier, so intercept those paths before the mux
+	// sees them. A trailing slash empties the final id of the device/session
+	// routes and is rejected there for the same reason; the document routes
+	// keep their pre-existing ServeMux behavior.
 	return emptyIDGuard(mux)
 }
 
-// emptyIDGuard rejects requests whose documentID path segment is empty with a
-// 400 JSON error instead of letting ServeMux emit its HTML redirect.
+// emptyIDGuard rejects requests carrying an empty path identifier with a 400
+// JSON error instead of letting ServeMux emit its HTML redirect or a
+// plain-text 404.
+//
+// The document family keeps its original rule (an empty documentID, i.e. the
+// prefix /v1/documents//); other odd paths there retain their old response so
+// the pre-existing surface is unchanged. The new device/session families are
+// stricter: any doubled slash (an empty deviceId, sessionId or documentId
+// segment) or a trailing slash (an empty final id) is a 400 JSON error.
 func emptyIDGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/v1/documents//") {
-			writeError(w, http.StatusBadRequest, "documentID must be a non-empty string")
+
+		documentSegmentEmpty := strings.HasPrefix(p, "/v1/documents//")
+		newFamilySegmentEmpty := false
+		if strings.HasPrefix(p, "/v1/devices/") || strings.HasPrefix(p, "/v1/sessions/") {
+			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
+		}
+
+		if documentSegmentEmpty || newFamilySegmentEmpty {
+			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -109,6 +166,97 @@ func Handler() http.Handler {
 		log.Fatalf("open in-memory store: %v", err)
 	}
 	return NewHandler(s)
+}
+
+// decodeJSONBody enforces the strict POST contract shared by every JSON
+// endpoint: Content-Type must be application/json, the body is capped at
+// maxBatchBytes, it must contain exactly one JSON value, and no trailing data
+// may follow it. Any violation writes a 400 JSON error and returns false; the
+// caller returns immediately, so no handler reaches the store with malformed
+// input and rejected requests write nothing.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusBadRequest, "Content-Type must be application/json")
+		return false
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	// Reject trailing data after the JSON value.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: unexpected trailing content")
+		return false
+	}
+	return true
+}
+
+func handleRegisterDevice(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	var req deviceRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+
+	created, err := s.RegisterDevice(req.DeviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to register device")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"deviceId": req.DeviceID, "created": created})
+}
+
+func handleCreateSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
+
+	var req sessionRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.SessionID == "" {
+		writeError(w, http.StatusBadRequest, "sessionId must be a non-empty string")
+		return
+	}
+
+	created, err := s.CreateSession(deviceID, req.SessionID)
+	if err != nil {
+		var conflict *store.ErrSessionConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "sessionId already belongs to another device: "+conflict.ID)
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to create session")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"sessionId": req.SessionID, "created": created})
+}
+
+func handleDeleteSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")   // route pattern + guard guarantee non-empty
+	sessionID := r.PathValue("sessionId") // route pattern + guard guarantee non-empty
+
+	if err := s.DeleteSession(deviceID, sessionID); err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to delete session")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
 func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
@@ -439,26 +587,10 @@ func isJSONObject(raw json.RawMessage) bool {
 
 func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID")
-	q := r.URL.Query()
 
-	after := int64(0)
-	if raw := q.Get("after"); raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || v < 0 {
-			writeError(w, http.StatusBadRequest, "after must be a non-negative integer")
-			return
-		}
-		after = v
-	}
-
-	limit := int64(defaultListLimit)
-	if raw := q.Get("limit"); raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || v < 1 || v > maxListLimit {
-			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
-			return
-		}
-		limit = v
+	after, limit, ok := parseChangesQuery(w, r)
+	if !ok {
+		return
 	}
 
 	changes, nextCursor, err := s.ListChanges(documentID, after, limit)
@@ -467,6 +599,75 @@ func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeChangesPage(w, changes, nextCursor)
+}
+
+// handleSessionChanges is the session-scoped view of the existing change log:
+// both path identifiers must be non-empty (the empty-segment guard rejects
+// those before routing) and the session must currently exist, after which the
+// query behaves exactly like GET /v1/documents/{documentID}/changes.
+func handleSessionChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	// Malformed query parameters are a request-shape error (400) checked
+	// before the resource lookup (404), matching the snapshot GET ordering.
+	after, limit, ok := parseChangesQuery(w, r)
+	if !ok {
+		return
+	}
+
+	exists, err := s.SessionExists(sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+
+	changes, nextCursor, err := s.ListChanges(documentID, after, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list changes")
+		return
+	}
+
+	writeChangesPage(w, changes, nextCursor)
+}
+
+// parseChangesQuery parses the shared after/limit pagination parameters,
+// writing the documented 400 on an illegal value. It is shared by the
+// document-scoped and session-scoped change listings so their query semantics
+// cannot drift apart.
+func parseChangesQuery(w http.ResponseWriter, r *http.Request) (after, limit int64, ok bool) {
+	q := r.URL.Query()
+
+	after = 0
+	if raw := q.Get("after"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "after must be a non-negative integer")
+			return 0, 0, false
+		}
+		after = v
+	}
+
+	limit = defaultListLimit
+	if raw := q.Get("limit"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 1 || v > maxListLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+			return 0, 0, false
+		}
+		limit = v
+	}
+
+	return after, limit, true
+}
+
+// writeChangesPage renders a change listing page in the shared response shape.
+func writeChangesPage(w http.ResponseWriter, changes []store.ListedChange, nextCursor int64) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"changes":    changes,
 		"nextCursor": nextCursor,

@@ -24,6 +24,47 @@ go test ./...
 
 返回 `{"status":"ok"}`。
 
+### `POST /v1/devices`
+
+注册设备。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1"}
+```
+
+- `deviceId` 为非空字符串；类型头不符、JSON 非法、尾随内容、缺失或类型错误（数字、布尔、`null` 等）均返回 `400` JSON 错误且零写入。
+- 首次注册返回 `200` `{"deviceId":"device-1","created":true}`；用同一 `deviceId` 重试是幂等的，返回 `200` `created=false`。
+
+### `POST /v1/devices/{deviceId}/sessions`
+
+为已注册设备创建同步会话。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"sessionId": "session-1"}
+```
+
+- `sessionId` 为非空字符串；类型头不符、JSON 非法、尾随内容、缺失或类型错误均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误且零写入。
+- 首次创建返回 `200` `{"sessionId":"session-1","created":true}`；同一设备用同一 `sessionId` 重试幂等返回 `created=false`。
+- `sessionId` 已归属其他设备时返回 `409` JSON 错误且零写入，归属永不改变。
+- 创建在序列化事务内完成；并发创建同一 `sessionId` 恰好一个成功，其余同设备幂等、异设备 `409`。
+
+### `DELETE /v1/devices/{deviceId}/sessions/{sessionId}`
+
+仅删除该设备名下匹配的会话，无请求体。
+
+- 命中返回 `200` `{"deleted":true}`。
+- 设备不存在、会话不存在、会话归属其他设备、或重复删除，一律返回 `404` JSON 错误；非属主的删除不会移除会话。
+- 删除为硬删除并同步落盘；删除后该 `sessionId` 可作为全新会话再次创建（`created=true`），重启后重复删除仍为 `404`。
+
+### `GET /v1/sessions/{sessionId}/documents/{documentId}/changes`
+
+会话视角的增量读取，查询参数与响应结构与 `GET /v1/documents/{documentID}/changes` 完全一致（`after`、`limit` 语义、`changes`/`nextCursor` 形状、未知文档返回空列表且 `nextCursor` 为 `0`）。
+
+- `sessionId`、`documentId` 均为非空字符串；空段返回 `400` JSON 错误而非重定向。
+- `after`、`limit` 非法返回 `400` JSON 错误（参数校验先于会话存在性检查）。
+- 会话不存在或已删除返回 `404` JSON 错误；会话存在时读取结果与既有 changes 查询逐字相同。
+
 ### `POST /v1/documents/{documentID}/changes`
 
 仅接受 `Content-Type: application/json`。请求体：
@@ -111,6 +152,6 @@ go test ./...
 - 同一文档同一 `changeId` 仅当 `deviceId`、`snapshotCursor` 与来源 state 都相同时才幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入。
 - 恢复来源随数据落盘，重启后幂等与冲突判定不变；并发恢复在序列化事务内分配唯一且连续的 cursor。
 
-### 路径中的空文档 ID
+### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge` 等 `documentID` 段为空的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
