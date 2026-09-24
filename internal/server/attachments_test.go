@@ -448,6 +448,65 @@ func TestGetAttachmentAndChunkHTTP(t *testing.T) {
 	}
 }
 
+func TestGetChunkIndexBoundary(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+	content := []byte("hello world") // 11 bytes, chunks of 4 -> 3 declared chunks [0,3)
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+	putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+
+	getChunk := func(device, att, index string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodGet,
+			"/v1/devices/"+device+"/attachments/"+att+"/chunks/"+index, nil)
+		return serveRecorder(h, r)
+	}
+
+	// Known attachment: negative, non-decimal and out-of-declared-range indices
+	// are all 400 JSON — a missing-but-in-range index stays 404.
+	for _, index := range []string{"-1", "x", "1.5", "+1", "3", "999"} {
+		w := getChunk("dev-1", "att-1", index)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("GET index %q = %d, want 400 body=%s", index, w.Code, w.Body.String())
+		}
+		assertJSONError(t, w)
+	}
+	// In-range but never uploaded: 404 JSON (boundary between 400 and 404).
+	if w := getChunk("dev-1", "att-1", "1"); w.Code != http.StatusNotFound {
+		t.Fatalf("missing in-range chunk = %d, want 404", w.Code)
+	}
+	// In-range and present: raw bytes.
+	if w := getChunk("dev-1", "att-1", "0"); w.Code != http.StatusOK || w.Body.String() != "hell" {
+		t.Fatalf("present chunk = %d %q", w.Code, w.Body.String())
+	}
+
+	// Resource checks precede the range check: an out-of-range index is still
+	// 404 for an unknown attachment and 403 for a non-creator device.
+	if w := getChunk("dev-1", "nope", "999"); w.Code != http.StatusNotFound {
+		t.Fatalf("unknown attachment, out-of-range index = %d, want 404", w.Code)
+	}
+	if w := getChunk("dev-2", "att-1", "999"); w.Code != http.StatusForbidden {
+		t.Fatalf("non-creator, out-of-range index = %d, want 403", w.Code)
+	}
+
+	// Empty device or attachment identifier: 400 JSON, never a redirect/HTML.
+	for _, path := range []string{
+		"/v1/devices//attachments/att-1/chunks/0",
+		"/v1/devices/dev-1/attachments//chunks/0",
+		"/v1/devices/dev-1/attachments/att-1/chunks/",
+	} {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		w := serveRecorder(h, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("GET %s = %d, want 400", path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("GET %s content-type = %q, want application/json", path, ct)
+		}
+	}
+}
+
 func TestAttachmentsSurviveRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
 	open := func(t *testing.T) (http.Handler, *store.Store) {

@@ -261,3 +261,70 @@ func toAttachment(id string, total, chunk int64, content []byte) Attachment {
 		SHA256:     digestOf(content),
 	}
 }
+
+// TestAttachmentSameDigestDifferentSizeConflict seeds a completed content
+// whose recorded size disagrees with a second upload of the same digest, then
+// finishes the second upload: the digest verifies but the size differs, so the
+// finish must fail with ErrAttachmentDigestConflict (mapped to 409) while the
+// upload and its chunks stay intact and resumable.
+func TestAttachmentSameDigestDifferentSizeConflict(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+	mustRegisterDevice(t, s, "dev-2")
+
+	content := []byte("abc")
+	digest := digestOf(content)
+
+	// Finish the first upload, creating the content-addressed row.
+	if _, err := s.CreateAttachment("dev-1", toAttachment("first", 3, 3, content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "first", 0, content); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteAttachment("dev-1", "first"); err != nil {
+		t.Fatalf("first complete: %v", err)
+	}
+
+	// A pre-existing completed content under the same digest records a
+	// different size (an honest upload cannot reach this state because the
+	// digest fixes the length; it represents the defended same-digest /
+	// different-size collision).
+	if _, err := s.db.Exec(
+		`UPDATE attachment_contents SET size = ? WHERE sha256 = ?`, int64(99), digest,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// The second upload verifies its digest but cannot reuse or finish.
+	if _, err := s.CreateAttachment("dev-2", toAttachment("second", 3, 3, content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-2", "second", 0, content); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompleteAttachment("dev-2", "second"); !errors.Is(err, ErrAttachmentDigestConflict) {
+		t.Fatalf("complete = %v, want ErrAttachmentDigestConflict", err)
+	}
+
+	// The upload and its chunk are undamaged and still resumable.
+	a, indices, err := s.GetAttachment("dev-2", "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Complete || len(indices) != 1 || indices[0] != 0 {
+		t.Fatalf("upload after conflict = complete=%v indices=%v, want incomplete [0]", a.Complete, indices)
+	}
+	data, err := s.GetAttachmentChunk("dev-2", "second", 0)
+	if err != nil || string(data) != "abc" {
+		t.Fatalf("chunk after conflict = %q %v, want preserved content", data, err)
+	}
+	// A repeat finish reaches the same decision.
+	if _, err := s.CompleteAttachment("dev-2", "second"); !errors.Is(err, ErrAttachmentDigestConflict) {
+		t.Fatalf("repeat complete = %v, want ErrAttachmentDigestConflict", err)
+	}
+}

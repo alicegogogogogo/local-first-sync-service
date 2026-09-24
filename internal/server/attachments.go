@@ -191,9 +191,10 @@ func handleGetAttachment(s *store.Store, w http.ResponseWriter, r *http.Request)
 }
 
 // handleGetChunk streams one stored chunk back to the creator. An empty
-// identifier is rejected by the path guard; an illegal index is a 400; an
-// unknown attachment or a chunk that never arrived is a 404; a non-creator
-// device is a 403.
+// identifier is rejected by the path guard; a negative or non-decimal index, or
+// one beyond the attachment's declared chunk count, is a 400; an unknown
+// attachment is a 404; an in-range chunk that never arrived is a 404; a
+// non-creator device is a 403.
 func handleGetChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
@@ -201,6 +202,27 @@ func handleGetChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	index, ok := parseCursorPath(r.PathValue("index"))
 	if !ok {
 		writeError(w, http.StatusBadRequest, "chunk index must be a non-negative integer")
+		return
+	}
+
+	// Resolve the attachment first: this answers an unknown id with 404 and a
+	// non-creator device with 403, and yields the declared shape so an index
+	// past the last declared chunk is a 400 even though no row exists there.
+	meta, _, err := s.GetAttachment(deviceID, attachmentID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to load attachment")
+		}
+		return
+	}
+	chunkCount := (meta.TotalBytes + meta.ChunkSize - 1) / meta.ChunkSize
+	if index >= chunkCount {
+		writeError(w, http.StatusBadRequest, "chunk index is out of range for the declared attachment")
 		return
 	}
 
