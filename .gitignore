@@ -6,3 +6,13 @@
 *.db-wal
 *.log
 
+# Dependency and build output. These are not answer code and must never be committed. One side ran
+# `go mod vendor` before sealing on 2026-09-25, which put 227 MB of third-party source into its sealed
+# commit: the sealed diff then measured 233 MB against the other side's 70 KB, tripped the
+# acceptance-authoring size guard, and the Pair was lost. Ignoring them here keeps them out of the
+# sealed commit, out of the baseline, and out of the published delivery from one place.
+/vendor/
+/node_modules/
+/__pycache__/
+/.venv/
+
