@@ -207,7 +207,7 @@ go test ./...
 
 ### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
 
-创建者读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识或非法序号返回 `400` JSON 错误；未知附件或缺失分块返回 `404` JSON 错误；非创建设备返回 `403` JSON 错误。
+创建者读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识（设备或附件）返回 `400` JSON 错误；已知附件的序号为负数、非十进制或超出声明分块范围（`>= ceil(totalBytes/chunkSize)`）也统一返回 `400` JSON 错误而非重定向或 HTML；未知附件返回 `404`，序号合法但该分块尚未到达也返回 `404` JSON 错误；非创建设备返回 `403` JSON 错误。
 
 附件的创建、分块、完成与读取均同步落盘；进程重启后上传状态、内容去重与幂等判定保持一致。
 

@@ -448,6 +448,39 @@ func TestGetAttachmentAndChunkHTTP(t *testing.T) {
 	}
 }
 
+func TestGetChunkOutOfRangeIs400(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+	content := []byte("hello world") // 11 bytes / chunk 4 -> 3 chunks (0..2)
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+
+	// A numeric index beyond the declared range is a 400 JSON error for a known
+	// attachment, even though that chunk row simply does not exist.
+	r := httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/3", nil)
+	w := serveRecorder(h, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range known = %d, want 400 body=%s", w.Code, w.Body.String())
+	}
+	assertJSONError(t, w)
+
+	// Same index on an unknown attachment stays 404, and on a non-creator 403.
+	r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/nope/chunks/3", nil)
+	if w = serveRecorder(h, r); w.Code != http.StatusNotFound {
+		t.Fatalf("out-of-range unknown = %d, want 404", w.Code)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-2/attachments/att-1/chunks/3", nil)
+	if w = serveRecorder(h, r); w.Code != http.StatusForbidden {
+		t.Fatalf("out-of-range non-creator = %d, want 403", w.Code)
+	}
+
+	// An in-range-but-not-yet-received index is still a 404.
+	r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/0", nil)
+	if w = serveRecorder(h, r); w.Code != http.StatusNotFound {
+		t.Fatalf("missing in-range chunk = %d, want 404", w.Code)
+	}
+}
+
 func TestAttachmentsSurviveRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
 	open := func(t *testing.T) (http.Handler, *store.Store) {
@@ -504,5 +537,62 @@ func TestAttachmentsSurviveRestart(t *testing.T) {
 	w = serveRecorder(h, r)
 	if w.Code != http.StatusOK || w.Body.String() != "rld" {
 		t.Fatalf("chunk read after restart = %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestAttachmentDedupSurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sync.db")
+	open := func(t *testing.T) (http.Handler, *store.Store) {
+		t.Helper()
+		s, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewHandler(s), s
+	}
+
+	content := []byte("shared content")
+
+	// First process: finish two identical-content attachments so the second
+	// reuses the first's stored bytes.
+	h, s := open(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+	for _, tc := range []struct {
+		device, id string
+	}{
+		{"dev-1", "att-1"},
+		{"dev-2", "att-2"},
+	} {
+		mustCreateAttachment(t, h, tc.device, tc.id, content, 8)
+		putChunk(t, h, tc.device, tc.id, 0, content[:8])
+		putChunk(t, h, tc.device, tc.id, 1, content[8:])
+		w, body := completeAttachment(t, h, tc.device, tc.id)
+		if w.Code != http.StatusOK {
+			t.Fatalf("complete %s = %d body=%s", tc.id, w.Code, w.Body.String())
+		}
+		if body["reused"] != (tc.id == "att-2") {
+			t.Fatalf("complete %s reused=%v", tc.id, body["reused"])
+		}
+	}
+	_ = s.Close()
+
+	// After restart the dedup decision and the stored result are unchanged:
+	// repeating the second finish still reports reused=true, and a third
+	// identical attachment also reuses without re-copying bytes.
+	h, s = open(t)
+	defer func() { _ = s.Close() }()
+
+	w, body := completeAttachment(t, h, "dev-2", "att-2")
+	if w.Code != http.StatusOK || body["reused"] != true || body["size"] != float64(len(content)) {
+		t.Fatalf("reused result after restart = %d %v", w.Code, body)
+	}
+
+	mustCreateAttachment(t, h, "dev-1", "att-3", content, 8)
+	putChunk(t, h, "dev-1", "att-3", 0, content[:8])
+	putChunk(t, h, "dev-1", "att-3", 1, content[8:])
+	w, body = completeAttachment(t, h, "dev-1", "att-3")
+	if w.Code != http.StatusOK || body["reused"] != true {
+		t.Fatalf("third attachment after restart reused = %d %v, want reused=true", w.Code, body)
 	}
 }

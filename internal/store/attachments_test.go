@@ -145,8 +145,11 @@ func TestAttachmentLifecycle(t *testing.T) {
 	if err != nil || string(data) != "rld" {
 		t.Fatalf("get chunk = %q %v", data, err)
 	}
-	if _, err := s.GetAttachmentChunk("dev-1", "att-1", 5); !errors.Is(err, ErrChunkNotFound) {
-		t.Fatalf("missing chunk = %v, want ErrChunkNotFound", err)
+	// An out-of-range index is an invalid request (HTTP 400), not a missing
+	// chunk; an in-range index with no chunk is a not-found.
+	var invalid *ErrChunkInvalid
+	if _, err := s.GetAttachmentChunk("dev-1", "att-1", 5); !errors.As(err, &invalid) {
+		t.Fatalf("out-of-range chunk = %v, want *ErrChunkInvalid", err)
 	}
 }
 
@@ -259,5 +262,81 @@ func toAttachment(id string, total, chunk int64, content []byte) Attachment {
 		TotalBytes: total,
 		ChunkSize:  chunk,
 		SHA256:     digestOf(content),
+	}
+}
+
+// TestReuseContentDecision covers the digest/size reuse matrix directly: no
+// content -> not reused; same digest and size -> reused; same digest but a
+// different size -> ErrAttachmentDigestConflict. The last state cannot arise
+// from honest uploads (it would require a SHA-256 collision), but the decision
+// must never reuse bytes whose length differs from the declared total.
+func TestReuseContentDecision(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	const d = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused, err := reuseContentTx(tx, d, 4)
+	if err != nil || reused {
+		t.Fatalf("absent content: reused=%v err=%v, want false/nil", reused, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.db.Exec(
+		`INSERT INTO attachment_contents (sha256, size, data) VALUES (?, ?, ?)`,
+		d, int64(4), []byte("data"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err = s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused, err := reuseContentTx(tx, d, 4); err != nil || !reused {
+		t.Fatalf("same digest/size: reused=%v err=%v, want true/nil", reused, err)
+	}
+	if _, err := reuseContentTx(tx, d, 3); !errors.Is(err, ErrAttachmentDigestConflict) {
+		t.Fatalf("same digest different size = %v, want ErrAttachmentDigestConflict", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestGetAttachmentChunkRange rejects an out-of-range index as invalid (400 at
+// the HTTP layer) even when the attachment is otherwise known, while an
+// in-range index without a chunk stays a not-found.
+func TestGetAttachmentChunkRange(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+
+	content := []byte("hello world") // 11 bytes / 4 -> 3 chunks (0..2)
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil {
+		t.Fatal(err)
+	}
+
+	var invalid *ErrChunkInvalid
+	if _, err := s.GetAttachmentChunk("dev-1", "att-1", 3); !errors.As(err, &invalid) {
+		t.Fatalf("out-of-range read = %v, want *ErrChunkInvalid", err)
+	}
+	if _, err := s.GetAttachmentChunk("dev-1", "att-1", 0); !errors.Is(err, ErrChunkNotFound) {
+		t.Fatalf("in-range missing chunk = %v, want ErrChunkNotFound", err)
+	}
+	if _, err := s.GetAttachmentChunk("dev-1", "nope", 0); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("unknown attachment = %v, want ErrAttachmentNotFound", err)
 	}
 }

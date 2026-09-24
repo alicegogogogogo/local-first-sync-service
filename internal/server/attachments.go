@@ -206,6 +206,7 @@ func handleGetChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 
 	data, err := s.GetAttachmentChunk(deviceID, attachmentID, index)
 	if err != nil {
+		var invalid *store.ErrChunkInvalid
 		switch {
 		case errors.Is(err, store.ErrAttachmentNotFound):
 			writeError(w, http.StatusNotFound, "attachment not found")
@@ -213,6 +214,8 @@ func handleGetChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "chunk not found")
 		case errors.Is(err, store.ErrAttachmentForbidden):
 			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		case errors.As(err, &invalid):
+			writeError(w, http.StatusBadRequest, invalid.Reason)
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to load chunk")
 		}

@@ -243,6 +243,30 @@ func (s *Store) PutChunk(deviceID, attachmentID string, index int64, data []byte
 	return false, tx.Commit()
 }
 
+// reuseContentTx resolves the digest-addressed content reuse decision inside
+// tx: it returns reused=true when finished content with the same digest and
+// size already exists (the bytes are not copied), reused=false when no such
+// content exists yet (the caller inserts it), and ErrAttachmentDigestConflict
+// when a finished content carries the same digest but a different size. That
+// last state cannot arise from honest chunk assembly without a hash collision,
+// but it must never silently reuse mismatched bytes.
+func reuseContentTx(tx *sql.Tx, digest string, size int64) (bool, error) {
+	var contentSize int64
+	err := tx.QueryRow(
+		`SELECT size FROM attachment_contents WHERE sha256 = ?`, digest,
+	).Scan(&contentSize)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	case err != nil:
+		return false, err
+	case contentSize != size:
+		return false, ErrAttachmentDigestConflict
+	default:
+		return true, nil
+	}
+}
+
 // CompleteAttachment seals an upload: every declared chunk must be present
 // and their lengths must add up to the declared total, after which the
 // concatenated content must hash to the declared digest.
@@ -326,25 +350,17 @@ func (s *Store) CompleteAttachment(deviceID, attachmentID string) (CompleteResul
 
 	// Content is addressed by digest: an existing row means another finished
 	// attachment already stored these bytes.
-	var contentSize int64
-	err = tx.QueryRow(
-		`SELECT size FROM attachment_contents WHERE sha256 = ?`, a.SHA256,
-	).Scan(&contentSize)
-	reused := false
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	reused, err := reuseContentTx(tx, a.SHA256, a.TotalBytes)
+	if err != nil {
+		return CompleteResult{}, err
+	}
+	if !reused {
 		if _, err := tx.Exec(
 			`INSERT INTO attachment_contents (sha256, size, data) VALUES (?, ?, ?)`,
 			a.SHA256, a.TotalBytes, content,
 		); err != nil {
 			return CompleteResult{}, err
 		}
-	case err != nil:
-		return CompleteResult{}, err
-	case contentSize != a.TotalBytes:
-		return CompleteResult{}, ErrAttachmentDigestConflict
-	default:
-		reused = true
 	}
 
 	if _, err := tx.Exec(
@@ -406,8 +422,10 @@ func (s *Store) GetAttachment(deviceID, attachmentID string) (Attachment, []int6
 }
 
 // GetAttachmentChunk returns the bytes stored at index. An unknown attachment
-// yields ErrAttachmentNotFound, a non-creator device ErrAttachmentForbidden,
-// and an index with no stored chunk ErrChunkNotFound.
+// yields ErrAttachmentNotFound and a non-creator device ErrAttachmentForbidden.
+// For a known attachment, a negative index or one beyond the declared chunk
+// range yields *ErrChunkInvalid (the caller maps it to 400); an in-range index
+// with no stored chunk yields ErrChunkNotFound (404).
 func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) ([]byte, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -415,8 +433,15 @@ func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) (
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := getAttachmentTx(tx, attachmentID, deviceID); err != nil {
+	a, err := getAttachmentTx(tx, attachmentID, deviceID)
+	if err != nil {
 		return nil, err
+	}
+	// The path index is already a non-negative decimal; reject one outside the
+	// shape the creator declared so out-of-range reads fail as a 400 rather than
+	// masquerading as a missing chunk (404).
+	if index < 0 || index >= a.chunkCount() {
+		return nil, &ErrChunkInvalid{Reason: fmt.Sprintf("chunk index %d is out of range [0, %d)", index, a.chunkCount())}
 	}
 
 	var data []byte
