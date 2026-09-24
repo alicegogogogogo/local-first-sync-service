@@ -166,6 +166,51 @@ go test ./...
 - 同一文档同一 `changeId` 仅当 `deviceId`、`snapshotCursor` 与来源 state 都相同时才幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入。
 - 恢复来源随数据落盘，重启后幂等与冲突判定不变；并发恢复在序列化事务内分配唯一且连续的 cursor。
 
+### `POST /v1/devices/{deviceId}/attachments`
+
+为已注册设备创建可恢复的分块附件上传。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{
+  "attachmentId": "att-1",
+  "totalBytes": 11,
+  "chunkSize": 4,
+  "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+}
+```
+
+- `attachmentId` 为非空字符串（稳定标识）；`totalBytes`、`chunkSize` 为正整数（不接受小数、字符串、布尔、`null`、零或负数）；`sha256` 为 64 位小写十六进制摘要。类型头不符、JSON 非法、尾随内容、字段缺失或类型错误、数值非正、摘要格式错误均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误且零写入。
+- 首次创建返回 `200` `{"attachmentId":"att-1","created":true}`；同一设备以完全相同元数据重试幂等返回 `created=false`。
+- `attachmentId` 已被占用时返回 `409` JSON 错误且原记录不变：无论占用者是其他设备（即使元数据相同）还是本设备但元数据不同。
+
+### `PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
+
+上传一个分块，请求体为二进制，仅接受 `Content-Type: application/octet-stream`。序号 `index` 从零开始，分块可乱序到达，断线后可重复提交。
+
+- 未知附件返回 `404` JSON 错误；路径设备不是创建者返回 `403` JSON 错误。
+- 内容类型错误、序号非法或越界（`>= ceil(totalBytes/chunkSize)`）、非末块长度不等于 `chunkSize`、末块长度超出声明范围的剩余字节，均返回 `400` JSON 错误且零写入。
+- 首次存储返回 `200` `{"index":N,"created":true}`；同序号再次提交相同字节幂等返回 `created=false`；同序号不同字节返回 `409` JSON 错误，保留首次内容。
+
+### `POST /v1/devices/{deviceId}/attachments/{attachmentId}/complete`
+
+封存上传。无请求体要求。
+
+- 仅创建者可调用：非创建设备返回 `403` JSON 错误，未知附件返回 `404` JSON 错误。
+- 分块未齐或累计长度不等于声明的 `totalBytes` 返回 `409` JSON 错误，上传保持可继续；按序拼接后摘要与声明不符返回 `422` JSON 错误，上传保持未完成。
+- 成功返回 `200`：`{"attachmentId","size","sha256","complete":true,"reused":...}`；重复完成返回相同结果。
+- 已有其他已完成附件拥有相同摘要和大小时复用其内容（`reused=true`），不复制字节；摘要相同但大小不同不得复用，返回 `409` JSON 错误且当前上传仍可恢复。
+
+### `GET /v1/devices/{deviceId}/attachments/{attachmentId}`
+
+创建者读取附件元数据，返回 `200`：`{"attachmentId","totalBytes","chunkSize","sha256","complete","receivedChunks":[...]}`，其中 `receivedChunks` 为已收到序号的升序列表。非创建设备返回 `403` JSON 错误，未知附件返回 `404` JSON 错误。
+
+### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
+
+创建者读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识或非法序号返回 `400` JSON 错误；未知附件或缺失分块返回 `404` JSON 错误；非创建设备返回 `403` JSON 错误。
+
+附件的创建、分块、完成与读取均同步落盘；进程重启后上传状态、内容去重与幂等判定保持一致。
+
 ### 路径中的空标识
 
 `/v1/documents//changes`、`/v1/documents//merge`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。

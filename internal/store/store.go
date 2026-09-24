@@ -31,6 +31,15 @@
 // grant/revoke calls each land as a complete state and survive a restart.
 // Revoking never deletes changes, snapshots or sessions; it only gates the
 // session-scoped change listing.
+//
+// Attachments are resumable chunked uploads owned by the registered device
+// that created them. Creation pins the declared total size, chunk size and
+// SHA-256 digest; chunks land in any order and are stored durably as they
+// arrive, so an interrupted upload resumes after a restart with its
+// idempotency and conflict decisions intact. Finishing concatenates the
+// chunks, verifies the digest and seals the upload; finished content is
+// addressed by digest, so a second attachment with the same digest and size
+// reuses the stored bytes instead of copying them.
 package store
 
 import (
@@ -222,6 +231,26 @@ CREATE TABLE IF NOT EXISTS document_permissions (
 	device_id   TEXT NOT NULL,
 	authorized  INTEGER NOT NULL,
 	PRIMARY KEY (document_id, device_id)
+);
+CREATE TABLE IF NOT EXISTS attachments (
+	id          TEXT NOT NULL PRIMARY KEY,
+	device_id   TEXT NOT NULL REFERENCES devices(id),
+	total_bytes INTEGER NOT NULL,
+	chunk_size  INTEGER NOT NULL,
+	sha256      TEXT NOT NULL,
+	complete    INTEGER NOT NULL DEFAULT 0,
+	reused      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS attachment_chunks (
+	attachment_id TEXT NOT NULL REFERENCES attachments(id),
+	idx           INTEGER NOT NULL,
+	data          BLOB NOT NULL,
+	PRIMARY KEY (attachment_id, idx)
+);
+CREATE TABLE IF NOT EXISTS attachment_contents (
+	sha256 TEXT NOT NULL PRIMARY KEY,
+	size   INTEGER NOT NULL,
+	data   BLOB NOT NULL
 );
 `)
 	return err

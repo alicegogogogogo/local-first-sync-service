@@ -93,6 +93,21 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
+		handleCreateAttachment(s, w, r)
+	})
+	mux.HandleFunc("PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
+		handlePutChunk(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments/{attachmentId}/complete", func(w http.ResponseWriter, r *http.Request) {
+		handleCompleteAttachment(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
+		handleGetAttachment(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
+		handleGetChunk(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
