@@ -188,12 +188,18 @@ var ErrSessionNotFound = errors.New("session not found")
 type Store struct {
 	db *sql.DB
 
-	// pollMu guards pollWaits, nextWaitID and closed. Parked long polls wait
-	// on a per-document set of channels; a committed change to a document
-	// closes (signals) every channel parked on it.
+	// pollMu guards pollWaits, subs, nextWaitID, nextSubID and closed. Parked
+	// long polls wait on a per-document set of channels; a committed change to
+	// a document closes (signals) every channel parked on it. WebSocket
+	// subscriptions live in a second registry keyed by (document, device): a
+	// commit signals every subscription under the document, while a permission
+	// write signals only the matching device's subscriptions.
 	pollMu     sync.Mutex
 	pollWaits  map[string]map[uint64]chan struct{}
+	subs       map[subKey]map[uint64]*subscription
 	nextWaitID uint64
+	nextSubID  uint64
+	subWG      sync.WaitGroup
 	closed     bool
 }
 
@@ -216,7 +222,11 @@ func Open(path string) (*Store, error) {
 	// serialized by the immediate transaction anyway, and SQLite concurrency
 	// for readers does not help correctness here.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db, pollWaits: make(map[string]map[uint64]chan struct{})}
+	s := &Store{
+		db:        db,
+		pollWaits: make(map[string]map[uint64]chan struct{}),
+		subs:      make(map[subKey]map[uint64]*subscription),
+	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -301,19 +311,39 @@ func (s *Store) InterruptWaits() {
 	s.closed = true
 	waits := s.pollWaits
 	s.pollWaits = map[string]map[uint64]chan struct{}{}
+	// Snapshot the live subscription channels without reaping the registry:
+	// unregister remains valid while handlers drain, so the WaitGroup in
+	// Close balances. New AddSubscription calls fail fast on closed.
+	var subChans []chan struct{}
+	for _, set := range s.subs {
+		for _, sub := range set {
+			subChans = append(subChans, sub.wakes)
+		}
+	}
 	s.pollMu.Unlock()
 	for _, set := range waits {
 		for _, ch := range set {
 			close(ch)
 		}
 	}
+	// Live subscriptions get one last wakeup as well; the server re-checks
+	// the closed flag and finishes the connection with a going-away close.
+	for _, ch := range subChans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // Close releases the database handle. Parked long polls are woken first so
 // they stop waiting and return without writing; the wake happens before the
-// handle closes, so a waiter never observes a closed database.
+// handle closes, so a waiter never observes a closed database. WebSocket
+// subscriptions are likewise woken and drained (every handler unregisters)
+// before the handle closes.
 func (s *Store) Close() error {
 	s.InterruptWaits()
+	s.subWG.Wait()
 	return s.db.Close()
 }
 
@@ -351,9 +381,10 @@ func (s *Store) registerWait(documentID string) (ch chan struct{}, remove func()
 	}
 }
 
-// notifyWaiters signals every long poll parked on documentID. It is called
-// only after a change-bearing transaction has committed, so parked readers
-// observe the new rows when they re-query.
+// notifyWaiters signals every long poll parked on documentID and every
+// WebSocket subscription open on it. It is called only after a
+// change-bearing transaction has committed, so parked readers observe the
+// new rows when they re-query and pushed frames describe committed changes.
 func (s *Store) notifyWaiters(documentID string) {
 	s.pollMu.Lock()
 	set := s.pollWaits[documentID]
@@ -362,6 +393,7 @@ func (s *Store) notifyWaiters(documentID string) {
 	for _, ch := range set {
 		close(ch)
 	}
+	s.signalSubscribers(documentID)
 }
 
 // WaitForChanges blocks until documentID has a change with cursor greater than
@@ -1138,6 +1170,11 @@ func (s *Store) SetDocumentPermission(documentID, deviceID string, authorized bo
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
+	}
+	// A grant cannot unblock a subscription (the first revoke already ended
+	// it, stickily); only a revoke needs to end live subscriptions.
+	if !authorized {
+		s.signalRevokedSubscribers(documentID, deviceID)
 	}
 	return true, nil
 }

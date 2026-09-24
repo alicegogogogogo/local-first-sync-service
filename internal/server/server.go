@@ -140,6 +140,14 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleSubscribe(s, w, r)
+	})
+	// Non-GET verbs on the subscribe path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the endpoint's only method is GET.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Any other path under the new namespaces is a JSON 404 rather than
 	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
 	// Exact method-patterns above take precedence over these subtree patterns.
@@ -217,7 +225,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -254,6 +262,31 @@ func malformedNewDocumentPath(p string) bool {
 	for i, seg := range segs {
 		if seg == "replay" && i > 0 {
 			return !(len(segs) == 2 && segs[0] != "")
+		}
+	}
+	return false
+}
+
+// malformedSubscribePath reports whether p targets the WebSocket subscription
+// endpoint but is not at its exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe): a
+// missing "documents"/"changes" segment, an extra segment, or a "subscribe"
+// segment short of the registered shape. ServeMux would answer those with a
+// plain-text 404/405; every failure of this endpoint must be a JSON 400
+// instead. Empty segments are already rejected by the guard itself.
+func malformedSubscribePath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	for _, seg := range segs {
+		if seg == "subscribe" {
+			return !(len(segs) == 5 &&
+				segs[0] != "" &&
+				segs[1] == "documents" &&
+				segs[2] != "" &&
+				segs[3] == "changes")
 		}
 	}
 	return false
