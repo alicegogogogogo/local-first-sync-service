@@ -208,6 +208,76 @@ func TestAttachmentDigestMismatchAndReuse(t *testing.T) {
 	}
 }
 
+// TestSealedAttachmentRejectsChunks covers post-seal immutability: once a
+// finish has committed, every further chunk write — identical bytes, different
+// bytes, even an out-of-range index — is ErrAttachmentSealed and the recorded
+// state and content are unchanged. The rejection and the original bytes
+// survive a restart.
+func TestSealedAttachmentRejectsChunks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegisterDevice(t, s, "dev-1")
+
+	content := []byte("hello world") // 11 bytes, chunks of 4: [hell][o wo][rld]
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil {
+		t.Fatal(err)
+	}
+	for i, chunk := range [][]byte{[]byte("hell"), []byte("o wo"), []byte("rld")} {
+		if _, err := s.PutChunk("dev-1", "att-1", int64(i), chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := s.CompleteAttachment("dev-1", "att-1")
+	if err != nil || !res.Complete {
+		t.Fatalf("complete = %+v %v", res, err)
+	}
+
+	assertSealed := func(t *testing.T, s *Store) {
+		t.Helper()
+		// Byte-identical resubmission is no longer idempotent: it is rejected.
+		if _, err := s.PutChunk("dev-1", "att-1", 0, []byte("hell")); !errors.Is(err, ErrAttachmentSealed) {
+			t.Fatalf("identical chunk after seal = %v, want ErrAttachmentSealed", err)
+		}
+		// Different bytes at an existing index are rejected too.
+		if _, err := s.PutChunk("dev-1", "att-1", 0, []byte("HELL")); !errors.Is(err, ErrAttachmentSealed) {
+			t.Fatalf("conflicting chunk after seal = %v, want ErrAttachmentSealed", err)
+		}
+		// Even an out-of-range write hits the seal before any shape check.
+		if _, err := s.PutChunk("dev-1", "att-1", 7, []byte("xxxx")); !errors.Is(err, ErrAttachmentSealed) {
+			t.Fatalf("out-of-range chunk after seal = %v, want ErrAttachmentSealed", err)
+		}
+		// The recorded state and content are unchanged.
+		a, indices, err := s.GetAttachment("dev-1", "att-1")
+		if err != nil || !a.Complete || len(indices) != 3 {
+			t.Fatalf("sealed attachment = %+v %v %v", a, indices, err)
+		}
+		data, err := s.GetAttachmentChunk("dev-1", "att-1", 0)
+		if err != nil || string(data) != "hell" {
+			t.Fatalf("chunk 0 after rejected writes = %q %v", data, err)
+		}
+		// A repeat finish still returns the first recorded result.
+		again, err := s.CompleteAttachment("dev-1", "att-1")
+		if err != nil || again != res {
+			t.Fatalf("repeat complete = %+v %v, want %+v", again, err, res)
+		}
+	}
+	assertSealed(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a restart the seal still holds and the original bytes are intact.
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	assertSealed(t, s)
+}
+
 func TestAttachmentsPersistAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)

@@ -42,6 +42,12 @@ func (e *ErrAttachmentConflict) Error() string {
 	return fmt.Sprintf("attachment %q already exists with different owner or metadata", e.ID)
 }
 
+// ErrAttachmentSealed reports a chunk write to an upload that was already
+// finished. A sealed attachment is immutable: every further chunk write —
+// even a byte-identical resubmission — is rejected and the recorded state and
+// content are left unchanged. The caller maps it to 409.
+var ErrAttachmentSealed = errors.New("attachment is complete and no longer accepts chunks")
+
 // ErrChunkInvalid reports a chunk that violates the upload's declared shape:
 // an out-of-range index, a non-final chunk shorter than the declared chunk
 // size, or a final chunk beyond the declared total. The caller maps it to
@@ -197,10 +203,12 @@ func (s *Store) CreateAttachment(deviceID string, a Attachment) (created bool, e
 // Ownership and shape are enforced first: an unknown attachment yields
 // ErrAttachmentNotFound, a non-creator device ErrAttachmentForbidden, and an
 // out-of-range index or wrong length *ErrChunkInvalid — none of these write
-// anything. Re-submitting identical bytes for an existing index is idempotent
-// (created=false); different bytes for the same index yield
-// *ErrChunkConflict and the first content is kept. Chunks may arrive in any
-// order.
+// anything. A finished upload is sealed: any further chunk write, even a
+// byte-identical resubmission, yields ErrAttachmentSealed and changes
+// nothing. On an open upload, re-submitting identical bytes for an existing
+// index is idempotent (created=false); different bytes for the same index
+// yield *ErrChunkConflict and the first content is kept. Chunks may arrive in
+// any order.
 func (s *Store) PutChunk(deviceID, attachmentID string, index int64, data []byte) (created bool, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -211,6 +219,12 @@ func (s *Store) PutChunk(deviceID, attachmentID string, index int64, data []byte
 	a, err := getAttachmentTx(tx, attachmentID, deviceID)
 	if err != nil {
 		return false, err
+	}
+	// A sealed upload is immutable: reject every further write before any
+	// shape check or content comparison, so the recorded state and content
+	// cannot change once the finish committed.
+	if a.Complete {
+		return false, ErrAttachmentSealed
 	}
 	if err := a.checkChunkShape(index, int64(len(data))); err != nil {
 		return false, err

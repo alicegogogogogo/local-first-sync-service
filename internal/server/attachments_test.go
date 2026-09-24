@@ -596,3 +596,78 @@ func TestAttachmentDedupSurvivesRestart(t *testing.T) {
 		t.Fatalf("third attachment after restart reused = %d %v, want reused=true", w.Code, body)
 	}
 }
+
+// TestSealedAttachmentRejectsChunksHTTP seals an upload and then verifies that
+// every further chunk write — identical bytes, different bytes, an index that
+// was never uploaded — is a 409 JSON error that changes nothing, and that the
+// rejection and the original bytes survive a restart.
+func TestSealedAttachmentRejectsChunksHTTP(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sync.db")
+	open := func(t *testing.T) (http.Handler, *store.Store) {
+		t.Helper()
+		s, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewHandler(s), s
+	}
+
+	h, s := open(t)
+	registerDevice(t, h, "dev-1")
+	content := []byte("hello world")
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+	putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+	putChunk(t, h, "dev-1", "att-1", 1, []byte("o wo"))
+	putChunk(t, h, "dev-1", "att-1", 2, []byte("rld"))
+	w, body := completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || body["complete"] != true {
+		t.Fatalf("complete = %d %v", w.Code, body)
+	}
+
+	assertSealed := func(t *testing.T, h http.Handler) {
+		t.Helper()
+		// A byte-identical resubmission is no longer idempotent: 409 JSON.
+		w, _ := putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("identical chunk after seal = %d, want 409 body=%s", w.Code, w.Body.String())
+		}
+		assertJSONError(t, w)
+		// Different bytes at the same index: still 409, first content kept.
+		w, _ = putChunk(t, h, "dev-1", "att-1", 0, []byte("HELL"))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("conflicting chunk after seal = %d, want 409", w.Code)
+		}
+		assertJSONError(t, w)
+		// An index that was never uploaded is rejected as well.
+		w, _ = putChunk(t, h, "dev-1", "att-1", 3, []byte("xxxx"))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("new index after seal = %d, want 409", w.Code)
+		}
+		// The stored content and metadata are unchanged.
+		r := httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/0", nil)
+		w = serveRecorder(h, r)
+		if w.Code != http.StatusOK || w.Body.String() != "hell" {
+			t.Fatalf("chunk 0 after rejected writes = %d %q", w.Code, w.Body.String())
+		}
+		r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1", nil)
+		w = serveRecorder(h, r)
+		var meta map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &meta)
+		if meta["complete"] != true || fmt.Sprint(meta["receivedChunks"]) != "[0 1 2]" {
+			t.Fatalf("meta after rejected writes = %v", meta)
+		}
+	}
+	assertSealed(t, h)
+	_ = s.Close()
+
+	// After a restart the seal still holds and the original bytes are intact.
+	h, s = open(t)
+	defer func() { _ = s.Close() }()
+	assertSealed(t, h)
+	// The recorded finish result is unchanged across the restart.
+	w, body = completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || body["complete"] != true || body["reused"] != false ||
+		body["size"] != float64(11) || body["sha256"] != sha256Hex(content) {
+		t.Fatalf("repeat complete after restart = %d %v", w.Code, body)
+	}
+}
