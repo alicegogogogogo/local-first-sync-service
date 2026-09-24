@@ -50,6 +50,18 @@
 // closing store leaves no rows behind — while the changes themselves stay
 // durable, so waiting and idempotency decisions are unchanged by restart.
 //
+// WebSocket document subscriptions are the push counterpart of long polling
+// and ride the same post-commit signal: a subscription is a per-document,
+// capacity-one coalescing wake registered on behalf of a session's device;
+// the owning handler re-reads the change log from its last delivered cursor
+// after every wake, so a burst that collapses to one marker still delivers
+// every committed row in order. Subscriptions are in-memory only — they
+// create no row and a disconnect or shutdown leaves no change, cursor or other
+// record behind. Revoking a document permission pings only that device's
+// subscriptions (they close with 4403 at the transport layer); closing the
+// store pings every subscription (they close with 1001) and waits for each
+// handler to release itself before the database handle shuts.
+//
 // Replay is the offline retry of an ordinary batch: it shares the same
 // per-document contiguous cursor space and the same serialized transaction as
 // PostChanges, and additionally enforces the registration/permission layer
@@ -188,13 +200,32 @@ var ErrSessionNotFound = errors.New("session not found")
 type Store struct {
 	db *sql.DB
 
-	// pollMu guards pollWaits, nextWaitID and closed. Parked long polls wait
-	// on a per-document set of channels; a committed change to a document
-	// closes (signals) every channel parked on it.
+	// pollMu guards pollWaits, subs, nextWaitID, nextSubID and closed. Parked
+	// long polls wait on a per-document set of channels; a committed change to
+	// a document closes (signals) every long-poll channel parked on it and
+	// pings every live subscription registered for it. Both kinds of wait
+	// state are in-memory only and never touch the database.
 	pollMu     sync.Mutex
 	pollWaits  map[string]map[uint64]chan struct{}
+	subs       map[string]map[uint64]*subEntry
 	nextWaitID uint64
+	nextSubID  uint64
 	closed     bool
+
+	// subWG tracks live subscription handlers so a closing store can wait for
+	// every subscription to release itself before the database handle closes.
+	subWG sync.WaitGroup
+}
+
+// subEntry is one live WebSocket subscription. signal is capacity-one and
+// coalescing: a non-blocking send means a burst of commits while the handler
+// is busy drains backfill collapses into a single wake, after which the
+// handler re-reads the change log from its last delivered cursor and catches
+// every committed row. deviceID records the owning session's device so the
+// registry does not need to touch the sessions table on every wake.
+type subEntry struct {
+	deviceID string
+	signal   chan struct{}
 }
 
 // Open opens (creating if needed) the SQLite database at path. The empty path
@@ -216,7 +247,11 @@ func Open(path string) (*Store, error) {
 	// serialized by the immediate transaction anyway, and SQLite concurrency
 	// for readers does not help correctness here.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db, pollWaits: make(map[string]map[uint64]chan struct{})}
+	s := &Store{
+		db:        db,
+		pollWaits: make(map[string]map[uint64]chan struct{}),
+		subs:      make(map[string]map[uint64]*subEntry),
+	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -292,28 +327,59 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	return err
 }
 
-// InterruptWaits wakes every parked long poll without closing the database,
-// so an orderly server shutdown drains waiting connections immediately
-// (they answer 503) instead of holding Shutdown hostage until their wait
-// deadline. Committed state is untouched.
+// InterruptWaits wakes every parked long poll and pings every live
+// subscription without closing the database, so an orderly server shutdown
+// drains waiting connections immediately (long polls answer 503,
+// subscriptions close with 1001) instead of holding Shutdown hostage until a
+// wait deadline. The flag is one-way: a subscription or long poll that
+// registers afterward observes a closing store at once. Committed state is
+// untouched.
 func (s *Store) InterruptWaits() {
 	s.pollMu.Lock()
 	s.closed = true
 	waits := s.pollWaits
 	s.pollWaits = map[string]map[uint64]chan struct{}{}
+	// subs is intentionally not replaced: a subscription that a shutdown wakes
+	// still has to deregister its own entry and release its subWG slot, which
+	// it does by looking itself up in this map. Snapshot the entries under the
+	// lock so signaling below cannot race a concurrent deregistration.
+	var allSubs []*subEntry
+	for _, set := range s.subs {
+		for _, e := range set {
+			allSubs = append(allSubs, e)
+		}
+	}
 	s.pollMu.Unlock()
 	for _, set := range waits {
 		for _, ch := range set {
 			close(ch)
 		}
 	}
+	for _, e := range allSubs {
+		select {
+		case e.signal <- struct{}{}:
+		default:
+		}
+	}
 }
 
-// Close releases the database handle. Parked long polls are woken first so
-// they stop waiting and return without writing; the wake happens before the
-// handle closes, so a waiter never observes a closed database.
+// Closing reports whether the store is shutting down. A subscription uses it
+// to tell a shutdown wake from a commit wake: a closing store ends the
+// subscription with WebSocket close code 1001 rather than re-reading.
+func (s *Store) Closing() bool {
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	return s.closed
+}
+
+// Close releases the database handle. Parked long polls are woken and live
+// subscriptions are pinged first, and Close only closes the handle once every
+// subscription handler has released itself (subWG), so a closing subscription
+// never observes a closed database and its 1001 close frame goes out before
+// the handle shuts.
 func (s *Store) Close() error {
 	s.InterruptWaits()
+	s.subWG.Wait()
 	return s.db.Close()
 }
 
@@ -351,16 +417,122 @@ func (s *Store) registerWait(documentID string) (ch chan struct{}, remove func()
 	}
 }
 
-// notifyWaiters signals every long poll parked on documentID. It is called
-// only after a change-bearing transaction has committed, so parked readers
-// observe the new rows when they re-query.
+// notifyWaiters signals every long poll parked on documentID and pings every
+// live subscription to it. It is called only after a change-bearing
+// transaction has committed, so parked readers and woken subscriptions observe
+// the new rows when they re-query.
 func (s *Store) notifyWaiters(documentID string) {
 	s.pollMu.Lock()
 	set := s.pollWaits[documentID]
 	delete(s.pollWaits, documentID)
+	subSet := s.subs[documentID]
+	subs := make([]*subEntry, 0, len(subSet))
+	for _, e := range subSet {
+		subs = append(subs, e)
+	}
 	s.pollMu.Unlock()
 	for _, ch := range set {
 		close(ch)
+	}
+	for _, e := range subs {
+		select {
+		case e.signal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Subscription is one live, in-memory WebSocket push channel for a document.
+// It carries no durable state: creating it writes no row and closing it (or the
+// store) leaves no change, cursor or other record behind. The owning handler
+// tracks its own last delivered cursor and re-reads the change log from it on
+// every wake, so the coalesced signal cannot make the subscription miss a
+// committed row.
+type Subscription struct {
+	store    *Store
+	id       uint64
+	document string
+	deviceID string
+	signal   chan struct{}
+}
+
+// Signal returns the subscription's capacity-one coalescing wake channel. A
+// marker is sent (non-blocking) after a committed change to the document and
+// when the owning device's permission is revoked; a burst while the handler is
+// busy therefore collapses into one wake that a re-read still covers fully.
+func (x *Subscription) Signal() <-chan struct{} { return x.signal }
+
+// DeviceID reports the device that owns the subscribing session.
+func (x *Subscription) DeviceID() string { return x.deviceID }
+
+// Subscribe registers a live subscription to documentID on behalf of the
+// session-owned deviceID and tracks it so the store can wait for its release
+// at shutdown. Registration must precede the handler's first change read so a
+// commit landing during catch-up is never missed. ok is false when the store
+// is already closing; no subscription is then tracked.
+func (s *Store) Subscribe(documentID, deviceID string) (sub *Subscription, ok bool) {
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	if s.closed {
+		return nil, false
+	}
+	s.nextSubID++
+	id := s.nextSubID
+	e := &subEntry{deviceID: deviceID, signal: make(chan struct{}, 1)}
+	set := s.subs[documentID]
+	if set == nil {
+		set = make(map[uint64]*subEntry)
+		s.subs[documentID] = set
+	}
+	set[id] = e
+	s.subWG.Add(1)
+	return &Subscription{
+		store:    s,
+		id:       id,
+		document: documentID,
+		deviceID: deviceID,
+		signal:   e.signal,
+	}, true
+}
+
+// Close deregisters the subscription exactly once; a later call is a no-op. It
+// never closes the wake channel, which the store owns.
+func (x *Subscription) Close() {
+	s := x.store
+	s.pollMu.Lock()
+	set, ok := s.subs[x.document]
+	if ok {
+		if _, present := set[x.id]; present {
+			delete(set, x.id)
+			if len(set) == 0 {
+				delete(s.subs, x.document)
+			}
+			s.pollMu.Unlock()
+			s.subWG.Done()
+			return
+		}
+	}
+	s.pollMu.Unlock()
+}
+
+// notifyRevocation pings only the live subscriptions to documentID owned by
+// deviceID, so they re-check permission and end with the revocation close
+// code. Subscriptions of other devices are not woken.
+func (s *Store) notifyRevocation(documentID, deviceID string) {
+	s.pollMu.Lock()
+	subSet := s.subs[documentID]
+	var targets []*subEntry
+	for _, e := range subSet {
+		if e.deviceID == deviceID {
+			targets = append(targets, e)
+		}
+	}
+	s.pollMu.Unlock()
+	for _, e := range targets {
+		select {
+		case e.signal <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -1138,6 +1310,11 @@ func (s *Store) SetDocumentPermission(documentID, deviceID string, authorized bo
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
+	}
+	// After the revoke is durable, end that device's live subscriptions to
+	// the document; their handlers re-read permission and close with 4403.
+	if !authorized {
+		s.notifyRevocation(documentID, deviceID)
 	}
 	return true, nil
 }

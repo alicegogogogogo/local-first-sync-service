@@ -145,6 +145,35 @@ go test ./...
 - `documentID` 为空、路径段缺失或多余（如尾斜杠）、方法不匹配（非 GET）一律返回 `400` JSON 错误，不重定向、不输出 HTML。
 - 客户端断开连接或服务关闭时等待立即取消；被中断的等待不留下任何变更、游标或其他记录，服务关闭时挂起的请求以 `503` JSON 错误返回。
 
+### `GET /v1/sessions/{sessionId}/documents/{documentId}/subscribe`
+
+会话视角的 WebSocket 文档订阅（推送通道，只推不写）。客户端携带**已存在的会话标识**、文档标识和起始游标发起升级握手：
+
+```
+GET /v1/sessions/session-1/documents/doc-1/subscribe?after=12
+Connection: Upgrade
+Upgrade: websocket
+Sec-WebSocket-Key: <16 字节随机值的 base64>
+Sec-WebSocket-Version: 13
+```
+
+握手、读取与消息：
+
+- 升级成功返回 `101 Switching Protocols` 与合法的 `Sec-WebSocket-Accept`（RFC 6455）。连接建立后，先把起始游标之后**已提交**的变更按游标升序逐条补齐，随后无缝接上实时推送。
+- 每条推送是一个 text 帧，载荷与变更读取返回的**单条记录同一形状**：`{"id","deviceId","payload","cursor"}`；顺序与分页读取完全一致，不重排、不合并、不跳过。每条消息携带变更标识、来源设备、负载和游标。
+- `after` 为非负整数（默认 `0`），语义同变更读取：只推送 cursor 严格大于它的变更。重连后任意历史游标都能续上，观察到的游标可原样作为下次读取或重连的起点。
+- 普通提交、merge、restore、离线 replay 任一途径写入的新变更，都在事务提交后立即推送给订阅方。
+- 订阅与读取共享同一份变更日志；推送本身不改变文档游标空间，不产生新的变更记录，也不改变幂等判定。该连接不能提交、修改或删除任何变更内容；客户端发来的数据帧被忽略。
+- 重启后已提交的变更仍按原游标可读，新订阅可以从任意历史游标开始补齐。订阅不引入新的认证机制或存储入口，订阅身份完全由会话标识决定。
+
+失败与生命周期语义（升级前的错误一律是普通 HTTP JSON 响应，不重定向、不输出 HTML，也不建立连接或写入任何记录）：
+
+- `after` 为负数、小数或非数字，方法不是 GET，路径标识为空/段缺失或多余，或缺少/非法升级握手（`Connection`/`Upgrade`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version: 13`），返回 `400` JSON 错误。
+- 会话不存在或已删除返回 `404` JSON 错误；会话所属设备对该文档的权限已撤回返回 `403` JSON 错误。这些都在升级之前发生。
+- 订阅建立后权限被撤回时，服务端以关闭码 **4403** 结束该订阅，并停止推送任何后续变更；不影响其他设备的订阅。
+- 客户端断开或网络中断时服务端立即释放订阅，不留下变更、游标或其他记录。
+- 收到终止信号（`SIGINT`/`SIGTERM`）时，服务端以关闭码 **1001** 结束全部订阅；已提交数据和游标保持可读，优雅退出仍为零状态。
+
 ### `POST /v1/documents/{documentID}/replay`
 
 离线操作重放入口。仅接受 `Content-Type: application/json`，请求体：
@@ -270,4 +299,4 @@ go test ./...
 
 ### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//replay`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/replay/x`）以及方法不匹配同样返回 `400` JSON 错误。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//replay`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/subscribe`、`/v1/sessions/{id}/documents//subscribe` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/replay/x`、`/v1/sessions/{id}/documents/{id}/subscribe/`、`/v1/sessions/{id}/documents/{id}/subscribe/x`）以及方法不匹配同样返回 `400` JSON 错误。会话或文档恰好名为 `subscribe` 时，其普通 changes 路由不受影响。非空路径的语义保持不变。

@@ -140,6 +140,15 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleSubscribe(s, w, r)
+	})
+	// Non-GET verbs on the subscribe path: the exact GET pattern above is more
+	// specific, so other verbs reach this method-less pattern and get a JSON
+	// 400 instead of ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Any other path under the new namespaces is a JSON 404 rather than
 	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
 	// Exact method-patterns above take precedence over these subtree patterns.
@@ -217,7 +226,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -255,6 +264,50 @@ func malformedNewDocumentPath(p string) bool {
 		if seg == "replay" && i > 0 {
 			return !(len(segs) == 2 && segs[0] != "")
 		}
+	}
+	return false
+}
+
+// malformedSubscribePath reports whether p targets the session-scoped
+// subscribe endpoint but is not at its exact location:
+//
+//	/v1/sessions/{sessionId}/documents/{documentId}/subscribe
+//
+// Empty segments and trailing slashes are already rejected by the caller. This
+// catches a misplaced "subscribe" keyword or extra segments so those answer a
+// JSON 400 rather than the session subtree's JSON 404. A session (segment 0)
+// or document (segment 2) literally named "subscribe" is an identifier, not
+// the endpoint keyword, so it keeps its ordinary changes route — the same
+// carve-out documents named "poll"/"replay" already receive.
+func malformedSubscribePath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		if seg != "subscribe" {
+			continue
+		}
+		// Segment 0 is the session id and never the keyword.
+		if i == 0 {
+			continue
+		}
+		// Segment 2 is the document id, but only inside the
+		// "{session}/documents/{document}/..." shape; e.g. a document
+		// literally named "subscribe" keeps its ordinary changes route.
+		if i == 2 {
+			if len(segs) == 4 && segs[1] == "documents" && segs[3] == "changes" {
+				continue
+			}
+			return true
+		}
+		// The keyword is well-formed only as the final segment, after
+		// "{sessionId}/documents/{documentId}".
+		if i == 3 {
+			return !(len(segs) == 4 && segs[1] == "documents")
+		}
+		return true
 	}
 	return false
 }
