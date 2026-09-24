@@ -48,6 +48,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -141,6 +142,11 @@ type RestoreResult struct {
 // never registered. The caller maps it to 404; nothing is written.
 var ErrDeviceNotFound = errors.New("device not found")
 
+// ErrPermissionDenied reports that the calling device's permission for the
+// target document has been revoked. The caller maps it to 403; error
+// responses never include change contents.
+var ErrPermissionDenied = errors.New("device permission for document revoked")
+
 // ErrSessionConflict reports that a session id already belongs to a different
 // device. The session keeps its original owner; nothing is written. The
 // caller maps it to 409.
@@ -160,6 +166,100 @@ var ErrSessionNotFound = errors.New("session not found")
 // Store is the durable change log.
 type Store struct {
 	db *sql.DB
+
+	// notifier wakes long polls when a document gains changes. It carries no
+	// durable state of its own: every wake is also visible in the change log,
+	// so a missed notification (process restart, subscription that starts
+	// after the commit) costs one poll cycle rather than data.
+	notifier *changeNotifier
+}
+
+// changeNotifier broadcasts "a document gained changes" events to waiting long
+// polls. Subscriptions are keyed by document id; notify is invoked once per
+// committed write to the change log, including merges and restores. Close
+// cancels every outstanding wait, so server shutdown never leaves a poll
+// hanging.
+type changeNotifier struct {
+	mu      sync.Mutex
+	waiters map[string]map[chan struct{}]struct{}
+	closed  bool
+	done    chan struct{} // closed once, when the store is shutting down
+}
+
+func newChangeNotifier() *changeNotifier {
+	return &changeNotifier{waiters: make(map[string]map[chan struct{}]struct{}), done: make(chan struct{})}
+}
+
+// Done is closed when the notifier (and its store) shuts down. Waiters select
+// on it so server shutdown cancels every long poll without waiting for the
+// poll deadline.
+func (n *changeNotifier) Done() <-chan struct{} { return n.done }
+
+// subscribe registers ch for documentID's change events and returns an
+// unsubscribe function. Events coalesce: one signal stands for "re-read the
+// log", so a capacity-1 channel never blocks the notifier or loses a wake. On
+// Close every subscription is signaled once instead of unsubscribed silently.
+func (n *changeNotifier) subscribe(documentID string, ch chan struct{}) func() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		// A notifier that is already shutting down must not leave the caller
+		// waiting: signal immediately and treat the subscription as a no-op.
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+		return func() {}
+	}
+	set := n.waiters[documentID]
+	if set == nil {
+		set = make(map[chan struct{}]struct{})
+		n.waiters[documentID] = set
+	}
+	set[ch] = struct{}{}
+	return func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		if set, ok := n.waiters[documentID]; ok {
+			delete(set, ch)
+			if len(set) == 0 {
+				delete(n.waiters, documentID)
+			}
+		}
+	}
+}
+
+// notify wakes every subscriber of documentID.
+func (n *changeNotifier) notify(documentID string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for ch := range n.waiters[documentID] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// close wakes every subscriber once and refuses later subscriptions from
+// blocking; it is called when the service shuts down.
+func (n *changeNotifier) close() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return
+	}
+	n.closed = true
+	for _, set := range n.waiters {
+		for ch := range set {
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}
+	n.waiters = nil
+	close(n.done)
 }
 
 // Open opens (creating if needed) the SQLite database at path. The empty path
@@ -181,7 +281,7 @@ func Open(path string) (*Store, error) {
 	// serialized by the immediate transaction anyway, and SQLite concurrency
 	// for readers does not help correctness here.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, notifier: newChangeNotifier()}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -257,8 +357,47 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	return err
 }
 
-// Close releases the database handle.
-func (s *Store) Close() error { return s.db.Close() }
+// BeginShutdown wakes every outstanding long poll without closing the
+// database. The service calls it before HTTP shutdown drains in-flight
+// handlers: otherwise a long poll waiting on the store's shutdown signal
+// would itself block that drain until its poll deadline elapsed. Commits
+// after this point still persist; notifications simply have no waiters. It is
+// safe to call more than once and is implied by Close.
+func (s *Store) BeginShutdown() { s.notifier.close() }
+
+// Close releases the database handle and wakes any long polls so they do not
+// outlive the store.
+func (s *Store) Close() error {
+	s.notifier.close()
+	return s.db.Close()
+}
+
+// SubscribeChanges registers ch to be signaled whenever documentID gains a
+// committed change (a normal batch, a merge or a restore). The returned
+// function unsubscribes. Signals coalesce, so callers re-read the log after
+// each wake rather than counting signals.
+func (s *Store) SubscribeChanges(documentID string, ch chan struct{}) func() {
+	return s.notifier.subscribe(documentID, ch)
+}
+
+// ShutdownChannel is closed once when the store closes. Long polls select on
+// it so server shutdown cancels outstanding waits immediately.
+func (s *Store) ShutdownChannel() <-chan struct{} { return s.notifier.Done() }
+
+// DocumentExists reports whether documentID has at least one committed
+// change. It lets a long poll distinguish an unknown document (which must
+// return immediately with cursor 0 and never wait) from a known one caught up
+// at its tail.
+func (s *Store) DocumentExists(documentID string) (bool, error) {
+	var exists bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ?)`,
+		documentID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
 
 // PostChanges validates and commits one batch atomically.
 //
@@ -330,6 +469,110 @@ func (s *Store) PostChanges(documentID string, changes []Change) ([]Result, erro
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if len(pending) > 0 {
+		s.notifier.notify(documentID)
+	}
+	return results, nil
+}
+
+// ReplayChanges retries one offline batch against the change log. It shares
+// the change log's idempotency rules with PostChanges: an existing id is
+// idempotent only when deviceID and the decoded payload match, otherwise the
+// whole batch is rejected with *ErrConflict. Unlike a normal post it first
+// verifies, inside the same serialized transaction, that deviceID is
+// registered (ErrDeviceNotFound) and still authorized for documentID — an
+// absent permission row means authorized, so only an explicit revoke blocks
+// the replay. Valid batches commit atomically, taking the next contiguous
+// cursors, so concurrent replays and normal commits never double-allocate or
+// leave a partial batch. Results preserve the input order.
+func (s *Store) ReplayChanges(documentID, deviceID string, changes []Change) ([]Result, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, deviceID,
+	).Scan(&deviceExists); err != nil {
+		return nil, err
+	}
+	if !deviceExists {
+		return nil, ErrDeviceNotFound
+	}
+	var stored int
+	err = tx.QueryRow(
+		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No row means the default (authorized) state.
+	case err != nil:
+		return nil, err
+	default:
+		if stored == 0 {
+			return nil, ErrPermissionDenied
+		}
+	}
+
+	results := make([]Result, len(changes))
+	pending := make([]int, 0, len(changes))
+	for i, c := range changes {
+		var existingDevice string
+		var existingPayload []byte
+		var existingCursor int64
+		err := tx.QueryRow(
+			`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+			documentID, c.ID,
+		).Scan(&existingCursor, &existingDevice, &existingPayload)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			pending = append(pending, i)
+		case err != nil:
+			return nil, err
+		default:
+			if existingDevice != c.DeviceID || !jsonEqual(existingPayload, c.Payload) {
+				return nil, &ErrConflict{ID: c.ID}
+			}
+			results[i] = Result{
+				ID:      c.ID,
+				Created: false,
+				Cursor:  existingCursor,
+			}
+		}
+	}
+
+	var nextCursor int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&nextCursor); err != nil {
+		return nil, err
+	}
+	for _, i := range pending {
+		c := changes[i]
+		if _, err := tx.Exec(
+			`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
+			documentID, nextCursor, c.ID, c.DeviceID, []byte(c.Payload),
+		); err != nil {
+			return nil, err
+		}
+		results[i] = Result{
+			ID:      c.ID,
+			Created: true,
+			Cursor:  nextCursor,
+		}
+		nextCursor++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 {
+		s.notifier.notify(documentID)
 	}
 	return results, nil
 }
@@ -458,6 +701,7 @@ func (s *Store) MergeChange(documentID string, baseCursor int64, c Change) (Merg
 	if err := tx.Commit(); err != nil {
 		return MergeResult{}, err
 	}
+	s.notifier.notify(documentID)
 	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, nil
 }
 
@@ -635,6 +879,7 @@ func (s *Store) RestoreSnapshot(documentID string, deviceID, changeID string, sn
 	if err := tx.Commit(); err != nil {
 		return RestoreResult{}, err
 	}
+	s.notifier.notify(documentID)
 	return RestoreResult{
 		ID:           changeID,
 		Created:      true,

@@ -146,6 +146,21 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleListChanges(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
+		handlePollChanges(s, w, r)
+	})
+	// A non-GET verb on the poll path is a request-shape error (400 JSON),
+	// not ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "poll requires GET")
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
+		handleReplay(s, w, r)
+	})
+	// A non-POST verb on the replay path is a 400 JSON error.
+	mux.HandleFunc("/v1/documents/{documentID}/replay", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "replay requires POST")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleMergeChange(s, w, r)
 	})
@@ -182,6 +197,10 @@ func NewHandler(s *store.Store) http.Handler {
 // the pre-existing surface is unchanged. The new device/session families are
 // stricter: any doubled slash (an empty deviceId, sessionId or documentId
 // segment) or a trailing slash (an empty final id) is a 400 JSON error.
+//
+// The long-poll and replay endpoints are new in the same stricter family:
+// any empty segment (a doubled slash anywhere in the path, or a trailing
+// slash) is a 400 JSON error, never a redirect or HTML.
 func emptyIDGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
@@ -191,8 +210,20 @@ func emptyIDGuard(next http.Handler) http.Handler {
 		if strings.HasPrefix(p, "/v1/devices/") || strings.HasPrefix(p, "/v1/sessions/") {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
+		// The poll and replay endpoints are new in the stricter family: any
+		// doubled slash (an empty documentID or a missing segment such as
+		// /changes//poll) or a trailing slash is a 400 JSON error, never a
+		// ServeMux redirect (which an HTTP client would follow) or HTML. The
+		// legacy /documents/{id}/changes route ends in neither suffix, so its
+		// old trailing-slash response stands.
+		newEndpointSegmentEmpty := false
+		if strings.HasPrefix(p, "/v1/documents/") &&
+			(strings.HasSuffix(p, "/poll") || strings.HasSuffix(p, "/poll/") ||
+				strings.HasSuffix(p, "/replay") || strings.HasSuffix(p, "/replay/")) {
+			newEndpointSegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
+		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty {
+		if documentSegmentEmpty || newFamilySegmentEmpty || newEndpointSegmentEmpty {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
