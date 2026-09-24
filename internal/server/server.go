@@ -67,6 +67,25 @@ type sessionRequest struct {
 	SessionID string `json:"sessionId"`
 }
 
+// NewHandlerWithReadiness builds the same public HTTP surface as NewHandler but
+// answers every request — including GET /healthz — with a 503 JSON error until
+// ready reports that the database is open and the listener is accepting
+// connections. Once ready, responses are byte-for-byte what NewHandler emits;
+// readiness is one-way, so a later flip back is not part of the contract.
+func NewHandlerWithReadiness(s *store.Store, ready func() bool) http.Handler {
+	h := NewHandler(s)
+	if ready == nil {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ready() {
+			writeError(w, http.StatusServiceUnavailable, "service is not ready")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
 // NewHandler builds the public HTTP surface backed by s.
 func NewHandler(s *store.Store) http.Handler {
 	mux := http.NewServeMux()

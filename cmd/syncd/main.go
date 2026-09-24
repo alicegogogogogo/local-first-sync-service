@@ -1,40 +1,26 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"log"
-	"net/http"
 	"os"
-	"path/filepath"
+	"os/signal"
+	"syscall"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/server"
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/service"
 )
 
 func main() {
-	addr := os.Getenv("SYNC_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:8080"
-	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	dataPath := os.Getenv("SYNC_DATA")
-	if dataPath == "" {
-		dataPath = filepath.Join("data", "sync.db")
-	}
-	if dir := filepath.Dir(dataPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("create data directory %q: %v", dir, err)
-		}
-	}
-
-	s, err := store.Open(dataPath)
+	err := service.Run(ctx, service.Options{
+		Addr:     os.Getenv("SYNC_ADDR"),
+		DataPath: os.Getenv("SYNC_DATA"),
+	})
 	if err != nil {
-		log.Fatalf("open store at %q: %v", dataPath, err)
-	}
-	defer func() { _ = s.Close() }()
-
-	log.Printf("sync service listening on %s (data: %s)", addr, dataPath)
-	if err := http.ListenAndServe(addr, server.NewHandler(s)); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		// A startup or serving failure ends the process non-zero with the
+		// cause intact; a signal-triggered shutdown returns nil.
 		log.Fatal(err)
 	}
 }
