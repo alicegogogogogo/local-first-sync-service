@@ -37,9 +37,11 @@
 // SHA-256 digest; chunks land in any order and are stored durably as they
 // arrive, so an interrupted upload resumes after a restart with its
 // idempotency and conflict decisions intact. Finishing concatenates the
-// chunks, verifies the digest and seals the upload; finished content is
-// addressed by digest, so a second attachment with the same digest and size
-// reuses the stored bytes instead of copying them.
+// chunks, verifies the digest and seals the upload; a sealed upload is
+// immutable, so every later chunk write — even a byte-identical one — is
+// rejected and the saved content never changes. Finished content is addressed
+// by digest, so a second attachment with the same digest and size reuses the
+// stored bytes instead of copying them.
 package store
 
 import (

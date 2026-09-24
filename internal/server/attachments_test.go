@@ -481,6 +481,119 @@ func TestGetChunkOutOfRangeIs400(t *testing.T) {
 	}
 }
 
+// TestSealedAttachmentRejectsWritesHTTP observes the full required sequence:
+// one successful completion, a repeat completion with the identical result,
+// and post-seal chunk writes rejected with 409 — even when the bytes match —
+// with the sealed state and saved content unchanged.
+func TestSealedAttachmentRejectsWritesHTTP(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+	content := []byte("hello world")
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+	putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+	putChunk(t, h, "dev-1", "att-1", 1, []byte("o wo"))
+	putChunk(t, h, "dev-1", "att-1", 2, []byte("rld"))
+
+	w, first := completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || first["complete"] != true {
+		t.Fatalf("complete = %d %v body=%s", w.Code, first, w.Body.String())
+	}
+
+	// Repeat sealing returns the first result verbatim.
+	w, again := completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || fmt.Sprint(again) != fmt.Sprint(first) {
+		t.Fatalf("repeat complete = %d %v, want %v", w.Code, again, first)
+	}
+
+	// Identical bytes after sealing: 409 JSON, not the pre-seal idempotent 200.
+	w, _ = putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("identical post-seal write = %d, want 409", w.Code)
+	}
+	assertJSONError(t, w)
+	// Different bytes after sealing are refused just the same.
+	w, _ = putChunk(t, h, "dev-1", "att-1", 2, []byte("RLD!"))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("different post-seal write = %d, want 409", w.Code)
+	}
+	assertJSONError(t, w)
+
+	// A non-creator's post-seal write is still a 403 and an unknown id a 404.
+	w, _ = putChunk(t, h, "dev-2", "att-1", 0, []byte("hell"))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("non-creator post-seal write = %d, want 403", w.Code)
+	}
+	w, _ = putChunk(t, h, "dev-1", "nope", 0, []byte("hell"))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("unknown post-seal write = %d, want 404", w.Code)
+	}
+
+	// Sealed state and original bytes are untouched.
+	r := httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1", nil)
+	w = serveRecorder(h, r)
+	var meta map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &meta)
+	if meta["complete"] != true || fmt.Sprint(meta["receivedChunks"]) != "[0 1 2]" {
+		t.Fatalf("metadata after rejected writes = %v", meta)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/2", nil)
+	w = serveRecorder(h, r)
+	if w.Code != http.StatusOK || w.Body.String() != "rld" {
+		t.Fatalf("chunk content after rejected writes = %d %q", w.Code, w.Body.String())
+	}
+}
+
+// TestSealedWriteRejectionSurvivesRestart confirms the rejection decision is
+// persisted: after reopening the database, an identical chunk write still
+// fails with 409 while the repeat completion and chunk read stay consistent
+// with the original bytes.
+func TestSealedWriteRejectionSurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sync.db")
+	open := func(t *testing.T) (http.Handler, *store.Store) {
+		t.Helper()
+		s, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewHandler(s), s
+	}
+
+	h, s := open(t)
+	registerDevice(t, h, "dev-1")
+	content := []byte("hello world")
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+	putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+	putChunk(t, h, "dev-1", "att-1", 1, []byte("o wo"))
+	putChunk(t, h, "dev-1", "att-1", 2, []byte("rld"))
+	w, first := completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || first["complete"] != true || first["reused"] != false {
+		t.Fatalf("complete = %d %v", w.Code, first)
+	}
+	_ = s.Close()
+
+	h, s = open(t)
+	defer func() { _ = s.Close() }()
+
+	// Post-restart, an identical chunk write is still refused with 409.
+	w, _ = putChunk(t, h, "dev-1", "att-1", 1, []byte("o wo"))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("post-seal write after restart = %d, want 409", w.Code)
+	}
+	assertJSONError(t, w)
+
+	// The repeat completion and chunk read match the first outcome and bytes.
+	w, body := completeAttachment(t, h, "dev-1", "att-1")
+	if w.Code != http.StatusOK || fmt.Sprint(body) != fmt.Sprint(first) {
+		t.Fatalf("repeat complete after restart = %d %v, want %v", w.Code, body, first)
+	}
+	r := httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/1", nil)
+	w = serveRecorder(h, r)
+	if w.Code != http.StatusOK || w.Body.String() != "o wo" {
+		t.Fatalf("chunk read after restart = %d %q", w.Code, w.Body.String())
+	}
+}
+
 func TestAttachmentsSurviveRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
 	open := func(t *testing.T) (http.Handler, *store.Store) {

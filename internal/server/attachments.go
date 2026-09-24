@@ -81,7 +81,9 @@ func handleCreateAttachment(s *store.Store, w http.ResponseWriter, r *http.Reque
 // wrong content type, an out-of-range index, a short non-final chunk or a
 // final chunk beyond the declared total is a 400 — none of these write
 // anything. Re-submitting identical bytes is idempotent; different bytes for
-// the same index are a 409 and the first content is kept.
+// the same index are a 409 and the first content is kept. Once the attachment
+// is sealed every chunk write — even with identical bytes — is a 409, leaving
+// the sealed state and saved content untouched.
 func handlePutChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
@@ -118,6 +120,8 @@ func handlePutChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, invalid.Reason)
 		case errors.As(err, &conflict):
 			writeError(w, http.StatusConflict, "chunk already exists with different content")
+		case errors.Is(err, store.ErrAttachmentSealed):
+			writeError(w, http.StatusConflict, "attachment is already sealed and cannot accept chunk writes")
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to store chunk")
 		}

@@ -31,6 +31,12 @@ var ErrAttachmentDigestMismatch = errors.New("assembled content does not match t
 // reused. The upload stays resumable; the caller maps it to 409.
 var ErrAttachmentDigestConflict = errors.New("a completed content with the same digest but a different size exists")
 
+// ErrAttachmentSealed reports a chunk write attempted after the attachment was
+// successfully completed. A sealed upload is immutable: even a byte-identical
+// resubmission is rejected and neither the sealed state nor the saved content
+// changes. The caller maps it to 409.
+var ErrAttachmentSealed = errors.New("attachment is already sealed and rejects further chunk writes")
+
 // ErrAttachmentConflict reports that an attachment id is already taken — by
 // another device, or by this device with different metadata. The original
 // record is unchanged; the caller maps it to 409.
@@ -194,13 +200,16 @@ func (s *Store) CreateAttachment(deviceID string, a Attachment) (created bool, e
 
 // PutChunk stores one chunk of an upload, durably, inside one transaction.
 //
-// Ownership and shape are enforced first: an unknown attachment yields
-// ErrAttachmentNotFound, a non-creator device ErrAttachmentForbidden, and an
-// out-of-range index or wrong length *ErrChunkInvalid — none of these write
-// anything. Re-submitting identical bytes for an existing index is idempotent
-// (created=false); different bytes for the same index yield
-// *ErrChunkConflict and the first content is kept. Chunks may arrive in any
-// order.
+// Ownership is enforced first: an unknown attachment yields
+// ErrAttachmentNotFound and a non-creator device ErrAttachmentForbidden.
+// Once the attachment has been successfully completed it is sealed: every
+// further chunk write — even a byte-identical resubmission — yields
+// ErrAttachmentSealed, and neither the sealed state nor the saved content
+// changes. Before sealing, an out-of-range index or wrong length is an
+// *ErrChunkInvalid — none of these write anything. Re-submitting identical
+// bytes for an existing index is idempotent (created=false); different bytes
+// for the same index yield *ErrChunkConflict and the first content is kept.
+// Chunks may arrive in any order.
 func (s *Store) PutChunk(deviceID, attachmentID string, index int64, data []byte) (created bool, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -211,6 +220,11 @@ func (s *Store) PutChunk(deviceID, attachmentID string, index int64, data []byte
 	a, err := getAttachmentTx(tx, attachmentID, deviceID)
 	if err != nil {
 		return false, err
+	}
+	if a.Complete {
+		// A sealed upload is immutable: refuse every chunk write regardless of
+		// whether the bytes match what was saved.
+		return false, ErrAttachmentSealed
 	}
 	if err := a.checkChunkShape(index, int64(len(data))); err != nil {
 		return false, err

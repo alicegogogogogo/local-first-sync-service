@@ -254,6 +254,132 @@ func TestAttachmentsPersistAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestSealedAttachmentRejectsChunks verifies the post-completion write
+// boundary: once an attachment is sealed, every chunk write fails with
+// ErrAttachmentSealed — including a byte-identical resubmission — and neither
+// the sealed metadata nor the saved bytes change. Ownership and existence
+// checks still take precedence.
+func TestSealedAttachmentRejectsChunks(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+	mustRegisterDevice(t, s, "dev-2")
+
+	content := []byte("hello world")
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil {
+		t.Fatal(err)
+	}
+	chunks := [][]byte{[]byte("hell"), []byte("o wo"), []byte("rld")}
+	for i, c := range chunks {
+		if _, err := s.PutChunk("dev-1", "att-1", int64(i), c); err != nil {
+			t.Fatalf("put chunk %d: %v", i, err)
+		}
+	}
+	res, err := s.CompleteAttachment("dev-1", "att-1")
+	if err != nil || !res.Complete {
+		t.Fatalf("complete = %+v %v", res, err)
+	}
+
+	// Identical bytes after sealing are still rejected.
+	for i, c := range chunks {
+		if _, err := s.PutChunk("dev-1", "att-1", int64(i), c); !errors.Is(err, ErrAttachmentSealed) {
+			t.Fatalf("identical re-put chunk %d after seal = %v, want ErrAttachmentSealed", i, err)
+		}
+	}
+	// Different bytes and an out-of-range index after sealing are rejected the
+	// same way: the sealed boundary wins over shape validation.
+	if _, err := s.PutChunk("dev-1", "att-1", 0, []byte("HELL")); !errors.Is(err, ErrAttachmentSealed) {
+		t.Fatalf("different re-put after seal = %v, want ErrAttachmentSealed", err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 3, []byte("xxxx")); !errors.Is(err, ErrAttachmentSealed) {
+		t.Fatalf("out-of-range re-put after seal = %v, want ErrAttachmentSealed", err)
+	}
+
+	// Ownership/existence still precede the sealed check.
+	if _, err := s.PutChunk("dev-2", "att-1", 0, chunks[0]); !errors.Is(err, ErrAttachmentForbidden) {
+		t.Fatalf("non-creator sealed write = %v, want ErrAttachmentForbidden", err)
+	}
+	if _, err := s.PutChunk("dev-1", "nope", 0, chunks[0]); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("unknown sealed write = %v, want ErrAttachmentNotFound", err)
+	}
+
+	// Sealed metadata and saved content are unchanged.
+	a, indices, err := s.GetAttachment("dev-1", "att-1")
+	if err != nil || !a.Complete || a.Reused != res.Reused || len(indices) != 3 {
+		t.Fatalf("metadata after rejected writes = %+v %v err=%v", a, indices, err)
+	}
+	for i, want := range chunks {
+		got, err := s.GetAttachmentChunk("dev-1", "att-1", int64(i))
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("chunk %d after seal = %q %v, want %q", i, got, err, want)
+		}
+	}
+
+	// A repeat finish still returns the first result without recomputing.
+	again, err := s.CompleteAttachment("dev-1", "att-1")
+	if err != nil || again != res {
+		t.Fatalf("repeat complete = %+v %v, want %+v", again, err, res)
+	}
+}
+
+// TestSealedBoundarySurvivesReopen verifies the post-seal rejection is durable:
+// after a restart the complete flag (and reused marker) are read back from
+// disk, so writes stay refused and reads still return the original bytes.
+func TestSealedBoundarySurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegisterDevice(t, s, "dev-1")
+	content := []byte("immutable!") // 10 bytes / chunk 4 -> [immu][tabl][e!]
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", int64(len(content)), 4, content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 0, content[:4]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 1, content[4:8]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 2, content[8:]); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.CompleteAttachment("dev-1", "att-1")
+	if err != nil || !res.Complete {
+		t.Fatalf("complete = %+v %v", res, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	// Even identical bytes are refused after restart.
+	if _, err := s.PutChunk("dev-1", "att-1", 0, content[:4]); !errors.Is(err, ErrAttachmentSealed) {
+		t.Fatalf("sealed write after reopen = %v, want ErrAttachmentSealed", err)
+	}
+	a, indices, err := s.GetAttachment("dev-1", "att-1")
+	if err != nil || !a.Complete || a.Reused != res.Reused || len(indices) != 3 {
+		t.Fatalf("metadata after reopen = %+v %v err=%v", a, indices, err)
+	}
+	got, err := s.GetAttachmentChunk("dev-1", "att-1", 2)
+	if err != nil || string(got) != string(content[8:]) {
+		t.Fatalf("chunk after reopen = %q %v", got, err)
+	}
+	again, err := s.CompleteAttachment("dev-1", "att-1")
+	if err != nil || again != res {
+		t.Fatalf("repeat complete after reopen = %+v %v, want %+v", again, err, res)
+	}
+}
+
 // toAttachment builds the create-time metadata for content with the given
 // chunking.
 func toAttachment(id string, total, chunk int64, content []byte) Attachment {
