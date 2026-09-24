@@ -223,6 +223,32 @@ CREATE TABLE IF NOT EXISTS document_permissions (
 	authorized  INTEGER NOT NULL,
 	PRIMARY KEY (document_id, device_id)
 );
+CREATE TABLE IF NOT EXISTS attachments (
+	id           TEXT NOT NULL PRIMARY KEY,
+	device_id    TEXT NOT NULL REFERENCES devices(id),
+	size         INTEGER NOT NULL,
+	chunk_size   INTEGER NOT NULL,
+	sha256       TEXT NOT NULL,
+	status       TEXT NOT NULL,
+	content_hash TEXT,
+	reused_from  TEXT,
+	completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS attachments_device_idx
+	ON attachments(device_id);
+CREATE INDEX IF NOT EXISTS attachments_content_idx
+	ON attachments(content_hash, size);
+CREATE TABLE IF NOT EXISTS attachment_chunks (
+	attachment_id TEXT NOT NULL REFERENCES attachments(id),
+	chunk_index   INTEGER NOT NULL,
+	data          BLOB NOT NULL,
+	PRIMARY KEY (attachment_id, chunk_index)
+);
+CREATE TABLE IF NOT EXISTS attachment_blobs (
+	sha256 TEXT NOT NULL PRIMARY KEY,
+	size   INTEGER NOT NULL,
+	data   BLOB NOT NULL
+);
 `)
 	return err
 }

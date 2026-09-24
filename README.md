@@ -169,3 +169,65 @@ go test ./...
 ### 路径中的空标识
 
 `/v1/documents//changes`、`/v1/documents//merge`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
+
+## 附件（分块、可恢复、去重）
+
+附件是面向已注册设备的可恢复分块上传。创建、分块、完成和读取子资源全部挂在同一设备路径下，服务以路径中的 `deviceId` 判断创建者/归属，不依赖任何其他认证机制。
+
+创建时声明完整元数据：客户端标识、总字节数、分块大小和内容的小写十六进制 SHA-256 摘要；之后分块以二进制上传，序号从零开始，允许乱序提交与断线重试。所有操作均同步落盘，进程重启后上传进度、归属、幂等与去重判定保持一致。
+
+### `POST /v1/devices/{deviceId}/attachments`
+
+仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{
+  "attachmentId": "att-1",
+  "size": 10,
+  "chunkSize": 4,
+  "sha256": "2c70e75d9b4a8d0f6d2f1e5b0a9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c"
+}
+```
+
+- `attachmentId` 为非空字符串；`size`、`chunkSize` 为正整数（拒绝小数、字符串、布尔、`null`、零或负数）；`sha256` 为恰好 64 位小写十六进制字符。
+- 类型头不符、JSON 非法、尾随内容、字段缺失或类型错误、非正数或摘要格式错误均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误。
+- 同一设备以完全相同的元数据重试返回 `200` `{"attachmentId","size","chunkSize","sha256","created":false}`；首次创建 `"created":true`。
+- 标识已被其他设备占用时，即使元数据完全相同也返回 `409` JSON 首次记录不得改变；同一设备以不同元数据重试同样 `409`，原声明不变。
+
+### `PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
+
+上传一个分块。请求体为二进制，必须携带 `Content-Type: application/octet-stream`；`{index}` 为十进制非负整数，从零开始。
+
+- 内容类型错误或序号格式错误返回 `400`。
+- 未知附件返回 `404`；附件归属其他设备返回 `403`。
+- 序号越界、非末块长度不等于 `chunkSize`、或末块长度超过声明的余数均返回 `400` 且零写入。
+- 同序号再次提交相同字节返回 `200` 幂等（响应携带 `attachmentId`、`index`、`bytes`）；同序号提交不同字节返回 `409` 并保留首次内容。
+- 分块允许乱序上传，已提交的分块持久化，断线后可继续。
+
+### `POST /v1/devices/{deviceId}/attachments/{attachmentId}/complete`
+
+封存上传，无请求体。只有创建者可调用：非属主设备返回 `403`；未知附件返回 `404`。
+
+- 缺少分块，或已收分块累计长度不等于声明总长度，返回 `409` 且上传保持可继续。
+- 分块齐全且长度相符时按序号拼接并校验 SHA-256：摘要不一致返回 `422` 并保持未完成（分块仍可读取、上传可修正后重试）。
+- 成功返回 `200` `{"attachmentId","size","sha256","completed":true,"reused":…}`；重复完成返回相同结果。
+- 当已有其他已完成附件具有相同摘要和大小，直接复用其内容：`"reused":true` 并以 `"reusedFrom"` 标明来源附件，不复制字节。摘要相同但大小不同不得复用，返回 `409` 且当前上传仍可恢复。
+
+### `GET /v1/devices/{deviceId}/attachments/{attachmentId}`
+
+创建者读取附件元数据与上传进度：
+
+- 命中返回 `200` `{"attachmentId","deviceId","size","chunkSize","sha256","completed","received":[…]}`，`received` 为已收到分块的序号（升序）。
+- 非创建设备返回 `403`；未知附件返回 `404`。
+
+### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
+
+读取指定分块的原始字节（`Content-Type: application/octet-stream`）。
+
+- 序号格式非法（非十进制非负整数）返回 `400`；附件未知返回 `404`；非创建设备返回 `403`。
+- 序号越界返回 `400`；序号合法但该分块尚未收到（或已被首次内容占用后无法读取其他版本）返回 `404`。
+
+### 空标识与持久化
+
+附件路径下任一段为空（连续斜杠或以斜杠结尾）同样返回 `400` JSON 错误。创建、分块、完成和读取均在序列化事务内同步持久化（WAL + `synchronous=FULL`）；重启后元数据、已收分块、完成状态、幂等/冲突判定以及内容去重关系均保持不变。本次不改变设备、会话、权限、变更、合并、快照和恢复的既有语义。
