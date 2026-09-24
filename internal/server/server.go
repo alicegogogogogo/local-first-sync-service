@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
@@ -21,6 +23,9 @@ const defaultListLimit = 100
 
 // maxListLimit is the largest page size GET accepts.
 const maxListLimit = 1000
+
+// maxPollWaitMillis is the longest waitMs a long poll accepts.
+const maxPollWaitMillis = 30000
 
 type changeIn struct {
 	ID      string          `json:"id"`
@@ -65,6 +70,11 @@ type permissionRequest struct {
 
 type sessionRequest struct {
 	SessionID string `json:"sessionId"`
+}
+
+type replayRequest struct {
+	DeviceID   string     `json:"deviceId"`
+	Operations []changeIn `json:"operations"`
 }
 
 // NewHandlerWithReadiness builds the same public HTTP surface as NewHandler but
@@ -146,6 +156,21 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleListChanges(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
+		handlePollChanges(s, w, r)
+	})
+	// Non-GET verbs on the poll path: the exact GET pattern above is more
+	// specific, so only other verbs reach this method-less pattern and get a
+	// JSON 400 instead of ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
+		handleReplay(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/replay", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleMergeChange(s, w, r)
 	})
@@ -192,12 +217,46 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// malformedNewDocumentPath reports whether p targets one of the new
+// long-poll/replay endpoints but is not that endpoint's exact location: a
+// missing/empty segment, a trailing slash, extra segments, or a "poll"/"replay"
+// segment in a position short of the registered shape. ServeMux would answer
+// those with a 301 redirect or a plain-text 404/405; the new endpoints promise
+// a JSON error and never a redirect, so every such path is a malformed 400.
+//
+// Keywords are matched only past the documentID position, so documents that
+// happen to be named "poll" or "replay" keep their ordinary merge/snapshot/
+// changes routes.
+func malformedNewDocumentPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/documents/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+
+	// Poll endpoint: "poll" must be exactly the third segment, after a
+	// non-empty documentID and "changes".
+	for i, seg := range segs {
+		if seg == "poll" && i > 0 {
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// Replay endpoint: "replay" must be exactly the second segment, after a
+	// non-empty documentID.
+	for i, seg := range segs {
+		if seg == "replay" && i > 0 {
+			return !(len(segs) == 2 && segs[0] != "")
+		}
+	}
+	return false
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use
@@ -782,4 +841,124 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// handlePollChanges is the long-polling entry over the change log.
+//
+// Query params share the existing change-read constraints: after is a
+// non-negative cursor (default 0) and limit is 1..1000 (default 100); waitMs
+// is 0..30000 (default 0). Rows already past after return immediately; a known
+// document caught up to after parks until the first new commit or the wait
+// deadline; an unknown document returns an empty page with cursor 0 at once.
+// The response shape is the ordinary page plus a timedOut flag; a deadline
+// expiry echoes the caller's cursor and never advances it. A client
+// disconnect simply stops the wait and writes nothing.
+func handlePollChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	after, limit, ok := parseChangesQuery(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	var waitMs int64
+	if raw := q.Get("waitMs"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 || v > maxPollWaitMillis {
+			writeError(w, http.StatusBadRequest, "waitMs must be an integer between 0 and 30000")
+			return
+		}
+		waitMs = v
+	}
+
+	changes, nextCursor, timedOut, err := s.WaitForChanges(
+		r.Context(), documentID, after, limit, time.Duration(waitMs)*time.Millisecond,
+	)
+	switch {
+	case errors.Is(err, store.ErrStoreClosing):
+		writeError(w, http.StatusServiceUnavailable, "service is shutting down")
+		return
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The client went away (or, with waitMs bounded, its deadline lapsed
+		// at the transport): nothing more to write and nothing was stored.
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "failed to poll changes")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"changes":    changes,
+		"nextCursor": nextCursor,
+		"timedOut":   timedOut,
+	})
+}
+
+// handleReplay retries an offline batch against the existing change log. The
+// request and per-element semantics mirror POST .../changes — strict
+// application/json body, non-empty ids, no in-batch duplicates, idempotent only
+// when deviceId and decoded payload match, otherwise 409 reporting the
+// conflicting id — with the registration/permission layer enforced first:
+// 404 for an unregistered device and 403 for a revoked one, neither exposing
+// change content. The whole batch commits in one serialized transaction that
+// shares the document's contiguous cursor space with ordinary commits.
+func handleReplay(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	var req replayRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+	if req.Operations == nil {
+		writeError(w, http.StatusBadRequest, "operations must be a non-empty array")
+		return
+	}
+	if len(req.Operations) == 0 {
+		writeError(w, http.StatusBadRequest, "operations must be a non-empty array")
+		return
+	}
+
+	changes := make([]store.Change, len(req.Operations))
+	seen := make(map[string]struct{}, len(req.Operations))
+	for i, op := range req.Operations {
+		if op.ID == "" {
+			writeError(w, http.StatusBadRequest, "each operation must have a non-empty string id")
+			return
+		}
+		if len(op.Payload) == 0 {
+			writeError(w, http.StatusBadRequest, "each operation must carry a JSON payload")
+			return
+		}
+		if _, dup := seen[op.ID]; dup {
+			writeError(w, http.StatusBadRequest, "duplicate operation id within batch: "+op.ID)
+			return
+		}
+		seen[op.ID] = struct{}{}
+		changes[i] = store.Change{ID: op.ID, DeviceID: req.DeviceID, Payload: op.Payload}
+	}
+
+	results, err := s.ReplayChanges(documentID, changes)
+	if err != nil {
+		var conflict *store.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.As(err, &conflict):
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "operation id already exists with different deviceId or payload",
+				"conflictId": conflict.ID,
+			})
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to replay operations")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }

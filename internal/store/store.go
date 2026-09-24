@@ -41,16 +41,43 @@
 // immutable and rejects every further chunk write. Finished content is
 // addressed by digest, so a second attachment with the same digest and size
 // reuses the stored bytes instead of copying them.
+//
+// Long polling lets a caught-up client wait for subsequent changes. Waiters
+// register per document before the confirming read, so a commit landing
+// between that read and the park is never missed; every change-producing
+// commit (batch, merge, restore, replay) signals the document's waiters after
+// it commits. Wait state is in-memory only — a canceled disconnect or a
+// closing store leaves no rows behind — while the changes themselves stay
+// durable, so waiting and idempotency decisions are unchanged by restart.
+//
+// Replay is the offline retry of an ordinary batch: it shares the same
+// per-document contiguous cursor space and the same serialized transaction as
+// PostChanges, and additionally enforces the registration/permission layer
+// (ErrDeviceNotFound, ErrPermissionDenied) before any change id is resolved,
+// so its error responses never reveal change content.
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// ErrStoreClosing reports that the store is shutting down and parked long
+// polls have been woken so they can return without writing anything. The
+// caller maps it to 503.
+var ErrStoreClosing = errors.New("store is closing")
+
+// ErrPermissionDenied reports that a device's access to the document has been
+// revoked. The caller maps it to 403; nothing is written and no change content
+// is exposed.
+var ErrPermissionDenied = errors.New("device permission for this document has been revoked")
 
 // ErrStaleCursor reports that a merge targets a base cursor for an unknown
 // document, or a base cursor greater than the document's current cursor. The
@@ -160,6 +187,14 @@ var ErrSessionNotFound = errors.New("session not found")
 // Store is the durable change log.
 type Store struct {
 	db *sql.DB
+
+	// pollMu guards pollWaits, nextWaitID and closed. Parked long polls wait
+	// on a per-document set of channels; a committed change to a document
+	// closes (signals) every channel parked on it.
+	pollMu     sync.Mutex
+	pollWaits  map[string]map[uint64]chan struct{}
+	nextWaitID uint64
+	closed     bool
 }
 
 // Open opens (creating if needed) the SQLite database at path. The empty path
@@ -181,7 +216,7 @@ func Open(path string) (*Store, error) {
 	// serialized by the immediate transaction anyway, and SQLite concurrency
 	// for readers does not help correctness here.
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, pollWaits: make(map[string]map[uint64]chan struct{})}
 	if err := s.init(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -257,8 +292,149 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	return err
 }
 
-// Close releases the database handle.
-func (s *Store) Close() error { return s.db.Close() }
+// InterruptWaits wakes every parked long poll without closing the database,
+// so an orderly server shutdown drains waiting connections immediately
+// (they answer 503) instead of holding Shutdown hostage until their wait
+// deadline. Committed state is untouched.
+func (s *Store) InterruptWaits() {
+	s.pollMu.Lock()
+	s.closed = true
+	waits := s.pollWaits
+	s.pollWaits = map[string]map[uint64]chan struct{}{}
+	s.pollMu.Unlock()
+	for _, set := range waits {
+		for _, ch := range set {
+			close(ch)
+		}
+	}
+}
+
+// Close releases the database handle. Parked long polls are woken first so
+// they stop waiting and return without writing; the wake happens before the
+// handle closes, so a waiter never observes a closed database.
+func (s *Store) Close() error {
+	s.InterruptWaits()
+	return s.db.Close()
+}
+
+// registerWait parks a channel for documentID and returns it together with a
+// removal function. The channel is closed on the next committed change to the
+// document, or when the store closes.
+func (s *Store) registerWait(documentID string) (ch chan struct{}, remove func()) {
+	ch = make(chan struct{}, 1)
+
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	if s.closed {
+		// Close beat the registration: signal immediately so the caller does
+		// not park on a channel nobody will close.
+		close(ch)
+		return ch, func() {}
+	}
+	s.nextWaitID++
+	id := s.nextWaitID
+	set := s.pollWaits[documentID]
+	if set == nil {
+		set = make(map[uint64]chan struct{})
+		s.pollWaits[documentID] = set
+	}
+	set[id] = ch
+	return ch, func() {
+		s.pollMu.Lock()
+		if set, ok := s.pollWaits[documentID]; ok {
+			delete(set, id)
+			if len(set) == 0 {
+				delete(s.pollWaits, documentID)
+			}
+		}
+		s.pollMu.Unlock()
+	}
+}
+
+// notifyWaiters signals every long poll parked on documentID. It is called
+// only after a change-bearing transaction has committed, so parked readers
+// observe the new rows when they re-query.
+func (s *Store) notifyWaiters(documentID string) {
+	s.pollMu.Lock()
+	set := s.pollWaits[documentID]
+	delete(s.pollWaits, documentID)
+	s.pollMu.Unlock()
+	for _, ch := range set {
+		close(ch)
+	}
+}
+
+// WaitForChanges blocks until documentID has a change with cursor greater than
+// after, a change is committed while waiting, wait elapses, ctx is canceled
+// (the client disconnected) or the store closes. It then returns the current
+// page of up to limit changes exactly as ListChanges would, with timedOut=true
+// only when the wait deadline expired with no new rows.
+//
+// Registration precedes the first query: a commit landing between the read and
+// the park still notifies a registered channel, so no change is missed.
+//
+// An unknown document is never parked on: it returns immediately with an empty
+// list and nextCursor 0, timedOut=false. Data already past after is likewise
+// returned immediately. wait <= 0 is an immediately expired deadline.
+func (s *Store) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) (changes []ListedChange, nextCursor int64, timedOut bool, err error) {
+	ch, remove := s.registerWait(documentID)
+	defer remove()
+
+	changes, nextCursor, err = s.ListChanges(documentID, after, limit)
+	if err != nil || len(changes) > 0 {
+		return changes, nextCursor, false, err
+	}
+
+	// Empty page: distinguish an unknown document (immediate empty/0, never
+	// parked on) from a known document caught up to after.
+	known, err := s.DocumentExists(documentID)
+	if err != nil || !known {
+		return changes, 0, false, err
+	}
+
+	// Known document, nothing new: a zero wait is an immediately expired
+	// deadline; ListChanges already echoes nextCursor == after.
+	if wait <= 0 {
+		return changes, nextCursor, true, nil
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-ch:
+		// Woken by a committed change or by Close.
+		s.pollMu.Lock()
+		closing := s.closed
+		s.pollMu.Unlock()
+		if closing {
+			return nil, 0, false, ErrStoreClosing
+		}
+		changes, nextCursor, err = s.ListChanges(documentID, after, limit)
+		return changes, nextCursor, len(changes) == 0, err
+	case <-timer.C:
+		// Timeout with no new rows: echo the caller's cursor without
+		// advancing it. The document was known above, so ListChanges returns
+		// nextCursor == after for an empty page.
+		changes, nextCursor, err = s.ListChanges(documentID, after, limit)
+		return changes, nextCursor, len(changes) == 0, err
+	case <-ctx.Done():
+		return nil, 0, false, ctx.Err()
+	}
+}
+
+// DocumentExists reports whether documentID has any change row and is
+// therefore a known document rather than an empty namespace.
+func (s *Store) DocumentExists(documentID string) (bool, error) {
+	var known bool
+	if err := s.db.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ?)`,
+		documentID,
+	).Scan(&known); err != nil {
+		return false, err
+	}
+	return known, nil
+}
 
 // PostChanges validates and commits one batch atomically.
 //
@@ -330,6 +506,115 @@ func (s *Store) PostChanges(documentID string, changes []Change) ([]Result, erro
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if len(pending) > 0 {
+		s.notifyWaiters(documentID)
+	}
+	return results, nil
+}
+
+// ReplayChanges commits a retried offline batch with exactly the same change
+// semantics as PostChanges: ids resolve against the existing log, matching ids
+// are idempotent only when deviceID and the decoded payload match, a mismatch
+// is *ErrConflict and aborts the whole batch, and new ids take contiguous
+// cursors in input order in one serialized transaction.
+//
+// Unlike PostChanges it additionally enforces the registration/permission
+// layer before touching the log: an unregistered device yields
+// ErrDeviceNotFound (404) and a revoked device yields ErrPermissionDenied
+// (403). None of those outcomes writes anything or exposes change content.
+func (s *Store) ReplayChanges(documentID string, changes []Change) ([]Result, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Gate first, in the same transaction: the device row and the permission
+	// row are read before any change id is resolved, so a rejected replay
+	// cannot observe (and its error cannot reveal) change content.
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, changes[0].DeviceID,
+	).Scan(&deviceExists); err != nil {
+		return nil, err
+	}
+	if !deviceExists {
+		return nil, ErrDeviceNotFound
+	}
+	var stored int
+	err = tx.QueryRow(
+		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, changes[0].DeviceID,
+	).Scan(&stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No deviation row: devices start authorized.
+	case err != nil:
+		return nil, err
+	default:
+		if stored == 0 {
+			return nil, ErrPermissionDenied
+		}
+	}
+
+	results := make([]Result, len(changes))
+
+	// Resolve every id before allocating anything.
+	pending := make([]int, 0, len(changes))
+	for i, c := range changes {
+		var existingDevice string
+		var existingPayload []byte
+		var existingCursor int64
+		err := tx.QueryRow(
+			`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+			documentID, c.ID,
+		).Scan(&existingCursor, &existingDevice, &existingPayload)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			pending = append(pending, i)
+		case err != nil:
+			return nil, err
+		default:
+			if existingDevice != c.DeviceID || !jsonEqual(existingPayload, c.Payload) {
+				return nil, &ErrConflict{ID: c.ID}
+			}
+			results[i] = Result{
+				ID:      c.ID,
+				Created: false,
+				Cursor:  existingCursor,
+			}
+		}
+	}
+
+	var nextCursor int64
+	if err := tx.QueryRow(
+		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
+		documentID,
+	).Scan(&nextCursor); err != nil {
+		return nil, err
+	}
+	for _, i := range pending {
+		c := changes[i]
+		if _, err := tx.Exec(
+			`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
+			documentID, nextCursor, c.ID, c.DeviceID, []byte(c.Payload),
+		); err != nil {
+			return nil, err
+		}
+		results[i] = Result{
+			ID:      c.ID,
+			Created: true,
+			Cursor:  nextCursor,
+		}
+		nextCursor++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 {
+		s.notifyWaiters(documentID)
 	}
 	return results, nil
 }
@@ -458,6 +743,7 @@ func (s *Store) MergeChange(documentID string, baseCursor int64, c Change) (Merg
 	if err := tx.Commit(); err != nil {
 		return MergeResult{}, err
 	}
+	s.notifyWaiters(documentID)
 	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, nil
 }
 
@@ -635,6 +921,7 @@ func (s *Store) RestoreSnapshot(documentID string, deviceID, changeID string, sn
 	if err := tx.Commit(); err != nil {
 		return RestoreResult{}, err
 	}
+	s.notifyWaiters(documentID)
 	return RestoreResult{
 		ID:           changeID,
 		Created:      true,

@@ -126,6 +126,47 @@ go test ./...
 
 游标在每个文档内独立、从 1 开始、连续不重复，可作为断点续传位置持久保存。
 
+### `GET /v1/documents/{documentID}/changes/poll`
+
+断线客户端的长轮询续传入口，在 `GET .../changes` 的分页语义上增加一个等待期限。查询参数：
+
+- `after`：非负整数，默认 `0`，只返回 cursor 严格大于它的变更（沿用既有变更读取约束）。
+- `limit`：`1..1000` 的整数，默认 `100`（沿用既有变更读取约束）。
+- `waitMs`：`0..30000` 的整数，默认 `0`，即愿意为后续变更等待的毫秒数。
+
+行为：
+
+- `after` 之后已有变更时立即返回，不进入等待；响应结果继续按 cursor 递增。
+- 已知文档但暂无新变更时，请求保持到期限届满或首条新变更提交；新变更（普通提交、merge、restore、replay 任一途径）一提交即被唤醒并立即返回同一结果结构。
+- 未知文档立即返回空列表与 `nextCursor: 0`，不挂起请求。
+- 期限届满仍无变化时返回空列表、`nextCursor` 等于请求中的 `after`、`timedOut: true`，绝不伪造游标推进；数据就绪或未知文档的即时返回均带 `timedOut: false`。
+- 响应：`{"changes":[{"id","deviceId","payload","cursor"}, ...], "nextCursor": N, "timedOut": bool}`，`changes` 按 cursor 递增。
+- `after`、`limit` 或 `waitMs` 非法（含 `waitMs` 超出 `0..30000`、小数、非数字）返回 `400` JSON 错误且不写入。
+- `documentID` 为空、路径段缺失或多余（如尾斜杠）、方法不匹配（非 GET）一律返回 `400` JSON 错误，不重定向、不输出 HTML。
+- 客户端断开连接或服务关闭时等待立即取消；被中断的等待不留下任何变更、游标或其他记录，服务关闭时挂起的请求以 `503` JSON 错误返回。
+
+### `POST /v1/documents/{documentID}/replay`
+
+离线操作重放入口。仅接受 `Content-Type: application/json`，请求体：
+
+```json
+{
+  "deviceId": "device-1",
+  "operations": [
+    {"id": "change-1", "payload": {"any": "json"}},
+    {"id": "change-2", "payload": [1, true, null]}
+  ]
+}
+```
+
+- 每一项都按既有变更提交语义的一次重试处理：`operations` 为非空数组，元素含非空字符串 `id` 和任意 JSON `payload`，按原顺序排列。
+- 类型头不符、请求体不是合法 JSON、带尾随内容、`deviceId` 缺失或为空、`operations` 缺失或为空、元素缺少非空 `id` 或 payload、批内 `id` 重复，均返回 `400` JSON 错误且整批零写入。
+- 设备未注册返回 `404` JSON 错误；该设备对此文档的权限已撤回返回 `403` JSON 错误；两类错误均不暴露任何变更内容。
+- 同一文档已有标识只有在 `deviceId` 与解码后的负载都相同时才算幂等（`created=false`，cursor 为首次值）；已有标识的负载或设备不一致时返回 `409` JSON 错误：`{"error": "...", "conflictId": "..."}`，整批保持原状。
+- 成功返回 `200` `{"results":[{"id","created","cursor"}, ...]}`，顺序与请求一致，逐项说明新建（`created=true`）或幂等（`created=false`）及对应 cursor。
+- 离线重放与普通提交共享每个文档连续、不重复的游标空间，并在同一个序列化原子事务内提交；并发的普通提交与重放不会重复分配 cursor，也不会留下半批数据。
+- 所有判定与负载同步落盘：重启后再次等待或重放得到一致的状态、幂等判定和原始负载。
+
 ### `POST /v1/documents/{documentID}/merge`
 
 仅接受 `Content-Type: application/json`。请求体：
@@ -229,4 +270,4 @@ go test ./...
 
 ### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//replay`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/replay/x`）以及方法不匹配同样返回 `400` JSON 错误。非空路径的语义保持不变。

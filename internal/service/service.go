@@ -141,8 +141,11 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	// Shutdown closes the listener immediately (new connections are refused)
-	// and lets in-flight handlers finish before the store is closed. It is
-	// safe even when Serve has already returned on its own.
+	// and lets in-flight handlers finish before the store is closed. Waiting
+	// long polls are interrupted first so they answer instead of pinning the
+	// drain until their wait deadline. It is safe even when Serve has already
+	// returned on its own.
+	st.InterruptWaits()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
