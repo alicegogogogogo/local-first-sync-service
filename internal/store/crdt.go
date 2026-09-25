@@ -196,6 +196,20 @@ CREATE TABLE IF NOT EXISTS crdt_orset_tombstones (
 	removed_by  TEXT NOT NULL,
 	PRIMARY KEY (document_id, element, op_id)
 );
+-- crdt_op_identities keeps, for each operation id whose merge row compaction
+-- trimmed away, the only information idempotency and conflict decisions still
+-- need: the originating device and a digest of the type-specific comparison
+-- content. Compaction never trims this table; it does not participate in any
+-- merge and holds a fixed-size digest rather than the operation payload, so
+-- retaining one small row per trimmed id cannot grow the state back toward its
+-- pre-compaction size.
+CREATE TABLE IF NOT EXISTS crdt_op_identities (
+	document_id TEXT NOT NULL,
+	id          TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	digest      BLOB NOT NULL,
+	PRIMARY KEY (document_id, id)
+);
 `
 
 // SubmitCRDTOps validates and commits one CRDT batch atomically.
@@ -355,6 +369,19 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 		).Scan(&existingDevice, &existingValue)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
+			// The merge row may have been trimmed by compaction; the retained
+			// identity still decides between idempotent replay and conflict.
+			idempotent, idErr := resolveTrimmedIdentity(
+				tx, documentID, CRDTTypeCounter,
+				"operation id already exists with a different device or value", op,
+			)
+			if idErr != nil {
+				return false, idErr
+			}
+			if idempotent {
+				results[i] = CRDTResult{ID: op.ID, Created: false}
+				continue
+			}
 			// New id: enforce monotonicity against this device's maximum.
 			var current sql.NullInt64
 			if scanErr := tx.QueryRow(
@@ -418,6 +445,19 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 		).Scan(&existingDevice, &existingElements)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
+			// The operation row covering the union may have been trimmed; the
+			// retained identity still decides replay versus conflict.
+			idempotent, idErr := resolveTrimmedIdentity(
+				tx, documentID, CRDTTypeGSet,
+				"operation id already exists with a different device or elements", op,
+			)
+			if idErr != nil {
+				return false, idErr
+			}
+			if idempotent {
+				results[i] = CRDTResult{ID: op.ID, Created: false}
+				continue
+			}
 			// New id; insert the op and its elements below.
 		case err != nil:
 			return false, err
@@ -488,9 +528,24 @@ func applyRegisterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRD
 		).Scan(&existingDevice, &existingVersion, &existingValue)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
+			// An older per-device version may have been trimmed; the retained
+			// identity still decides replay versus conflict before the version
+			// monotonicity gate, which only applies to an id never accepted.
+			idempotent, idErr := resolveTrimmedIdentity(
+				tx, documentID, CRDTTypeRegister,
+				"operation id already exists with a different device, version or value", op,
+			)
+			if idErr != nil {
+				return false, idErr
+			}
+			if idempotent {
+				results[i] = CRDTResult{ID: op.ID, Created: false}
+				continue
+			}
 			// New id: the device's versions only move strictly forward. The
-			// per-device maximum is derived from the accepted ops, so the
-			// decision is durable across restarts without extra state.
+			// per-device maximum is derived from the retained operations, so
+			// the decision survives compaction (which keeps each device's
+			// latest) and restarts without extra state.
 			var maxVersion sql.NullInt64
 			if scanErr := tx.QueryRow(
 				`SELECT MAX(version) FROM crdt_register_ops WHERE document_id = ? AND device_id = ?`,

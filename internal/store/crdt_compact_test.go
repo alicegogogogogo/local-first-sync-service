@@ -396,3 +396,190 @@ func TestCompactPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("retained op replay after reopen = %v %+v, want idempotent", err, results)
 	}
 }
+
+// wantConflict submits ops and asserts an *ErrCRDTConflict that names id.
+func wantConflict(t *testing.T, s *Store, doc, typ string, id string, ops ...CRDTOp) {
+	t.Helper()
+	_, err := s.SubmitCRDTOps(doc, typ, ops)
+	var conflict *ErrCRDTConflict
+	if !errors.As(err, &conflict) {
+		t.Fatalf("submit %s after compaction err = %v, want *ErrCRDTConflict", id, err)
+	}
+	if conflict.ID != id {
+		t.Fatalf("conflict id = %q, want %q", conflict.ID, id)
+	}
+}
+
+// replay submits ops and asserts the first result is an idempotent no-op.
+func replay(t *testing.T, s *Store, doc, typ string, ops ...CRDTOp) {
+	t.Helper()
+	results, err := s.SubmitCRDTOps(doc, typ, ops)
+	if err != nil {
+		t.Fatalf("replay after compaction: %v", err)
+	}
+	if len(results) != len(ops) {
+		t.Fatalf("replay results = %d, want %d", len(results), len(ops))
+	}
+	for i, result := range results {
+		if result.ID != ops[i].ID || result.Created {
+			t.Fatalf("replay result %d = %+v, want %s created=false", i, result, ops[i].ID)
+		}
+	}
+}
+
+func TestCompactCounterTrimmedIDStillDecides(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	registerDevices(t, s, "dev-1", "dev-2")
+
+	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+
+	snapshot, err := s.CompactCRDT("doc", "dev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a1 (value 5) is trimmed; a2 (value 8) is retained.
+	if snapshot.Operations != 1 || string(snapshot.Value) != "8" {
+		t.Fatalf("snapshot = %+v, want one op merging to 8", snapshot)
+	}
+
+	// Same device and value: the trimmed id still replays idempotently with
+	// its original result (created=false), and creates nothing.
+	replay(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	if got := crdtStateValue(t, s, "doc"); got != "8" {
+		t.Fatalf("state after trimmed replay = %s, want 8", got)
+	}
+	if after, _ := s.GetCRDTSnapshot("doc"); after.Operations != 1 {
+		t.Fatalf("operations after trimmed replay = %d, want 1", after.Operations)
+	}
+
+	// Different value: 409 and nothing changes, even though the row is gone.
+	wantConflict(t, s, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(9)})
+	// Different device: likewise 409 with the state untouched.
+	wantConflict(t, s, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-2", Value: rawInt(5)})
+	if got := crdtStateValue(t, s, "doc"); got != "8" {
+		t.Fatalf("state after trimmed conflicts = %s, want 8", got)
+	}
+	if after, _ := s.GetCRDTSnapshot("doc"); after.Operations != 1 {
+		t.Fatalf("operations after trimmed conflicts = %d, want 1", after.Operations)
+	}
+
+	// A genuinely new id still follows the normal path: a regression is
+	// rejected by the retained per-device maximum, an advance is accepted.
+	wantConflict(t, s, "doc", CRDTTypeCounter, "a3", CRDTOp{ID: "a3", DeviceID: "dev-1", Value: rawInt(7)})
+	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a4", DeviceID: "dev-1", Value: rawInt(10)})
+	if got := crdtStateValue(t, s, "doc"); got != "10" {
+		t.Fatalf("state after new advance = %s, want 10", got)
+	}
+}
+
+func TestCompactGSetTrimmedIDStillDecides(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	registerDevices(t, s, "dev-1", "dev-2")
+
+	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g1", DeviceID: "dev-1", Elements: []string{"apple", "banana"}})
+	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g2", DeviceID: "dev-1", Elements: []string{"cherry"}})
+	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple"}})
+
+	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	// g3 is fully covered by g1 and trimmed.
+
+	// Same elements, different order and duplicated: the element-set content
+	// compares equal, so the trimmed id replays idempotently.
+	replay(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple", "apple"}})
+	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry"]` {
+		t.Fatalf("state after trimmed replay = %s", got)
+	}
+
+	// A different element set conflicts; so does a different device.
+	wantConflict(t, s, "doc", CRDTTypeGSet, "g3", CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"date"}})
+	wantConflict(t, s, "doc", CRDTTypeGSet, "g3", CRDTOp{ID: "g3", DeviceID: "dev-2", Elements: []string{"apple"}})
+	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry"]` {
+		t.Fatalf("state after trimmed conflicts = %s", got)
+	}
+
+	// A new element still merges through the normal path.
+	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g4", DeviceID: "dev-1", Elements: []string{"date"}})
+	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry","date"]` {
+		t.Fatalf("state after new element = %s", got)
+	}
+}
+
+func TestCompactRegisterTrimmedIDStillDecides(t *testing.T) {
+	s, _ := Open("")
+	defer func() { _ = s.Close() }()
+	registerDevices(t, s, "dev-1", "dev-2")
+
+	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
+
+	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	// r1 is the trimmed older version of dev-1; r2 is the retained latest.
+
+	// The trimmed id replays idempotently even though version 1 is now below
+	// the device's retained maximum — the identity is decided before the
+	// monotonicity gate. Object key order (and 1 vs 1.0-style JSON equality)
+	// is irrelevant to the comparison.
+	replay(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"a":1,"b":2}`)})
+	if got := crdtStateValue(t, s, "doc"); got != `"second"` {
+		t.Fatalf("state after trimmed replay = %s, want \"second\"", got)
+	}
+
+	// Different version, different value or different device all conflict and
+	// leave the winning value and the retained operation count untouched.
+	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
+	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 3, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-2", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	if got := crdtStateValue(t, s, "doc"); got != `"second"` {
+		t.Fatalf("state after trimmed conflicts = %s, want \"second\"", got)
+	}
+	if after, _ := s.GetCRDTSnapshot("doc"); after.Operations != 1 {
+		t.Fatalf("operations after trimmed replays = %d, want 1", after.Operations)
+	}
+}
+
+func TestCompactTrimmedIdentitiesPersistAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sync.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerDevices(t, s, "dev-1")
+	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc2", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
+	submitCRDT(t, s, "doc2", CRDTTypeRegister, CRDTOp{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
+	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CompactCRDT("doc2", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	// The trimmed ids keep deciding identically after the restart.
+	replay(t, s2, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	wantConflict(t, s2, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(6)})
+	replay(t, s2, "doc2", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
+	wantConflict(t, s2, "doc2", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
+	if got := crdtStateValue(t, s2, "doc"); got != "8" {
+		t.Fatalf("counter state after reopen = %s, want 8", got)
+	}
+	if got := crdtStateValue(t, s2, "doc2"); got != `"second"` {
+		t.Fatalf("register state after reopen = %s, want \"second\"", got)
+	}
+}

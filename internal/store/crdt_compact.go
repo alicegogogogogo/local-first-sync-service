@@ -13,11 +13,15 @@
 // because the merged value does not move. The trimmed state still reproduces
 // the exact merge and still answers the submission layer's questions — the
 // per-device counter maxima and register versions that gate regressions live
-// in the retained rows — so merge results, idempotency decisions and conflict
-// responses are computed by the same rules afterward. A snapshot read reports
-// the merged value together with the number of stored operations and
-// tombstones, so a client can observe what compaction trimmed; both counts
-// are non-negative and durable across restarts.
+// in the retained rows, and the device plus comparison content of every
+// trimmed operation id moves into the small crdt_op_identities table — so
+// merge results, idempotency decisions and conflict responses are computed by
+// the same rules afterward. A snapshot read reports the merged value together
+// with the number of stored operations and tombstones, so a client can observe
+// what compaction trimmed; both counts are non-negative and durable across
+// restarts. The identity table is neither count: it holds one fixed-size
+// digest per trimmed id, never participates in a merge, and cannot grow the
+// trimmed state back toward its pre-compaction size.
 
 package store
 
@@ -58,20 +62,24 @@ type CRDTSnapshot struct {
 //   - counter: each device's maximum contribution (ties keep the
 //     lexicographically smaller operation id); superseded contributions are
 //     dropped. The per-device maxima table is untouched, so monotonicity
-//     checks and the merged sum are unchanged.
+//     checks and the merged sum are unchanged. Each dropped id keeps a
+//     device-plus-value identity.
 //   - gset: a minimal prefix cover of the union — operations are considered
 //     in ascending id order and one is kept only when it contributes an
 //     element no previously kept operation covers. The union table is
-//     untouched, so the merged set is unchanged.
+//     untouched, so the merged set is unchanged. Each dropped id keeps a
+//     device-plus-elements identity.
 //   - register: each device's greatest-version operation (which includes the
 //     document's winner). Regression checks derive per-device maxima from
 //     these rows, so later version checks and the winning value are
-//     unchanged.
+//     unchanged. Each dropped older id keeps a device-plus-version-plus-value
+//     identity.
 //   - orset: live add tags. Tombstoned tags are dropped together with the
 //     tombstones covering them — a dead tag and its tombstone cancel out of
 //     the merge — so the live element set is unchanged. The operation log is
-//     untouched, so replaying an add or remove stays idempotent and a
-//     replayed remove never tombstones tags that arrived after it.
+//     untouched (adds and removes alike), so replaying either one stays
+//     idempotent and a replayed remove never tombstones tags that arrived
+//     after it; no identity row is needed.
 //
 // Compaction is idempotent: a second run finds nothing to trim and returns
 // the same snapshot. It commits no change-log row, allocates no cursor and,
@@ -158,7 +166,9 @@ func (s *Store) CompactCRDT(documentID, deviceID string) (CRDTSnapshot, error) {
 // equal but later-id) contribution from the same device, keeping exactly one
 // operation per device: its maximum contribution, ties broken by the
 // lexicographically smaller operation id. The per-device maxima table that
-// drives the merge and the regression checks is untouched.
+// drives the merge and the regression checks is untouched. Before a row is
+// dropped its identity is retained, so a replay of the trimmed id stays
+// idempotent and a mismatched replay stays a conflict.
 func compactCounterOps(tx *sql.Tx, documentID string) error {
 	rows, err := tx.Query(
 		`SELECT id, device_id, value FROM crdt_ops WHERE document_id = ? ORDER BY id ASC`,
@@ -170,9 +180,10 @@ func compactCounterOps(tx *sql.Tx, documentID string) error {
 	type contribution struct {
 		id    string
 		value int64
+		raw   []byte
 	}
 	best := make(map[string]contribution)
-	var drop []string
+	var drop []CRDTOp
 	for rows.Next() {
 		var id, deviceID string
 		var raw []byte
@@ -190,11 +201,11 @@ func compactCounterOps(tx *sql.Tx, documentID string) error {
 		// greater value replaces it.
 		if cur, ok := best[deviceID]; !ok || value > cur.value {
 			if ok {
-				drop = append(drop, cur.id)
+				drop = append(drop, CRDTOp{ID: cur.id, DeviceID: deviceID, Value: json.RawMessage(cur.raw)})
 			}
-			best[deviceID] = contribution{id: id, value: value}
+			best[deviceID] = contribution{id: id, value: value, raw: raw}
 		} else {
-			drop = append(drop, id)
+			drop = append(drop, CRDTOp{ID: id, DeviceID: deviceID, Value: json.RawMessage(raw)})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -203,10 +214,13 @@ func compactCounterOps(tx *sql.Tx, documentID string) error {
 	}
 	_ = rows.Close()
 
-	for _, id := range drop {
+	for _, op := range drop {
+		if err := retainCRDTOpIdentity(tx, documentID, CRDTTypeCounter, op); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(
 			`DELETE FROM crdt_ops WHERE document_id = ? AND id = ?`,
-			documentID, id,
+			documentID, op.ID,
 		); err != nil {
 			return err
 		}
@@ -218,21 +232,23 @@ func compactCounterOps(tx *sql.Tx, documentID string) error {
 // kept operations: operations are considered in ascending id order and one is
 // kept only when it contributes at least one element no previously kept
 // operation covers. The union table that drives the merge is untouched, so
-// the kept operations still reproduce the exact merged set.
+// the kept operations still reproduce the exact merged set. A dropped
+// operation's identity is retained before its row is deleted, so a replay of
+// the trimmed id stays idempotent and a mismatched replay stays a conflict.
 func compactGSetOps(tx *sql.Tx, documentID string) error {
 	rows, err := tx.Query(
-		`SELECT id, value FROM crdt_ops WHERE document_id = ? ORDER BY id ASC`,
+		`SELECT id, device_id, value FROM crdt_ops WHERE document_id = ? ORDER BY id ASC`,
 		documentID,
 	)
 	if err != nil {
 		return err
 	}
 	covered := make(map[string]struct{})
-	var drop []string
+	var drop []CRDTOp
 	for rows.Next() {
-		var id string
+		var id, deviceID string
 		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
+		if err := rows.Scan(&id, &deviceID, &raw); err != nil {
 			_ = rows.Close()
 			return err
 		}
@@ -249,7 +265,7 @@ func compactGSetOps(tx *sql.Tx, documentID string) error {
 			}
 		}
 		if !keeps {
-			drop = append(drop, id)
+			drop = append(drop, CRDTOp{ID: id, DeviceID: deviceID, Elements: elements})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -258,10 +274,13 @@ func compactGSetOps(tx *sql.Tx, documentID string) error {
 	}
 	_ = rows.Close()
 
-	for _, id := range drop {
+	for _, op := range drop {
+		if err := retainCRDTOpIdentity(tx, documentID, CRDTTypeGSet, op); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(
 			`DELETE FROM crdt_ops WHERE document_id = ? AND id = ?`,
-			documentID, id,
+			documentID, op.ID,
 		); err != nil {
 			return err
 		}
@@ -273,10 +292,12 @@ func compactGSetOps(tx *sql.Tx, documentID string) error {
 // version from the same device, keeping each device's greatest-version
 // operation. Versions strictly increase per device, so exactly one row per
 // device survives; the per-device maxima the regression checks derive from
-// the table, and the document's winning value, are unchanged.
+// the table, and the document's winning value, are unchanged. A dropped
+// operation's identity is retained before its row is deleted, so a replay of
+// the trimmed id stays idempotent and a mismatched replay stays a conflict.
 func compactRegisterOps(tx *sql.Tx, documentID string) error {
-	_, err := tx.Exec(
-		`DELETE FROM crdt_register_ops
+	rows, err := tx.Query(
+		`SELECT id, device_id, version, value FROM crdt_register_ops
 		 WHERE document_id = ?
 		   AND EXISTS (
 			SELECT 1 FROM crdt_register_ops newer
@@ -286,7 +307,36 @@ func compactRegisterOps(tx *sql.Tx, documentID string) error {
 		   )`,
 		documentID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	var drop []CRDTOp
+	for rows.Next() {
+		var op CRDTOp
+		if err := rows.Scan(&op.ID, &op.DeviceID, &op.Version, &op.Value); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		drop = append(drop, op)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	for _, op := range drop {
+		if err := retainCRDTOpIdentity(tx, documentID, CRDTTypeRegister, op); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM crdt_register_ops WHERE document_id = ? AND id = ?`,
+			documentID, op.ID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // compactORSetOps drops every tombstoned add tag together with every

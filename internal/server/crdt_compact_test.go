@@ -334,3 +334,48 @@ func TestCRDTSnapshotPersistsAcrossRestart(t *testing.T) {
 		t.Fatalf("regression after restart = %d, want 409", w.Code)
 	}
 }
+
+func TestCRDTCompactTrimmedIDReplayAndConflict(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+
+	post := func(device, id string, value int) *httptest.ResponseRecorder {
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtCounterBody(device,
+			map[string]any{"id": id, "value": value}))
+		return w
+	}
+	post("dev-1", "a1", 5)
+	post("dev-1", "a2", 8)
+	if w, _ := postJSON(t, h, "/v1/documents/doc/crdt/compact", map[string]any{"deviceId": "dev-1"}); w.Code != http.StatusOK {
+		t.Fatalf("compact = %d %s", w.Code, w.Body.String())
+	}
+
+	// The trimmed a1 still replays idempotently: 200 created=false and no new
+	// merge effect.
+	w := post("dev-1", "a1", 5)
+	if w.Code != http.StatusOK {
+		t.Fatalf("trimmed replay = %d %s", w.Code, w.Body.String())
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != `{"results":[{"id":"a1","created":false}]}` {
+		t.Fatalf("trimmed replay body = %q", got)
+	}
+
+	// Same id, changed comparison content: 409 JSON, state unchanged.
+	w = post("dev-1", "a1", 9)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("trimmed id changed content = %d, want 409", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("conflict content type = %q", ct)
+	}
+	// Same id, changed origin device: 409 as well, even though the op row is gone.
+	w = post("dev-2", "a1", 5)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("trimmed id changed device = %d, want 409", w.Code)
+	}
+	// The failed replays moved nothing: the merge still merges from one op.
+	if got := getRaw(t, h, "/v1/documents/doc/crdt/snapshot").Body.String(); got != compactBody("counter", "8", "1", "0") {
+		t.Fatalf("snapshot after replays = %q", got)
+	}
+}
