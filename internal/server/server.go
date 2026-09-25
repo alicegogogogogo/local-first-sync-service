@@ -194,6 +194,20 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
 		handleSetPermission(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, r *http.Request) {
+		handleSubmitCRDT(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
+		handleGetCRDTState(s, w, r)
+	})
+	// Any other verb on the exact CRDT paths is a JSON 400 rather than
+	// ServeMux's plain-text 405, matching the poll/replay endpoint guards.
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 
 	// ServeMux treats any empty path segment (the doubled slash in
 	// /v1/documents//..., /v1/devices//sessions or
@@ -225,7 +239,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedCRDTPath(p) || malformedSubscribePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -267,29 +281,63 @@ func malformedNewDocumentPath(p string) bool {
 	return false
 }
 
+// malformedCRDTPath reports whether p targets the CRDT namespace but is not
+// one of its two exact endpoints
+// (/v1/documents/{documentID}/crdt/ops and .../crdt/state): a missing/empty
+// documentID or terminal segment, a trailing slash, an extra segment, or a
+// "crdt" segment in a position short of the registered shape. ServeMux would
+// answer those with a 301 redirect or a plain-text 404/405, while every
+// failure of the new endpoints must be a JSON 400 and never a redirect. The
+// terminal resource is matched exactly as "ops" or "state", so a document
+// named "crdt" keeps its other routes and unrelated paths pass through.
+func malformedCRDTPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/documents/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		if seg == "crdt" && i > 0 {
+			if len(segs) != 3 || segs[0] == "" {
+				return true
+			}
+			return segs[2] != "ops" && segs[2] != "state"
+		}
+	}
+	return false
+}
+
 // malformedSubscribePath reports whether p targets the WebSocket subscription
 // endpoint but is not at its exact location
 // (/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe): a
 // missing "documents"/"changes" segment, an extra segment, or a "subscribe"
-// segment short of the registered shape. ServeMux would answer those with a
+// terminal short of the registered shape. ServeMux would answer those with a
 // plain-text 404/405; every failure of this endpoint must be a JSON 400
 // instead. Empty segments are already rejected by the guard itself.
+//
+// The endpoint marker is a "subscribe" segment at the fixed position 4
+// (0-based) of the sessions shape, or a trailing "subscribe" on a shorter
+// path (a missing "documents" segment). A "subscribe" segment in any other
+// position is a session or document id and is left alone, so identifiers
+// literally named "subscribe" are handled exactly like other names for both
+// change reads and subscriptions.
 func malformedSubscribePath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
 	if !ok {
 		return false
 	}
 	segs := strings.Split(rest, "/")
-	for _, seg := range segs {
-		if seg == "subscribe" {
-			return !(len(segs) == 5 &&
-				segs[0] != "" &&
-				segs[1] == "documents" &&
-				segs[2] != "" &&
-				segs[3] == "changes")
-		}
+
+	targets := (len(segs) > 4 && segs[4] == "subscribe") ||
+		(len(segs) < 5 && len(segs) > 0 && segs[len(segs)-1] == "subscribe")
+	if !targets {
+		return false
 	}
-	return false
+	return !(len(segs) == 5 &&
+		segs[0] != "" &&
+		segs[1] == "documents" &&
+		segs[2] != "" &&
+		segs[3] == "changes")
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use

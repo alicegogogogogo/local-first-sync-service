@@ -50,6 +50,23 @@
 // closing store leaves no rows behind — while the changes themselves stay
 // durable, so waiting and idempotency decisions are unchanged by restart.
 //
+// CRDT state is an auto-merging layer that lives entirely apart from the
+// change log: its operations never take a document cursor and its reads never
+// appear in changes/poll/subscribe traffic. A document's CRDT type is fixed on
+// its very first accepted operation as either "counter" or "gset" and can
+// never change; two concurrent type declarations serialize in one immediate
+// transaction so exactly one wins and the loser observes the established type
+// (ErrCRDTTypeConflict). Counter ops carry the device's cumulative
+// contribution; the merged value is the sum over devices of each device's
+// maximum, and a device's own value must move only upward (ErrCRDTRejected).
+// G-set ops add one element each and merge as a set union; elements present in
+// ascending order. Every op carries a stable id: an identical re-post (same
+// type, device and value) is idempotent, while an existing id with a different
+// device or value is a conflict (ErrCRDTOpConflict). Submits additionally go
+// through the same registration/permission gate as replay: an unregistered
+// device is ErrDeviceNotFound (404), a revoked one ErrPermissionDenied (403),
+// neither ever exposing state.
+//
 // Replay is the offline retry of an ordinary batch: it shares the same
 // per-document contiguous cursor space and the same serialized transaction as
 // PostChanges, and additionally enforces the registration/permission layer
@@ -298,6 +315,19 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	size   INTEGER NOT NULL,
 	data   BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS crdt_documents (
+	document_id TEXT NOT NULL PRIMARY KEY,
+	type        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS crdt_ops (
+	document_id TEXT NOT NULL,
+	id          TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	value       TEXT NOT NULL,
+	PRIMARY KEY (document_id, id)
+);
+CREATE INDEX IF NOT EXISTS crdt_ops_doc_device_idx
+	ON crdt_ops(document_id, device_id);
 `)
 	return err
 }
