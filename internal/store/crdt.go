@@ -30,6 +30,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -141,7 +142,18 @@ CREATE TABLE IF NOT EXISTS crdt_set_elements (
 // content, otherwise it is an *ErrCRDTConflict; a counter contribution below
 // the device's current maximum is likewise an *ErrCRDTConflict. Any failure
 // rejects the whole batch. Results come back in request order.
+//
+// The whole call runs under crdtMu, which also covers the post-commit
+// fan-out: when the batch changed the merged value (including the batch that
+// first gives the document a state), the new merged state is queued to every
+// live CRDT subscription of the document, in commit order. Batches that leave
+// the merged value untouched — idempotent repeats, equal counter
+// contributions, re-added set elements — enqueue nothing, and rejected
+// batches (which commit nothing) never reach the fan-out.
 func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]CRDTResult, error) {
+	s.crdtMu.Lock()
+	defer s.crdtMu.Unlock()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -179,6 +191,7 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 
 	// Resolve the document type: fixed on the first accepted batch.
 	var docType string
+	hadState := false
 	err = tx.QueryRow(
 		`SELECT type FROM crdt_documents WHERE document_id = ?`, documentID,
 	).Scan(&docType)
@@ -200,6 +213,17 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 				Reason: fmt.Sprintf("document type is already %q", docType),
 			}
 		}
+		hadState = true
+	}
+
+	// Snapshot the merged value before the batch so the post-commit fan-out
+	// fires only when the batch actually changed it.
+	var before json.RawMessage
+	if hadState {
+		before, err = mergedCRDTValue(tx, documentID, docType)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	results := make([]CRDTResult, len(ops))
@@ -215,8 +239,18 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 		}
 	}
 
+	after, err := mergedCRDTValue(tx, documentID, docType)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	// The first accepted batch gives the document its state; any later batch
+	// notifies only when the merged value actually moved.
+	if !hadState || !bytes.Equal(before, after) {
+		s.enqueueCRDTStateLocked(documentID, CRDTState{Type: docType, Value: after})
 	}
 	return results, nil
 }
@@ -396,48 +430,61 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 		return CRDTState{}, err
 	}
 
+	value, err := mergedCRDTValue(s.db, documentID, docType)
+	if err != nil {
+		return CRDTState{}, err
+	}
+	return CRDTState{Type: docType, Value: value}, nil
+}
+
+// sqlQuerier is the query surface shared by *sql.DB and *sql.Tx, so the
+// merged value can be computed both for plain reads and inside the committing
+// transaction (for the change-detection snapshot).
+type sqlQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// mergedCRDTValue computes the document's merged value: for a counter the
+// JSON integer sum of per-device maxima; for a gset the sorted JSON array of
+// every accepted element (an empty set is []). The encoding is canonical, so
+// two values compare equal with bytes.Equal exactly when the merged states
+// are equal.
+func mergedCRDTValue(q sqlQuerier, documentID, docType string) (json.RawMessage, error) {
 	switch docType {
 	case CRDTTypeCounter:
 		var total int64
-		if err := s.db.QueryRow(
+		if err := q.QueryRow(
 			`SELECT COALESCE(SUM(value), 0) FROM crdt_counter_values WHERE document_id = ?`,
 			documentID,
 		).Scan(&total); err != nil {
-			return CRDTState{}, err
+			return nil, err
 		}
-		raw, err := json.Marshal(total)
-		if err != nil {
-			return CRDTState{}, err
-		}
-		return CRDTState{Type: docType, Value: raw}, nil
+		return json.Marshal(total)
 	case CRDTTypeGSet:
-		rows, err := s.db.Query(
+		rows, err := q.Query(
 			`SELECT element FROM crdt_set_elements WHERE document_id = ? ORDER BY element ASC`,
 			documentID,
 		)
 		if err != nil {
-			return CRDTState{}, err
+			return nil, err
 		}
 		elements := make([]string, 0)
 		for rows.Next() {
 			var element string
 			if err := rows.Scan(&element); err != nil {
 				_ = rows.Close()
-				return CRDTState{}, err
+				return nil, err
 			}
 			elements = append(elements, element)
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			return CRDTState{}, err
+			return nil, err
 		}
 		_ = rows.Close()
-		raw, err := json.Marshal(elements)
-		if err != nil {
-			return CRDTState{}, err
-		}
-		return CRDTState{Type: docType, Value: raw}, nil
+		return json.Marshal(elements)
 	default:
-		return CRDTState{}, fmt.Errorf("unknown crdt type %q stored for document", docType)
+		return nil, fmt.Errorf("unknown crdt type %q stored for document", docType)
 	}
 }

@@ -148,6 +148,13 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTStateSubscribe(s, w, r)
+	})
+	// Same rule for the CRDT state subscription: only GET is allowed.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Any other path under the new namespaces is a JSON 404 rather than
 	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
 	// Exact method-patterns above take precedence over these subtree patterns.
@@ -282,19 +289,22 @@ func malformedNewDocumentPath(p string) bool {
 	return false
 }
 
-// malformedSubscribePath reports whether p targets the WebSocket subscription
-// endpoint but is not at its exact location
-// (/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe): a
-// missing "documents"/"changes" segment, an extra segment, or a "subscribe"
-// segment short of the registered shape. ServeMux would answer those with a
-// plain-text 404/405; every failure of this endpoint must be a JSON 400
-// instead. Empty segments are already rejected by the guard itself.
+// malformedSubscribePath reports whether p targets one of the WebSocket
+// subscription endpoints but is not at its exact location:
 //
-// "subscribe" is treated as the endpoint keyword only in the endpoint's
-// terminal segment position (the fifth segment, index 4); a session or
-// document identifier literally named "subscribe" occupies an identifier
-// position (index 0 or 2) and is therefore left to the ordinary
-// changes/subscribe routes like any other id.
+//	/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe
+//	/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
+//
+// A missing "documents"/"changes"/"crdt"/"state" segment, an extra segment,
+// or a "subscribe" segment short of a registered shape is a malformed 400
+// rather than ServeMux's plain-text 404/405: every failure of these
+// endpoints must be a JSON error. Empty segments are already rejected by the
+// guard itself.
+//
+// "subscribe" is treated as an endpoint keyword only past the identifier
+// positions (the first and third segments); a session or document identifier
+// literally named "subscribe" occupies an identifier position and is
+// therefore left to the ordinary routes like any other id.
 func malformedSubscribePath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
 	if !ok {
@@ -310,14 +320,25 @@ func malformedSubscribePath(p string) bool {
 		if i == 0 || i == 2 {
 			continue
 		}
-		// Endpoint keyword position: the fifth segment must be exactly
-		// "subscribe" with the documents/changes scaffolding around it, and no
-		// segment may follow. Any other occurrence is a malformed path.
+		// Change-log endpoint: the fifth segment must be exactly "subscribe"
+		// with the documents/changes scaffolding around it, and no segment
+		// may follow.
 		if i == 4 && len(segs) == 5 &&
 			segs[0] != "" &&
 			segs[1] == "documents" &&
 			segs[2] != "" &&
 			segs[3] == "changes" {
+			return false
+		}
+		// CRDT state endpoint: the sixth segment must be exactly "subscribe"
+		// with the documents/crdt/state scaffolding around it, and no
+		// segment may follow.
+		if i == 5 && len(segs) == 6 &&
+			segs[0] != "" &&
+			segs[1] == "documents" &&
+			segs[2] != "" &&
+			segs[3] == "crdt" &&
+			segs[4] == "state" {
 			return false
 		}
 		return true

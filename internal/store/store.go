@@ -201,6 +201,18 @@ type Store struct {
 	nextSubID  uint64
 	subWG      sync.WaitGroup
 	closed     bool
+
+	// crdtMu serializes CRDT batches with CRDT subscription registration:
+	// SubmitCRDTOps holds it across the transaction and the post-commit state
+	// fan-out, and SubscribeCRDT holds it across registration and the initial
+	// merged-state read, so a subscriber's initial state and its queued
+	// updates can neither overlap nor gap, and queued states always arrive in
+	// transaction commit order. It also guards crdtSubs, nextCRDTSubID and
+	// crdtClosed. Nothing ever takes pollMu while holding crdtMu.
+	crdtMu        sync.Mutex
+	crdtSubs      map[subKey]map[uint64]*CRDTSubscription
+	nextCRDTSubID uint64
+	crdtClosed    bool
 }
 
 // Open opens (creating if needed) the SQLite database at path. The empty path
@@ -226,6 +238,7 @@ func Open(path string) (*Store, error) {
 		db:        db,
 		pollWaits: make(map[string]map[uint64]chan struct{}),
 		subs:      make(map[subKey]map[uint64]*subscription),
+		crdtSubs:  make(map[subKey]map[uint64]*CRDTSubscription),
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
@@ -305,7 +318,9 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 // InterruptWaits wakes every parked long poll without closing the database,
 // so an orderly server shutdown drains waiting connections immediately
 // (they answer 503) instead of holding Shutdown hostage until their wait
-// deadline. Committed state is untouched.
+// deadline. Committed state is untouched. Live WebSocket subscriptions —
+// change-log and CRDT state alike — get one final wakeup so the server can
+// end them with a going-away close.
 func (s *Store) InterruptWaits() {
 	s.pollMu.Lock()
 	s.closed = true
@@ -321,6 +336,17 @@ func (s *Store) InterruptWaits() {
 		}
 	}
 	s.pollMu.Unlock()
+
+	// Same final wakeup for CRDT state subscriptions, under their own lock.
+	s.crdtMu.Lock()
+	s.crdtClosed = true
+	for _, set := range s.crdtSubs {
+		for _, sub := range set {
+			subChans = append(subChans, sub.wakes)
+		}
+	}
+	s.crdtMu.Unlock()
+
 	for _, set := range waits {
 		for _, ch := range set {
 			close(ch)
@@ -1175,6 +1201,7 @@ func (s *Store) SetDocumentPermission(documentID, deviceID string, authorized bo
 	// it, stickily); only a revoke needs to end live subscriptions.
 	if !authorized {
 		s.signalRevokedSubscribers(documentID, deviceID)
+		s.signalRevokedCRDTSubscribers(documentID, deviceID)
 	}
 	return true, nil
 }
