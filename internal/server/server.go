@@ -146,12 +146,20 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTStateSubscribe(s, w, r)
 	})
-	// Non-GET verbs on the subscribe paths get a JSON 400 rather than
-	// ServeMux's plain-text 405: the endpoints' only method is GET.
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionCRDTState(s, w, r)
+	})
+	// Non-GET verbs on the subscribe path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the endpoint's only method is GET.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Other verbs on the session CRDT state read get the same JSON 400: the
+	// endpoint only accepts GET.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Any other path under the new namespaces is a JSON 404 rather than
@@ -337,14 +345,18 @@ func malformedSubscribePath(p string) bool {
 	return false
 }
 
-// malformedCRDTSubscribePath reports whether p targets the CRDT state
-// subscription endpoint but is not at its exact location
-// (/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe): a
-// missing "state"/"subscribe" segment, an extra segment, or a "crdt" segment
-// in the keyword position (immediately past the document identifier) short of
-// the registered shape. ServeMux would answer those with a plain-text 404;
-// every failure of this endpoint must be a JSON 400 instead. Empty segments
-// are already rejected by the guard itself.
+// malformedCRDTSubscribePath reports whether p targets the session CRDT
+// namespace but is at neither of its two exact locations:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
+//
+// The first is the session-scoped state read; the second is the state
+// subscription. A missing "state"/"subscribe" segment, an extra segment, or a
+// "crdt" segment in the keyword position (immediately past the document
+// identifier) short of either registered shape is a malformed 400: ServeMux
+// would answer those with a plain-text 404, and every failure here must be a
+// JSON 400. Empty segments are already rejected by the guard itself.
 //
 // "crdt" is treated as the endpoint keyword only in the fourth segment (index
 // 3, right after the document identifier); a session or document identifier
@@ -359,13 +371,19 @@ func malformedCRDTSubscribePath(p string) bool {
 	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "crdt" {
 		return false
 	}
-	// Keyword position reached: the only valid shape is exactly
-	// {sessionId}/documents/{documentId}/crdt/state/subscribe.
-	return !(len(segs) == 6 &&
+	// Keyword position reached. Valid shapes are exactly the state read
+	// ({sessionId}/documents/{documentId}/crdt/state) and, one segment further,
+	// the state subscription; nothing else is a valid session CRDT path.
+	validStateRead := len(segs) == 5 &&
+		segs[0] != "" &&
+		segs[2] != "" &&
+		segs[4] == "state"
+	validStateSubscribe := len(segs) == 6 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state" &&
-		segs[5] == "subscribe")
+		segs[5] == "subscribe"
+	return !(validStateRead || validStateSubscribe)
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use

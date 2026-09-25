@@ -132,6 +132,74 @@ func handleCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeCRDTState(w, state)
+}
+
+// handleSessionCRDTState is the session-scoped read of a document's merged
+// CRDT state:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
+//
+// It introduces no new credential: the existing session identifies its owning
+// device, exactly as the session changes read and the CRDT state subscription
+// do. The request shape (method and path) is enforced before the handler runs;
+// inside, the checks happen in one fixed order: the session must currently
+// exist (404), its device must currently hold permission for the document
+// (403), and only then is the CRDT state read. A document with no committed
+// CRDT operation is then the same 404 the document-level read returns, so the
+// three outcomes — deleted session, revoked permission, unknown CRDT state —
+// stay distinct and are never merged into one error.
+//
+// On success the body is byte-for-byte the document-level state read body
+// (compact single-line JSON, keys in type then value order, trailing newline)
+// and therefore also byte-for-byte a pushed state frame. The endpoint is
+// read-only: it never opens a transaction that writes, moves a cursor, records
+// a read or changes any idempotency/type-fixation decision, so its answers are
+// unchanged by restarts.
+func handleSessionCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return
+	}
+
+	state, err := s.GetCRDTState(documentID)
+	if err != nil {
+		if errors.Is(err, store.ErrCRDTNotFound) {
+			writeError(w, http.StatusNotFound, "crdt state not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load crdt state")
+		return
+	}
+
+	writeCRDTState(w, state)
+}
+
+// writeCRDTState renders a merged CRDT state exactly as every state-reading
+// surface must: compact single-line JSON with the keys in type then value
+// order (Go sorts map keys; "type" precedes "value"), terminated by one
+// newline. The document-level read, the session-level read and the pushed
+// subscription frames all go through this shape (or its encoder twin in
+// encodeCRDTStateFrame), so their bytes cannot drift apart.
+func writeCRDTState(w http.ResponseWriter, state store.CRDTState) {
 	// Marshal through a concrete shape so the value stays a native JSON number
 	// or array rather than an escaped blob.
 	writeJSON(w, http.StatusOK, map[string]any{
