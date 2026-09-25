@@ -188,19 +188,33 @@ var ErrSessionNotFound = errors.New("session not found")
 type Store struct {
 	db *sql.DB
 
-	// pollMu guards pollWaits, subs, nextWaitID, nextSubID and closed. Parked
-	// long polls wait on a per-document set of channels; a committed change to
-	// a document closes (signals) every channel parked on it. WebSocket
-	// subscriptions live in a second registry keyed by (document, device): a
-	// commit signals every subscription under the document, while a permission
-	// write signals only the matching device's subscriptions.
-	pollMu     sync.Mutex
-	pollWaits  map[string]map[uint64]chan struct{}
-	subs       map[subKey]map[uint64]*subscription
-	nextWaitID uint64
-	nextSubID  uint64
-	subWG      sync.WaitGroup
-	closed     bool
+	// pollMu guards pollWaits, subs, crdtSubs, nextWaitID, nextSubID,
+	// nextCRDTSubID and closed. Parked long polls wait on a per-document set
+	// of channels; a committed change to a document closes (signals) every
+	// channel parked on it. WebSocket subscriptions live in a second registry
+	// keyed by (document, device): a commit signals every subscription under
+	// the document, while a permission write signals only the matching
+	// device's subscriptions. CRDT state subscriptions live in a third
+	// registry with the same keying: a state-changing CRDT commit queues the
+	// new merged state on every subscription under the document.
+	pollMu        sync.Mutex
+	pollWaits     map[string]map[uint64]chan struct{}
+	subs          map[subKey]map[uint64]*subscription
+	crdtSubs      map[crdtSubKey]map[uint64]*CRDTSubscription
+	nextWaitID    uint64
+	nextSubID     uint64
+	nextCRDTSubID uint64
+	subWG         sync.WaitGroup
+	closed        bool
+
+	// crdtMu serializes CRDT submissions against each other and against a
+	// subscription's atomic register-plus-initial-read. Holding it across a
+	// state-changing commit and its notification makes notifications leave in
+	// transaction-commit order, and makes a commit's state land either in a
+	// subscriber's initial read or in its queue, never both and never
+	// neither. The single database connection already serializes the
+	// transactions themselves, so this costs no concurrency.
+	crdtMu sync.Mutex
 }
 
 // Open opens (creating if needed) the SQLite database at path. The empty path
@@ -226,6 +240,7 @@ func Open(path string) (*Store, error) {
 		db:        db,
 		pollWaits: make(map[string]map[uint64]chan struct{}),
 		subs:      make(map[subKey]map[uint64]*subscription),
+		crdtSubs:  make(map[crdtSubKey]map[uint64]*CRDTSubscription),
 	}
 	if err := s.init(); err != nil {
 		_ = db.Close()
@@ -334,13 +349,15 @@ func (s *Store) InterruptWaits() {
 		default:
 		}
 	}
+	// CRDT state subscriptions get the same final wakeup.
+	s.wakeCRDTSubscribers()
 }
 
 // Close releases the database handle. Parked long polls are woken first so
 // they stop waiting and return without writing; the wake happens before the
 // handle closes, so a waiter never observes a closed database. WebSocket
-// subscriptions are likewise woken and drained (every handler unregisters)
-// before the handle closes.
+// subscriptions (change-log and CRDT state alike) are likewise woken and
+// drained (every handler unregisters) before the handle closes.
 func (s *Store) Close() error {
 	s.InterruptWaits()
 	s.subWG.Wait()
@@ -1175,6 +1192,7 @@ func (s *Store) SetDocumentPermission(documentID, deviceID string, authorized bo
 	// it, stickily); only a revoke needs to end live subscriptions.
 	if !authorized {
 		s.signalRevokedSubscribers(documentID, deviceID)
+		s.signalRevokedCRDTSubscribers(documentID, deviceID)
 	}
 	return true, nil
 }

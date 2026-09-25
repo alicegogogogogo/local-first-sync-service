@@ -141,7 +141,18 @@ CREATE TABLE IF NOT EXISTS crdt_set_elements (
 // content, otherwise it is an *ErrCRDTConflict; a counter contribution below
 // the device's current maximum is likewise an *ErrCRDTConflict. Any failure
 // rejects the whole batch. Results come back in request order.
+//
+// When the committed batch actually moved the merged state (a counter maximum
+// advanced or the set union grew) the document's CRDT state subscribers are
+// notified with the new merged state after the commit; idempotent repeats,
+// rejected batches and no-op additions change nothing and notify nobody.
 func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]CRDTResult, error) {
+	// Serialize submissions with each other and with a subscriber's atomic
+	// register+initial-read: notifications then leave in commit order, and a
+	// committed state lands either in the initial read or in the queue.
+	s.crdtMu.Lock()
+	defer s.crdtMu.Unlock()
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -204,19 +215,34 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 
 	results := make([]CRDTResult, len(ops))
 
+	var stateChanged bool
 	switch docType {
 	case CRDTTypeCounter:
-		if err := applyCounterOps(tx, documentID, ops, results); err != nil {
+		changed, err := applyCounterOps(tx, documentID, ops, results)
+		if err != nil {
 			return nil, err
 		}
+		stateChanged = changed
 	case CRDTTypeGSet:
-		if err := applyGSetOps(tx, documentID, ops, results); err != nil {
+		changed, err := applyGSetOps(tx, documentID, ops, results)
+		if err != nil {
 			return nil, err
 		}
+		stateChanged = changed
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if stateChanged {
+		// The committed batch moved the merged state; re-derive it (the merge
+		// is never cached) and publish it after commit, so a subscriber only
+		// ever observes a durable state and commits arrive in commit order.
+		state, err := s.GetCRDTState(documentID)
+		if err != nil {
+			return results, nil
+		}
+		s.notifyCRDTSubscribers(documentID, state)
 	}
 	return results, nil
 }
@@ -225,12 +251,14 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 // repeated id is idempotent only with the same device and contribution. A new
 // id with a contribution below the device's stored maximum regresses the
 // counter and is rejected; an equal contribution is an accepted no-op; a
-// larger one advances the device's maximum.
-func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) error {
+// larger one advances the device's maximum. It reports whether the merged
+// state actually changed — only an advancing contribution moves the sum.
+func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
+	changed := false
 	for i, op := range ops {
 		value, err := decodeCounterValue(op.Value)
 		if err != nil {
-			return &ErrCRDTConflict{ID: op.ID, Reason: err.Error()}
+			return false, &ErrCRDTConflict{ID: op.ID, Reason: err.Error()}
 		}
 
 		var existingDevice string
@@ -247,10 +275,10 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 				`SELECT value FROM crdt_counter_values WHERE document_id = ? AND device_id = ?`,
 				documentID, op.DeviceID,
 			).Scan(&current); scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-				return scanErr
+				return false, scanErr
 			}
 			if current.Valid && value < current.Int64 {
-				return &ErrCRDTConflict{
+				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "counter contribution must not decrease",
 				}
@@ -259,7 +287,7 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 				`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
 				documentID, op.ID, op.DeviceID, []byte(op.Value),
 			); err != nil {
-				return err
+				return false, err
 			}
 			if !current.Valid || value > current.Int64 {
 				if _, err := tx.Exec(
@@ -267,15 +295,16 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 					 ON CONFLICT (document_id, device_id) DO UPDATE SET value = excluded.value`,
 					documentID, op.DeviceID, value,
 				); err != nil {
-					return err
+					return false, err
 				}
+				changed = true
 			}
 			results[i] = CRDTResult{ID: op.ID, Created: true}
 		case err != nil:
-			return err
+			return false, err
 		default:
 			if existingDevice != op.DeviceID || !jsonEqual(existingValue, op.Value) {
-				return &ErrCRDTConflict{
+				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device or value",
 				}
@@ -283,14 +312,17 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 			results[i] = CRDTResult{ID: op.ID, Created: false}
 		}
 	}
-	return nil
+	return changed, nil
 }
 
 // applyGSetOps resolves and applies every grow-only-set operation inside tx.
 // A repeated id is idempotent only with the same device and the same set of
 // elements (element order is irrelevant to the merge). New elements are
-// inserted into the union table; re-adding an element changes nothing.
-func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) error {
+// inserted into the union table; re-adding an element changes nothing. It
+// reports whether the merged state actually changed — only an element that
+// was not already in the union moves it.
+func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
+	changed := false
 	for i, op := range ops {
 		var existingDevice string
 		var existingElements []byte
@@ -302,10 +334,10 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 		case errors.Is(err, sql.ErrNoRows):
 			// New id; insert the op and its elements below.
 		case err != nil:
-			return err
+			return false, err
 		default:
 			if existingDevice != op.DeviceID || !stringSetEqual(existingElements, op.Elements) {
-				return &ErrCRDTConflict{
+				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device or elements",
 				}
@@ -318,21 +350,25 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 			`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
 			documentID, op.ID, op.DeviceID, []byte(encodeSetElements(op.Elements)),
 		); err != nil {
-			return err
+			return false, err
 		}
 		for _, element := range op.Elements {
 			// The union table is an identity insert: a repeated element simply
-			// exists once.
-			if _, err := tx.Exec(
+			// exists once, and only a genuinely new element moves the merge.
+			res, err := tx.Exec(
 				`INSERT OR IGNORE INTO crdt_set_elements (document_id, element) VALUES (?, ?)`,
 				documentID, element,
-			); err != nil {
-				return err
+			)
+			if err != nil {
+				return false, err
+			}
+			if n, err := res.RowsAffected(); err == nil && n > 0 {
+				changed = true
 			}
 		}
 		results[i] = CRDTResult{ID: op.ID, Created: true}
 	}
-	return nil
+	return changed, nil
 }
 
 // decodeCounterValue requires raw to be a non-negative JSON integer with no

@@ -143,9 +143,15 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleSubscribe(s, w, r)
 	})
-	// Non-GET verbs on the subscribe path get a JSON 400 rather than
-	// ServeMux's plain-text 405: the endpoint's only method is GET.
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTStateSubscribe(s, w, r)
+	})
+	// Non-GET verbs on the subscribe paths get a JSON 400 rather than
+	// ServeMux's plain-text 405: the endpoints' only method is GET.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Any other path under the new namespaces is a JSON 404 rather than
@@ -240,7 +246,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedCRDTPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedCRDTSubscribePath(p) || malformedCRDTPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -301,6 +307,12 @@ func malformedSubscribePath(p string) bool {
 		return false
 	}
 	segs := strings.Split(rest, "/")
+	// The CRDT state subscription namespace ("crdt" immediately past the
+	// document identifier) has its own guard; "subscribe" there is not the
+	// changes-subscribe keyword.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "subscribe" {
 			continue
@@ -323,6 +335,37 @@ func malformedSubscribePath(p string) bool {
 		return true
 	}
 	return false
+}
+
+// malformedCRDTSubscribePath reports whether p targets the CRDT state
+// subscription endpoint but is not at its exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe): a
+// missing "state"/"subscribe" segment, an extra segment, or a "crdt" segment
+// in the keyword position (immediately past the document identifier) short of
+// the registered shape. ServeMux would answer those with a plain-text 404;
+// every failure of this endpoint must be a JSON 400 instead. Empty segments
+// are already rejected by the guard itself.
+//
+// "crdt" is treated as the endpoint keyword only in the fourth segment (index
+// 3, right after the document identifier); a session or document identifier
+// literally named "crdt" occupies an identifier position (index 0 or 2) and
+// keeps its ordinary routes.
+func malformedCRDTSubscribePath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "crdt" {
+		return false
+	}
+	// Keyword position reached: the only valid shape is exactly
+	// {sessionId}/documents/{documentId}/crdt/state/subscribe.
+	return !(len(segs) == 6 &&
+		segs[0] != "" &&
+		segs[2] != "" &&
+		segs[4] == "state" &&
+		segs[5] == "subscribe")
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use
