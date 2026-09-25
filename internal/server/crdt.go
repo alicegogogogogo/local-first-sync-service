@@ -168,6 +168,110 @@ func handleCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeCRDTState(w, state)
 }
 
+// crdtCompactRequest is the body of POST .../crdt/compact: the device the
+// registration/permission layer is enforced against, exactly as a submission.
+type crdtCompactRequest struct {
+	DeviceID string `json:"deviceId"`
+}
+
+// handleCRDTCompact trims the document's CRDT state layer: operation records
+// and tombstones that no longer participate in the merge are deleted, so a
+// long-running document stops accumulating them. The merged state is
+// byte-for-byte unchanged and no cursor, change record or notification is
+// produced — subscribers observe nothing, because the merged value never
+// moves.
+//
+// The strict body contract matches the other JSON POST endpoints:
+// application/json, one JSON value, no trailing content, a non-empty
+// deviceId. Any violation is a 400 with zero writes. The device gate matches
+// the submission path: an unregistered device is a 404 and a revoked one a
+// 403, both before any CRDT content is observed; a document with no committed
+// CRDT operation is a 404. On success the body is exactly what a snapshot
+// read immediately afterwards returns, and repeating the compaction is an
+// idempotent 200.
+func handleCRDTCompact(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	var req crdtCompactRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+
+	snapshot, err := s.CompactCRDT(documentID, req.DeviceID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.Is(err, store.ErrCRDTNotFound):
+			writeError(w, http.StatusNotFound, "crdt state not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to compact crdt state")
+		}
+		return
+	}
+
+	writeCRDTSnapshot(w, snapshot)
+}
+
+// handleCRDTSnapshot returns the document's current type, merged result and
+// the state layer's storage footprint (retained operation and tombstone
+// counts). It carries no device gate and no new authentication, exactly like
+// the document-level state read. A document with no committed operations has
+// no state yet and answers 404.
+func handleCRDTSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	snapshot, err := s.GetCRDTSnapshot(documentID)
+	if err != nil {
+		if errors.Is(err, store.ErrCRDTNotFound) {
+			writeError(w, http.StatusNotFound, "crdt state not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load crdt snapshot")
+		return
+	}
+
+	writeCRDTSnapshot(w, snapshot)
+}
+
+// writeCRDTSnapshot renders a CRDT snapshot exactly as the compaction
+// response and the snapshot read must both emit it: compact single-line JSON
+// with the keys in type, value, operations, tombstones order, terminated by a
+// newline, so the two surfaces can be compared byte-for-byte.
+func writeCRDTSnapshot(w http.ResponseWriter, snapshot store.CRDTSnapshot) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(marshalCRDTSnapshot(snapshot))
+}
+
+// marshalCRDTSnapshot encodes a CRDT snapshot the single way every surface
+// emits it: compact single-line JSON with the keys in type, value,
+// operations, tombstones order and one trailing newline. The value is
+// embedded as native JSON rather than an escaped blob; the counts are
+// non-negative integers.
+func marshalCRDTSnapshot(snapshot store.CRDTSnapshot) []byte {
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	_ = enc.Encode(struct {
+		Type       string          `json:"type"`
+		Value      json.RawMessage `json:"value"`
+		Operations int64           `json:"operations"`
+		Tombstones int64           `json:"tombstones"`
+	}{
+		Type:       snapshot.Type,
+		Value:      snapshot.Value,
+		Operations: snapshot.Operations,
+		Tombstones: snapshot.Tombstones,
+	})
+	return []byte(buf.String())
+}
+
 // handleSessionCRDTState is the session-scoped view of the document-level
 // state read:
 //
@@ -253,10 +357,12 @@ func marshalCRDTState(state store.CRDTState) []byte {
 }
 
 // malformedCRDTPath reports whether p targets the CRDT namespace but is not at
-// one of the two exact endpoints:
+// one of the four exact endpoints:
 //
 //	POST/GET /v1/documents/{documentID}/crdt/ops
 //	GET      /v1/documents/{documentID}/crdt/state
+//	POST     /v1/documents/{documentID}/crdt/compact
+//	GET      /v1/documents/{documentID}/crdt/snapshot
 //
 // A missing/empty document id, a trailing slash, extra path segments, or a
 // "crdt" segment in any position short of that shape is a malformed 400 rather
@@ -275,7 +381,7 @@ func malformedCRDTPath(p string) bool {
 				return true
 			}
 			switch segs[2] {
-			case "ops", "state":
+			case "ops", "state", "compact", "snapshot":
 				return false
 			default:
 				return true

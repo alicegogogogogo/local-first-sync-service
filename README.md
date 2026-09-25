@@ -342,6 +342,33 @@ Sec-WebSocket-Version: 13
 - orset 返回 `200` `{"type":"orset","value":[...]}`，`value` 为当前仍有效的元素的升序数组（全部移除后为 `[]`，而非 `null`）。
 - `documentID` 为空、路径段缺失或多余（如尾斜杠、`/crdt/其他段`）一律返回 `400` JSON 错误，不重定向、不输出 HTML。
 
+### `POST /v1/documents/{documentID}/crdt/compact`
+
+压缩文档的 CRDT 状态层：把四种类型里不再影响合并结果的操作记录与墓碑裁掉，让长期运行的文档不再无限累积存储。仅接受 `Content-Type: application/json`。请求体沿用提交的设备判定：
+
+```json
+{"deviceId": "device-1"}
+```
+
+- 计数器：低于本设备当前最大贡献的操作不再参与合并（合并只读各设备最大值），裁掉；携带各设备最大值的操作保留，单调性判定不变。
+- 只增集合：元素全部被其他保留操作覆盖的操作不可能再改变并集，裁掉；并集本身不变。
+- register：只有各设备版本最高的操作仍参与判定（合并胜出值与版本严格递增检查），被压制的操作裁掉。
+- orset：已被墓碑覆盖的标签永远失效（其操作 id 已被占用，幂等重放不会复活它），裁掉该标签及其全部墓碑；存活标签与全部操作记录保留，观测移除语义不变。
+- 压缩前后的合并结果逐字一致（元素按升序、值原样呈现），保留记录驱动的幂等判定与冲突返回不变；合并值不发生变化，订阅方收不到任何推送，压缩本身不触发通知。
+- `deviceId` 缺失、为空或类型错误、类型头不符、JSON 非法、带尾随内容均返回 `400` JSON 错误且零写入。
+- 设备未注册返回 `404` JSON 错误；该设备对此文档的权限被撤回返回 `403` JSON 错误；两者都在读取任何 CRDT 内容之前判定，不改动状态。尚无 CRDT 操作的文档返回 `404` JSON 错误。
+- 成功返回 `200`，正文与紧接着的 `GET .../crdt/snapshot` 逐字一致；重复压缩幂等，不报错、计数不再变化。
+- 压缩在与提交相同的序列化事务内完成并同步落盘，重启后计数、状态与判定不变；压缩只影响 CRDT 状态层的存储规模，不占用变更游标、不产生变更记录，也不改变提交、状态读取与推送语义。
+
+### `GET /v1/documents/{documentID}/crdt/snapshot`
+
+读取文档当前的 CRDT 类型、合并结果与状态层存储规模。不带设备判定，也不新增认证。
+
+- 尚无 CRDT 操作的文档返回 `404` JSON 错误。
+- 成功返回 `200`，正文为一行紧凑 JSON，末尾一个换行，四个键的顺序固定为 `type`、`value`、`operations`、`tombstones`：`type` 与 `value` 和 `GET .../crdt/state` 逐字一致；`operations` 为压缩后仍参与合并的操作条数，`tombstones` 为保留的墓碑条数（非 orset 类型恒为 `0`），均为非负整数。例如 `{"type":"counter","value":12,"operations":2,"tombstones":0}`。
+- `documentID` 为空、路径段缺失或多余（如尾斜杠、额外段）、方法不匹配（非 GET）一律返回 `400` JSON 错误，不重定向、不输出 HTML。
+- 该入口只读：不占用游标、不产生变更记录、不影响提交的类型固定与幂等判定；重启后计数与状态不变。
+
 ### `GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state`
 
 会话视角的 CRDT 状态读取：客户端用**已存在的会话身份**（会话所属设备即为读取设备，无新增认证机制）读取文档当前类型与合并结果。请求沿用既有会话路径形态，只接受 `GET`。
@@ -396,4 +423,4 @@ Sec-WebSocket-Version: 13
 
 ### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`subscribe`、`state` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、CRDT 状态读取与订阅行为与其它标识完全一致。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/documents//crdt/compact`、`/v1/documents//crdt/snapshot`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`subscribe`、`state` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、CRDT 状态读取与订阅行为与其它标识完全一致。非空路径的语义保持不变。

@@ -46,6 +46,13 @@
 // device yields ErrPermissionDenied (403), before any CRDT content is observed.
 // It never touches the change log, document cursors, snapshots or the
 // subscription machinery.
+//
+// Compaction bounds the state layer's growth: operations and tombstones that
+// no longer participate in the merge are deleted in one serialized
+// transaction, leaving the merged state byte-for-byte identical and the
+// idempotency/conflict decisions driven by the retained records unchanged. A
+// snapshot read reports the merged state together with the retained operation
+// and tombstone counts; both surfaces are durable across restarts.
 
 package store
 
@@ -237,29 +244,8 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 
 	// Registration and permission are enforced before any CRDT content is
 	// observed, so a rejected submission cannot reveal type or state.
-	var deviceExists bool
-	if err := tx.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, deviceID,
-	).Scan(&deviceExists); err != nil {
+	if err := gateCRDTDevice(tx, documentID, deviceID); err != nil {
 		return nil, err
-	}
-	if !deviceExists {
-		return nil, ErrDeviceNotFound
-	}
-	var storedAuth int
-	err = tx.QueryRow(
-		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
-		documentID, deviceID,
-	).Scan(&storedAuth)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		// No deviation row: devices start authorized.
-	case err != nil:
-		return nil, err
-	default:
-		if storedAuth == 0 {
-			return nil, ErrPermissionDenied
-		}
 	}
 
 	// Resolve the document type: fixed on the first accepted batch.
@@ -765,21 +751,77 @@ func stringSetEqual(raw json.RawMessage, want []string) bool {
 // or the live tags minus tombstones (orset), not cached: it is exactly what
 // any equivalent batch order would converge to.
 func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
+	return getCRDTState(s.db, documentID)
+}
+
+// crdtQuerier is satisfied by both *sql.DB (a bare state read) and *sql.Tx
+// (a read inside a submission, compaction or snapshot transaction), so the
+// merge and the type lookup exist exactly once.
+type crdtQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// gateCRDTDevice enforces the registration/permission layer shared by every
+// CRDT write path: an unregistered device yields ErrDeviceNotFound and a
+// revoked one ErrPermissionDenied, before any CRDT content is observed.
+func gateCRDTDevice(tx *sql.Tx, documentID, deviceID string) error {
+	var deviceExists bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)`, deviceID,
+	).Scan(&deviceExists); err != nil {
+		return err
+	}
+	if !deviceExists {
+		return ErrDeviceNotFound
+	}
+	var storedAuth int
+	err := tx.QueryRow(
+		`SELECT authorized FROM document_permissions WHERE document_id = ? AND device_id = ?`,
+		documentID, deviceID,
+	).Scan(&storedAuth)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// No deviation row: devices start authorized.
+		return nil
+	case err != nil:
+		return err
+	default:
+		if storedAuth == 0 {
+			return ErrPermissionDenied
+		}
+		return nil
+	}
+}
+
+// crdtDocType returns the document's fixed CRDT type, or ErrCRDTNotFound when
+// no operation has ever been committed for it.
+func crdtDocType(q crdtQuerier, documentID string) (string, error) {
 	var docType string
-	err := s.db.QueryRow(
+	err := q.QueryRow(
 		`SELECT type FROM crdt_documents WHERE document_id = ?`, documentID,
 	).Scan(&docType)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return CRDTState{}, ErrCRDTNotFound
+		return "", ErrCRDTNotFound
 	case err != nil:
+		return "", err
+	default:
+		return docType, nil
+	}
+}
+
+// getCRDTState is the querier-based core of GetCRDTState.
+func getCRDTState(q crdtQuerier, documentID string) (CRDTState, error) {
+	docType, err := crdtDocType(q, documentID)
+	if err != nil {
 		return CRDTState{}, err
 	}
 
 	switch docType {
 	case CRDTTypeCounter:
 		var total int64
-		if err := s.db.QueryRow(
+		if err := q.QueryRow(
 			`SELECT COALESCE(SUM(value), 0) FROM crdt_counter_values WHERE document_id = ?`,
 			documentID,
 		).Scan(&total); err != nil {
@@ -791,7 +833,7 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 		}
 		return CRDTState{Type: docType, Value: raw}, nil
 	case CRDTTypeGSet:
-		rows, err := s.db.Query(
+		rows, err := q.Query(
 			`SELECT element FROM crdt_set_elements WHERE document_id = ? ORDER BY element ASC`,
 			documentID,
 		)
@@ -821,7 +863,7 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 		// A document's type row commits together with its first batch, so a
 		// register document always has at least one accepted operation.
 		var value []byte
-		if err := s.db.QueryRow(
+		if err := q.QueryRow(
 			`SELECT value FROM crdt_register_ops WHERE document_id = ?
 			 ORDER BY version DESC, id ASC LIMIT 1`,
 			documentID,
@@ -830,7 +872,7 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 		}
 		return CRDTState{Type: docType, Value: json.RawMessage(value)}, nil
 	case CRDTTypeORSet:
-		elements, err := queryORSetElements(s.db, documentID)
+		elements, err := queryORSetElements(q, documentID)
 		if err != nil {
 			return CRDTState{}, err
 		}
@@ -842,4 +884,298 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 	default:
 		return CRDTState{}, fmt.Errorf("unknown crdt type %q stored for document", docType)
 	}
+}
+
+// CRDTSnapshot is a document's merged CRDT state together with the storage
+// footprint of the state layer. Operations is the number of operation records
+// still participating in the merge (after any compaction); Tombstones is the
+// number of retained orset tombstones and is always zero for the other types.
+// Both are non-negative.
+type CRDTSnapshot struct {
+	Type       string
+	Value      json.RawMessage
+	Operations int64
+	Tombstones int64
+}
+
+// GetCRDTSnapshot returns the document's merged state plus its current
+// operation/tombstone counts, read in one transaction so the two never come
+// from different points in time. A document with no committed operations
+// yields ErrCRDTNotFound (the caller answers 404). The read is side-effect
+// free: it touches neither the change log nor any cursor or subscription.
+func (s *Store) GetCRDTSnapshot(documentID string) (CRDTSnapshot, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	state, err := getCRDTState(tx, documentID)
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	operations, tombstones, err := crdtCounts(tx, documentID, state.Type)
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CRDTSnapshot{}, err
+	}
+	return CRDTSnapshot{
+		Type:       state.Type,
+		Value:      state.Value,
+		Operations: operations,
+		Tombstones: tombstones,
+	}, nil
+}
+
+// CompactCRDT trims the CRDT state layer of documentID: operation records and
+// tombstones that no longer participate in the merge are deleted, so a
+// long-lived document stops accumulating storage it will never consult again.
+//
+//   - counter: an operation whose contribution is below its device's current
+//     maximum participates in nothing — the merge reads only the per-device
+//     maxima — so it is dropped; the operations carrying each device's maximum
+//     stay, and monotonicity is still enforced against the retained maxima.
+//   - gset: an operation whose elements are all also added by other retained
+//     operations cannot move the union, so it is dropped; the union table is
+//     untouched.
+//   - register: only each device's highest-version operation still decides
+//     anything (the merge winner and the strictly-forward version check), so
+//     dominated operations are dropped.
+//   - orset: a tombstoned tag is dead forever (its operation id is taken and
+//     an idempotent replay never re-inserts it), so the tag and every
+//     tombstone covering it are dropped; live tags and all operation records
+//     stay, so observed-remove semantics are unchanged.
+//
+// The merged state before and after compaction is byte-for-byte identical,
+// and the idempotency/conflict decisions driven by the retained records are
+// unchanged. The device is gated exactly like a submission (ErrDeviceNotFound
+// / ErrPermissionDenied, before any CRDT content is observed); a document with
+// no committed operations yields ErrCRDTNotFound. Compaction runs in the same
+// serialized transaction discipline as submissions, commits durably, is
+// idempotent (a repeated compact trims nothing further and reports the same
+// counts), never touches the change log or its cursors, and — since the
+// merged value never moves — notifies no subscriber.
+func (s *Store) CompactCRDT(documentID, deviceID string) (CRDTSnapshot, error) {
+	// Serialize with submissions and other compactions, so a concurrent batch
+	// either commits entirely before the trim (and is subject to it) or
+	// entirely after (and is judged against the trimmed state).
+	s.crdtMu.Lock()
+	defer s.crdtMu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := gateCRDTDevice(tx, documentID, deviceID); err != nil {
+		return CRDTSnapshot{}, err
+	}
+	docType, err := crdtDocType(tx, documentID)
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+
+	switch docType {
+	case CRDTTypeCounter:
+		err = compactCounterOps(tx, documentID)
+	case CRDTTypeGSet:
+		err = compactGSetOps(tx, documentID)
+	case CRDTTypeRegister:
+		err = compactRegisterOps(tx, documentID)
+	case CRDTTypeORSet:
+		err = compactORSetState(tx, documentID)
+	}
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+
+	// The response is derived inside the same transaction, so it is exactly
+	// what a snapshot read immediately after the commit reports.
+	state, err := getCRDTState(tx, documentID)
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	operations, tombstones, err := crdtCounts(tx, documentID, docType)
+	if err != nil {
+		return CRDTSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return CRDTSnapshot{}, err
+	}
+	return CRDTSnapshot{
+		Type:       state.Type,
+		Value:      state.Value,
+		Operations: operations,
+		Tombstones: tombstones,
+	}, nil
+}
+
+// crdtCounts reports the state layer's storage footprint for the document:
+// the number of retained operation records and, for an orset, the number of
+// retained tombstones (zero for every other type).
+func crdtCounts(q crdtQuerier, documentID, docType string) (operations, tombstones int64, err error) {
+	opTable := "crdt_ops"
+	if docType == CRDTTypeRegister {
+		opTable = "crdt_register_ops"
+	}
+	if err := q.QueryRow(
+		`SELECT COUNT(*) FROM `+opTable+` WHERE document_id = ?`, documentID,
+	).Scan(&operations); err != nil {
+		return 0, 0, err
+	}
+	if docType == CRDTTypeORSet {
+		if err := q.QueryRow(
+			`SELECT COUNT(*) FROM crdt_orset_tombstones WHERE document_id = ?`, documentID,
+		).Scan(&tombstones); err != nil {
+			return 0, 0, err
+		}
+	}
+	return operations, tombstones, nil
+}
+
+// compactCounterOps drops every counter operation whose contribution is
+// strictly below its device's current maximum. The merge sums the per-device
+// maxima, so a dominated operation participates in nothing; the operations
+// carrying each device's maximum stay and keep their idempotency.
+func compactCounterOps(tx *sql.Tx, documentID string) error {
+	_, err := tx.Exec(
+		`DELETE FROM crdt_ops
+		 WHERE document_id = ?
+		   AND CAST(value AS INTEGER) < (
+		       SELECT value FROM crdt_counter_values
+		       WHERE document_id = crdt_ops.document_id
+		         AND device_id = crdt_ops.device_id)`,
+		documentID,
+	)
+	return err
+}
+
+// compactGSetOps drops every grow-only-set operation whose elements are all
+// also added by other retained operations: removing it cannot move the union.
+// Coverage is evaluated greedily in operation-id order, so the result is
+// deterministic and every element keeps at least one contributing operation.
+func compactGSetOps(tx *sql.Tx, documentID string) error {
+	rows, err := tx.Query(
+		`SELECT id, value FROM crdt_ops WHERE document_id = ? ORDER BY id ASC`,
+		documentID,
+	)
+	if err != nil {
+		return err
+	}
+	type gsetOp struct {
+		id       string
+		elements []string
+	}
+	var ops []gsetOp
+	for rows.Next() {
+		var op gsetOp
+		var raw []byte
+		if err := rows.Scan(&op.id, &raw); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if err := json.Unmarshal(raw, &op.elements); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ops = append(ops, op)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	// coverage[e] counts the retained operations adding e; an operation is
+	// redundant when every element it adds is also added by at least one
+	// other retained operation.
+	coverage := make(map[string]int)
+	for _, op := range ops {
+		for _, element := range uniqueStrings(op.elements) {
+			coverage[element]++
+		}
+	}
+	for _, op := range ops {
+		elements := uniqueStrings(op.elements)
+		redundant := len(elements) > 0
+		for _, element := range elements {
+			if coverage[element] < 2 {
+				redundant = false
+				break
+			}
+		}
+		if !redundant {
+			continue
+		}
+		for _, element := range elements {
+			coverage[element]--
+		}
+		if _, err := tx.Exec(
+			`DELETE FROM crdt_ops WHERE document_id = ? AND id = ?`,
+			documentID, op.id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// uniqueStrings returns the distinct strings of in, in first-seen order.
+func uniqueStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// compactRegisterOps drops every register operation that is not its device's
+// highest-version one. The merge winner is a per-device maximum, and the
+// strictly-forward version check is enforced against the per-device maxima,
+// so a dominated operation participates in neither.
+func compactRegisterOps(tx *sql.Tx, documentID string) error {
+	_, err := tx.Exec(
+		`DELETE FROM crdt_register_ops
+		 WHERE document_id = ?
+		   AND version < (
+		       SELECT MAX(version) FROM crdt_register_ops r
+		       WHERE r.document_id = crdt_register_ops.document_id
+		         AND r.device_id = crdt_register_ops.device_id)`,
+		documentID,
+	)
+	return err
+}
+
+// compactORSetState drops every tombstoned tag together with the tombstones
+// covering it. A tombstoned tag is dead forever — its operation id is taken,
+// so nothing can resurrect it — and removing a dead tag and its tombstones
+// leaves the live element set untouched. Operation records stay, so a replayed
+// add or remove remains idempotent and a later remove still tombstones exactly
+// the tags it observes.
+func compactORSetState(tx *sql.Tx, documentID string) error {
+	if _, err := tx.Exec(
+		`DELETE FROM crdt_orset_tags
+		 WHERE document_id = ?
+		   AND EXISTS (
+		       SELECT 1 FROM crdt_orset_tombstones x
+		       WHERE x.document_id = crdt_orset_tags.document_id
+		         AND x.element = crdt_orset_tags.element
+		         AND x.op_id = crdt_orset_tags.op_id)`,
+		documentID,
+	); err != nil {
+		return err
+	}
+	_, err := tx.Exec(
+		`DELETE FROM crdt_orset_tombstones WHERE document_id = ?`,
+		documentID,
+	)
+	return err
 }
