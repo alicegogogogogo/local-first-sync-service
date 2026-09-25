@@ -213,13 +213,25 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTState(s, w, r)
 	})
-	// Other verbs on the CRDT endpoints get a JSON 400 (the ops endpoint only
-	// accepts POST; the state endpoint only accepts GET) rather than ServeMux's
-	// plain-text 405.
+	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/compact", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTCompact(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTSnapshot(s, w, r)
+	})
+	// Other verbs on the CRDT endpoints get a JSON 400 (the ops and compact
+	// endpoints only accept POST; the state and snapshot endpoints only accept
+	// GET) rather than ServeMux's plain-text 405.
 	mux.HandleFunc("/v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/snapshot", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 

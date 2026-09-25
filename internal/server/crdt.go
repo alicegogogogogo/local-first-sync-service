@@ -253,10 +253,12 @@ func marshalCRDTState(state store.CRDTState) []byte {
 }
 
 // malformedCRDTPath reports whether p targets the CRDT namespace but is not at
-// one of the two exact endpoints:
+// one of the four exact endpoints:
 //
-//	POST/GET /v1/documents/{documentID}/crdt/ops
+//	POST     /v1/documents/{documentID}/crdt/ops
 //	GET      /v1/documents/{documentID}/crdt/state
+//	POST     /v1/documents/{documentID}/crdt/compact
+//	GET      /v1/documents/{documentID}/crdt/snapshot
 //
 // A missing/empty document id, a trailing slash, extra path segments, or a
 // "crdt" segment in any position short of that shape is a malformed 400 rather
@@ -275,7 +277,7 @@ func malformedCRDTPath(p string) bool {
 				return true
 			}
 			switch segs[2] {
-			case "ops", "state":
+			case "ops", "state", "compact", "snapshot":
 				return false
 			default:
 				return true
