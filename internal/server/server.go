@@ -194,6 +194,21 @@ func NewHandler(s *store.Store) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
 		handleSetPermission(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTOps(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
+		handleCRDTState(s, w, r)
+	})
+	// Other verbs on the CRDT endpoints get a JSON 400 (the ops endpoint only
+	// accepts POST; the state endpoint only accepts GET) rather than ServeMux's
+	// plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 
 	// ServeMux treats any empty path segment (the doubled slash in
 	// /v1/documents//..., /v1/devices//sessions or
@@ -225,7 +240,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedCRDTPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -274,20 +289,38 @@ func malformedNewDocumentPath(p string) bool {
 // segment short of the registered shape. ServeMux would answer those with a
 // plain-text 404/405; every failure of this endpoint must be a JSON 400
 // instead. Empty segments are already rejected by the guard itself.
+//
+// "subscribe" is treated as the endpoint keyword only in the endpoint's
+// terminal segment position (the fifth segment, index 4); a session or
+// document identifier literally named "subscribe" occupies an identifier
+// position (index 0 or 2) and is therefore left to the ordinary
+// changes/subscribe routes like any other id.
 func malformedSubscribePath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
 	if !ok {
 		return false
 	}
 	segs := strings.Split(rest, "/")
-	for _, seg := range segs {
-		if seg == "subscribe" {
-			return !(len(segs) == 5 &&
-				segs[0] != "" &&
-				segs[1] == "documents" &&
-				segs[2] != "" &&
-				segs[3] == "changes")
+	for i, seg := range segs {
+		if seg != "subscribe" {
+			continue
 		}
+		// Identifier positions: sessionId (0) and documentId (2). A value of
+		// "subscribe" there is an ordinary identifier, not the endpoint word.
+		if i == 0 || i == 2 {
+			continue
+		}
+		// Endpoint keyword position: the fifth segment must be exactly
+		// "subscribe" with the documents/changes scaffolding around it, and no
+		// segment may follow. Any other occurrence is a malformed path.
+		if i == 4 && len(segs) == 5 &&
+			segs[0] != "" &&
+			segs[1] == "documents" &&
+			segs[2] != "" &&
+			segs[3] == "changes" {
+			return false
+		}
+		return true
 	}
 	return false
 }

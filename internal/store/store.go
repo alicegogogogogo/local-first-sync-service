@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	size   INTEGER NOT NULL,
 	data   BLOB NOT NULL
 );
-`)
+` + crdtSchema)
 	return err
 }
 
