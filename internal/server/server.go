@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -82,7 +84,7 @@ type replayRequest struct {
 // ready reports that the database is open and the listener is accepting
 // connections. Once ready, responses are byte-for-byte what NewHandler emits;
 // readiness is one-way, so a later flip back is not part of the contract.
-func NewHandlerWithReadiness(s *store.Store, ready func() bool) http.Handler {
+func NewHandlerWithReadiness(s *app.App, ready func() bool) http.Handler {
 	h := NewHandler(s)
 	if ready == nil {
 		return h
@@ -97,7 +99,7 @@ func NewHandlerWithReadiness(s *store.Store, ready func() bool) http.Handler {
 }
 
 // NewHandler builds the public HTTP surface backed by s.
-func NewHandler(s *store.Store) http.Handler {
+func NewHandler(s *app.App) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -399,9 +401,9 @@ func malformedSessionCRDTPath(p string) bool {
 // Handler exposes the HTTP surface over a private in-memory store. Use
 // NewHandler with a durable store for real deployments.
 func Handler() http.Handler {
-	s, err := store.Open("")
+	s, err := app.Open("")
 	if err != nil {
-		log.Fatalf("open in-memory store: %v", err)
+		log.Fatalf("open in-memory app: %v", err)
 	}
 	return NewHandler(s)
 }
@@ -433,7 +435,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-func handleRegisterDevice(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleRegisterDevice(s *app.App, w http.ResponseWriter, r *http.Request) {
 	var req deviceRequest
 	if !decodeJSONBody(w, r, &req) {
 		return
@@ -452,7 +454,7 @@ func handleRegisterDevice(s *store.Store, w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"deviceId": req.DeviceID, "created": created})
 }
 
-func handleCreateSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCreateSession(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
 
 	var req sessionRequest
@@ -481,7 +483,7 @@ func handleCreateSession(s *store.Store, w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]any{"sessionId": req.SessionID, "created": created})
 }
 
-func handleDeleteSession(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleDeleteSession(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")   // route pattern + guard guarantee non-empty
 	sessionID := r.PathValue("sessionId") // route pattern + guard guarantee non-empty
 
@@ -497,7 +499,7 @@ func handleDeleteSession(s *store.Store, w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, map[string]bool{"deleted": true})
 }
 
-func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handlePostChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -528,7 +530,7 @@ func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	changes := make([]store.Change, len(req.Changes))
+	changes := make([]events.Change, len(req.Changes))
 	seen := make(map[string]struct{}, len(req.Changes))
 	for i, c := range req.Changes {
 		if c.ID == "" {
@@ -544,12 +546,12 @@ func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[c.ID] = struct{}{}
-		changes[i] = store.Change{ID: c.ID, DeviceID: req.DeviceID, Payload: c.Payload}
+		changes[i] = events.Change{ID: c.ID, DeviceID: req.DeviceID, Payload: c.Payload}
 	}
 
 	results, err := s.PostChanges(documentID, changes)
 	if err != nil {
-		var conflict *store.ErrConflict
+		var conflict *events.ErrConflict
 		if errors.As(err, &conflict) {
 			writeError(w, http.StatusConflict, "change id already exists with different deviceId or payload: "+conflict.ID)
 			return
@@ -561,7 +563,7 @@ func handlePostChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
-func handleMergeChange(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleMergeChange(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -610,15 +612,15 @@ func handleMergeChange(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.MergeChange(documentID, baseCursor, store.Change{
+	result, err := s.MergeChange(documentID, baseCursor, events.Change{
 		ID:       req.Change.ID,
 		DeviceID: req.DeviceID,
 		Payload:  req.Change.Payload,
 	})
 	if err != nil {
-		var conflict *store.ErrConflict
+		var conflict *events.ErrConflict
 		switch {
-		case errors.Is(err, store.ErrStaleCursor):
+		case errors.Is(err, events.ErrStaleCursor):
 			writeError(w, http.StatusBadRequest, "baseCursor is unknown or greater than the current cursor")
 			return
 		case errors.As(err, &conflict):
@@ -633,7 +635,7 @@ func handleMergeChange(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func handlePostSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handlePostSnapshot(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -666,9 +668,9 @@ func handlePostSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) 
 
 	created, err := s.PutSnapshot(documentID, cursor, req.State)
 	if err != nil {
-		var conflict *store.ErrSnapshotConflict
+		var conflict *events.ErrSnapshotConflict
 		switch {
-		case errors.Is(err, store.ErrSnapshotBase):
+		case errors.Is(err, events.ErrSnapshotBase):
 			writeError(w, http.StatusBadRequest, "document is unknown or cursor is not an existing cursor")
 			return
 		case errors.As(err, &conflict):
@@ -683,7 +685,7 @@ func handlePostSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "created": created})
 }
 
-func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleGetSnapshot(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	cursor, ok := parseCursorPath(r.PathValue("cursor"))
@@ -694,7 +696,7 @@ func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
 
 	state, err := s.GetSnapshot(documentID, cursor)
 	if err != nil {
-		if errors.Is(err, store.ErrSnapshotNotFound) {
+		if errors.Is(err, events.ErrSnapshotNotFound) {
 			writeError(w, http.StatusNotFound, "snapshot not found")
 			return
 		}
@@ -705,7 +707,7 @@ func handleGetSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"cursor": cursor, "state": state})
 }
 
-func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleRestore(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -748,9 +750,9 @@ func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.RestoreSnapshot(documentID, req.DeviceID, req.ChangeID, snapshotCursor)
 	if err != nil {
-		var conflict *store.ErrRestoreConflict
+		var conflict *events.ErrRestoreConflict
 		switch {
-		case errors.Is(err, store.ErrSnapshotNotFound):
+		case errors.Is(err, events.ErrSnapshotNotFound):
 			writeError(w, http.StatusNotFound, "snapshot not found")
 			return
 		case errors.As(err, &conflict):
@@ -771,7 +773,7 @@ func handleRestore(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // request (bad content type, malformed JSON, trailing content, empty or
 // mistyped fields, unknown action) is a 400 JSON error and writes nothing; an
 // unregistered device is a 404 JSON error.
-func handleSetPermission(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleSetPermission(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern guarantees non-empty
 
 	var req permissionRequest
@@ -868,7 +870,7 @@ func isJSONObject(raw json.RawMessage) bool {
 	return true
 }
 
-func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleListChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID")
 
 	after, limit, ok := parseChangesQuery(w, r)
@@ -892,7 +894,7 @@ func handleListChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // the session's device has been revoked permission for the document, which is
 // a 403 JSON error with no changes or nextCursor. Revocation only gates this
 // read; the change log itself is untouched.
-func handleSessionChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
 
@@ -963,7 +965,7 @@ func parseChangesQuery(w http.ResponseWriter, r *http.Request) (after, limit int
 }
 
 // writeChangesPage renders a change listing page in the shared response shape.
-func writeChangesPage(w http.ResponseWriter, changes []store.ListedChange, nextCursor int64) {
+func writeChangesPage(w http.ResponseWriter, changes []events.ListedChange, nextCursor int64) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"changes":    changes,
 		"nextCursor": nextCursor,
@@ -990,7 +992,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 // The response shape is the ordinary page plus a timedOut flag; a deadline
 // expiry echoes the caller's cursor and never advances it. A client
 // disconnect simply stops the wait and writes nothing.
-func handlePollChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handlePollChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	after, limit, ok := parseChangesQuery(w, r)
@@ -1012,7 +1014,7 @@ func handlePollChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		r.Context(), documentID, after, limit, time.Duration(waitMs)*time.Millisecond,
 	)
 	switch {
-	case errors.Is(err, store.ErrStoreClosing):
+	case errors.Is(err, events.ErrStoreClosing):
 		writeError(w, http.StatusServiceUnavailable, "service is shutting down")
 		return
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
@@ -1039,7 +1041,7 @@ func handlePollChanges(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // 404 for an unregistered device and 403 for a revoked one, neither exposing
 // change content. The whole batch commits in one serialized transaction that
 // shares the document's contiguous cursor space with ordinary commits.
-func handleReplay(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleReplay(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	var req replayRequest
@@ -1059,7 +1061,7 @@ func handleReplay(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	changes := make([]store.Change, len(req.Operations))
+	changes := make([]events.Change, len(req.Operations))
 	seen := make(map[string]struct{}, len(req.Operations))
 	for i, op := range req.Operations {
 		if op.ID == "" {
@@ -1075,12 +1077,12 @@ func handleReplay(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[op.ID] = struct{}{}
-		changes[i] = store.Change{ID: op.ID, DeviceID: req.DeviceID, Payload: op.Payload}
+		changes[i] = events.Change{ID: op.ID, DeviceID: req.DeviceID, Payload: op.Payload}
 	}
 
 	results, err := s.ReplayChanges(documentID, changes)
 	if err != nil {
-		var conflict *store.ErrConflict
+		var conflict *events.ErrConflict
 		switch {
 		case errors.Is(err, store.ErrDeviceNotFound):
 			writeError(w, http.StatusNotFound, "device not found")

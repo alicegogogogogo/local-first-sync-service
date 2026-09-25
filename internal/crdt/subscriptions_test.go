@@ -1,20 +1,23 @@
-package store
+package crdt_test
 
 import (
 	"encoding/json"
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 )
 
-func counterSubOp(id, device string, value int64) CRDTOp {
-	return CRDTOp{ID: id, DeviceID: device, Value: rawInt(value)}
+func counterSubOp(id, device string, value int64) crdt.Op {
+	return crdt.Op{ID: id, DeviceID: device, Value: rawInt(value)}
 }
 
 // Opening a subscription returns the current state; a later state-changing
 // commit is queued in order, while a no-op commit queues nothing.
 func TestCRDTSubscriptionInitialStateAndDrain(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,14 +26,14 @@ func TestCRDTSubscriptionInitialStateAndDrain(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		counterSubOp("a1", "dev-1", 5),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	initial, sub, unregister := openSub(t, s, "doc", "dev-1")
-	if initial == nil || string(initial.Value) != "5" || initial.Type != CRDTTypeCounter {
+	if initial == nil || string(initial.Value) != "5" || initial.Type != crdt.TypeCounter {
 		t.Fatalf("initial = %+v, want counter 5", initial)
 	}
 	if queued := sub.Drain(); queued != nil {
@@ -38,12 +41,12 @@ func TestCRDTSubscriptionInitialStateAndDrain(t *testing.T) {
 	}
 
 	// Advancing commit queues one state; an equal-value new op queues none.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		counterSubOp("a2", "dev-1", 8),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		counterSubOp("a3", "dev-1", 8),
 	}); err != nil {
 		t.Fatal(err)
@@ -61,7 +64,7 @@ func TestCRDTSubscriptionInitialStateAndDrain(t *testing.T) {
 // A subscription opened before the document's first state gets no initial
 // state and then receives the first committed state through its queue.
 func TestCRDTSubscriptionWaitsForFirstState(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,13 +78,13 @@ func TestCRDTSubscriptionWaitsForFirstState(t *testing.T) {
 		t.Fatalf("initial = %+v, want nil before any op", initial)
 	}
 
-	if _, err := s.SubmitCRDTOps("virgin", CRDTTypeGSet, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("virgin", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-1", Elements: []string{"x"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	queued := sub.Drain()
-	if len(queued) != 1 || queued[0].Type != CRDTTypeGSet || string(queued[0].Value) != `["x"]` {
+	if len(queued) != 1 || queued[0].Type != crdt.TypeGSet || string(queued[0].Value) != `["x"]` {
 		t.Fatalf("queued = %v, want one gset [x]", queued)
 	}
 	unregister()
@@ -91,7 +94,7 @@ func TestCRDTSubscriptionWaitsForFirstState(t *testing.T) {
 // each, in strictly increasing order, ending at the total; a subscription on
 // another document receives nothing.
 func TestCRDTSubscriptionConcurrentCommitOrder(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +108,7 @@ func TestCRDTSubscriptionConcurrentCommitOrder(t *testing.T) {
 		}
 	}
 
-	subs := make([]*CRDTSubscription, 3)
+	subs := make([]*crdt.Subscription, 3)
 	for i := range subs {
 		_, sub, unregister := openSub(t, s, "doc", "dev-1")
 		defer unregister()
@@ -123,7 +126,7 @@ func TestCRDTSubscriptionConcurrentCommitOrder(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for v := 1; v <= perDevice; v++ {
-				if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+				if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 					counterSubOp(device+"-"+strconv.Itoa(v), device, int64(v)),
 				}); err != nil {
 					t.Errorf("submit %s %d: %v", device, v, err)
@@ -169,7 +172,7 @@ func TestCRDTSubscriptionConcurrentCommitOrder(t *testing.T) {
 // A revoke after opening closes the subscription's revoked channel once and
 // stickily; a subsequent grant leaves it closed. Other devices are untouched.
 func TestCRDTSubscriptionRevokeSignal(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +217,7 @@ func TestCRDTSubscriptionRevokeSignal(t *testing.T) {
 // After the store starts closing, a new subscription wakes immediately and a
 // live one receives a final wake, both mapping to the going-away close.
 func TestCRDTSubscriptionClosingWakes(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +247,7 @@ func TestCRDTSubscriptionClosingWakes(t *testing.T) {
 	}
 }
 
-func openSub(t *testing.T, s *Store, doc, device string) (*CRDTState, *CRDTSubscription, func()) {
+func openSub(t *testing.T, s *app.App, doc, device string) (*crdt.State, *crdt.Subscription, func()) {
 	t.Helper()
 	state, sub, unregister, err := s.OpenCRDTSubscription(doc, device)
 	if err != nil {
@@ -253,7 +256,7 @@ func openSub(t *testing.T, s *Store, doc, device string) (*CRDTState, *CRDTSubsc
 	return state, sub, unregister
 }
 
-func openSubOther(t *testing.T, s *Store, doc, device string) (*CRDTSubscription, func()) {
+func openSubOther(t *testing.T, s *app.App, doc, device string) (*crdt.Subscription, func()) {
 	t.Helper()
 	_, sub, unregister, err := s.OpenCRDTSubscription(doc, device)
 	if err != nil {

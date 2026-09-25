@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 func crdtORSetBody(device string, ops ...map[string]any) map[string]any {
@@ -258,7 +258,7 @@ func TestCRDTORSetSessionStateView(t *testing.T) {
 
 func TestCRDTORSetStatePersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crdt.db")
-	s1, err := store.Open(path)
+	s1, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestCRDTORSetStatePersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,4 +1,4 @@
-package store
+package crdt_test
 
 import (
 	"encoding/json"
@@ -6,16 +6,21 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
-func submitCRDT(t *testing.T, s *Store, doc, typ string, ops ...CRDTOp) {
+func submitCRDT(t *testing.T, s *app.App, doc, typ string, ops ...crdt.Op) {
 	t.Helper()
 	if _, err := s.SubmitCRDTOps(doc, typ, ops); err != nil {
 		t.Fatalf("submit %s op: %v", typ, err)
 	}
 }
 
-func crdtStateValue(t *testing.T, s *Store, doc string) string {
+func crdtStateValue(t *testing.T, s *app.App, doc string) string {
 	t.Helper()
 	state, err := s.GetCRDTState(doc)
 	if err != nil {
@@ -25,13 +30,13 @@ func crdtStateValue(t *testing.T, s *Store, doc string) string {
 }
 
 func TestCompactCounterTrimsSupersededContributions(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "b1", DeviceID: "dev-2", Value: rawInt(3)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "b1", DeviceID: "dev-2", Value: rawInt(3)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
 
 	before, err := s.GetCRDTSnapshot("doc")
 	if err != nil {
@@ -51,7 +56,7 @@ func TestCompactCounterTrimsSupersededContributions(t *testing.T) {
 	if snapshot.Operations != 2 || snapshot.Tombstones != 0 {
 		t.Fatalf("after compaction: operations=%d tombstones=%d, want 2/0", snapshot.Operations, snapshot.Tombstones)
 	}
-	if snapshot.Type != CRDTTypeCounter || string(snapshot.Value) != "11" {
+	if snapshot.Type != crdt.TypeCounter || string(snapshot.Value) != "11" {
 		t.Fatalf("after compaction: %s %s, want counter 11", snapshot.Type, snapshot.Value)
 	}
 	// The merged state read is untouched by the trim.
@@ -70,34 +75,34 @@ func TestCompactCounterTrimsSupersededContributions(t *testing.T) {
 	}
 
 	// The regression gate still uses the retained per-device maximum.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "a3", DeviceID: "dev-1", Value: rawInt(7)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("regression after compaction err = %v, want *ErrCRDTConflict", err)
+		t.Fatalf("regression after compaction err = %v, want *crdt.ErrConflict", err)
 	}
 	// The retained op stays idempotent; a new advance still lands.
-	results, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	results, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)},
 	})
 	if err != nil || results[0].Created {
 		t.Fatalf("retained op replay = %v %+v, want idempotent", err, results)
 	}
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a4", DeviceID: "dev-1", Value: rawInt(10)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a4", DeviceID: "dev-1", Value: rawInt(10)})
 	if got := crdtStateValue(t, s, "doc"); got != "13" {
 		t.Fatalf("state after new advance = %s, want 13", got)
 	}
 }
 
 func TestCompactGSetTrimsCoveredOps(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g1", DeviceID: "dev-1", Elements: []string{"apple", "banana"}})
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g2", DeviceID: "dev-1", Elements: []string{"banana", "cherry"}})
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g1", DeviceID: "dev-1", Elements: []string{"apple", "banana"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g2", DeviceID: "dev-1", Elements: []string{"banana", "cherry"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple"}})
 
 	before, err := s.GetCRDTSnapshot("doc")
 	if err != nil {
@@ -123,20 +128,20 @@ func TestCompactGSetTrimsCoveredOps(t *testing.T) {
 	}
 
 	// New elements still merge after compaction.
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g4", DeviceID: "dev-1", Elements: []string{"date"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g4", DeviceID: "dev-1", Elements: []string{"date"}})
 	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry","date"]` {
 		t.Fatalf("state after new element = %s", got)
 	}
 }
 
 func TestCompactRegisterKeepsPerDeviceLatest(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r3", DeviceID: "dev-2", Version: 1, Value: json.RawMessage(`"other"`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r3", DeviceID: "dev-2", Version: 1, Value: json.RawMessage(`"other"`)})
 
 	before, err := s.GetCRDTSnapshot("doc")
 	if err != nil {
@@ -158,27 +163,27 @@ func TestCompactRegisterKeepsPerDeviceLatest(t *testing.T) {
 	}
 
 	// The version gate still derives from the retained per-device maxima.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		{ID: "r4", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"stall"`)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("stalled version after compaction err = %v, want *ErrCRDTConflict", err)
+		t.Fatalf("stalled version after compaction err = %v, want *crdt.ErrConflict", err)
 	}
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r5", DeviceID: "dev-1", Version: 3, Value: json.RawMessage(`"third"`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r5", DeviceID: "dev-1", Version: 3, Value: json.RawMessage(`"third"`)})
 	if got := crdtStateValue(t, s, "doc"); got != `"third"` {
 		t.Fatalf("state after new version = %s, want \"third\"", got)
 	}
 }
 
 func TestCompactORSetDropsDeadTagsAndTombstones(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o1", DeviceID: "dev-1", Action: CRDTORSetAdd, Element: "apple"})
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o2", DeviceID: "dev-1", Action: CRDTORSetAdd, Element: "banana"})
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o3", DeviceID: "dev-1", Action: CRDTORSetRemove, Element: "apple"})
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o1", DeviceID: "dev-1", Action: crdt.ORSetAdd, Element: "apple"})
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o2", DeviceID: "dev-1", Action: crdt.ORSetAdd, Element: "banana"})
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o3", DeviceID: "dev-1", Action: crdt.ORSetRemove, Element: "apple"})
 
 	before, err := s.GetCRDTSnapshot("doc")
 	if err != nil {
@@ -201,9 +206,9 @@ func TestCompactORSetDropsDeadTagsAndTombstones(t *testing.T) {
 
 	// Replaying the compacted remove stays idempotent and must not tombstone
 	// a tag added after the original remove.
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o4", DeviceID: "dev-1", Action: CRDTORSetAdd, Element: "apple"})
-	results, err := s.SubmitCRDTOps("doc", CRDTTypeORSet, []CRDTOp{
-		{ID: "o3", DeviceID: "dev-1", Action: CRDTORSetRemove, Element: "apple"},
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o4", DeviceID: "dev-1", Action: crdt.ORSetAdd, Element: "apple"})
+	results, err := s.SubmitCRDTOps("doc", crdt.TypeORSet, []crdt.Op{
+		{ID: "o3", DeviceID: "dev-1", Action: crdt.ORSetRemove, Element: "apple"},
 	})
 	if err != nil || results[0].Created {
 		t.Fatalf("remove replay after compaction = %v %+v, want idempotent", err, results)
@@ -212,8 +217,8 @@ func TestCompactORSetDropsDeadTagsAndTombstones(t *testing.T) {
 		t.Fatalf("state after replayed remove = %s, want [\"apple\",\"banana\"]", got)
 	}
 	// Replaying the compacted add stays idempotent and resurrects nothing.
-	results, err = s.SubmitCRDTOps("doc", CRDTTypeORSet, []CRDTOp{
-		{ID: "o1", DeviceID: "dev-1", Action: CRDTORSetAdd, Element: "apple"},
+	results, err = s.SubmitCRDTOps("doc", crdt.TypeORSet, []crdt.Op{
+		{ID: "o1", DeviceID: "dev-1", Action: crdt.ORSetAdd, Element: "apple"},
 	})
 	if err != nil || results[0].Created {
 		t.Fatalf("add replay after compaction = %v %+v, want idempotent", err, results)
@@ -224,12 +229,12 @@ func TestCompactORSetDropsDeadTagsAndTombstones(t *testing.T) {
 }
 
 func TestCompactORSetFullyRemovedSet(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o1", DeviceID: "dev-1", Action: CRDTORSetAdd, Element: "apple"})
-	submitCRDT(t, s, "doc", CRDTTypeORSet, CRDTOp{ID: "o2", DeviceID: "dev-1", Action: CRDTORSetRemove, Element: "apple"})
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o1", DeviceID: "dev-1", Action: crdt.ORSetAdd, Element: "apple"})
+	submitCRDT(t, s, "doc", crdt.TypeORSet, crdt.Op{ID: "o2", DeviceID: "dev-1", Action: crdt.ORSetRemove, Element: "apple"})
 
 	snapshot, err := s.CompactCRDT("doc", "dev-1")
 	if err != nil {
@@ -244,28 +249,28 @@ func TestCompactORSetFullyRemovedSet(t *testing.T) {
 }
 
 func TestCompactGateAndMissingState(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
 
 	// An unregistered device is rejected before any CRDT content is observed.
-	if _, err := s.CompactCRDT("doc", "ghost"); !errors.Is(err, ErrDeviceNotFound) {
-		t.Fatalf("unregistered device err = %v, want ErrDeviceNotFound", err)
+	if _, err := s.CompactCRDT("doc", "ghost"); !errors.Is(err, store.ErrDeviceNotFound) {
+		t.Fatalf("unregistered device err = %v, want store.ErrDeviceNotFound", err)
 	}
 	// A revoked device is rejected and changes nothing.
 	if _, err := s.SetDocumentPermission("doc", "dev-2", false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.CompactCRDT("doc", "dev-2"); !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("revoked device err = %v, want ErrPermissionDenied", err)
+	if _, err := s.CompactCRDT("doc", "dev-2"); !errors.Is(err, store.ErrPermissionDenied) {
+		t.Fatalf("revoked device err = %v, want store.ErrPermissionDenied", err)
 	}
 	// A document with no CRDT operation has nothing to compact.
-	if _, err := s.CompactCRDT("never", "dev-1"); !errors.Is(err, ErrCRDTNotFound) {
-		t.Fatalf("empty document err = %v, want ErrCRDTNotFound", err)
+	if _, err := s.CompactCRDT("never", "dev-1"); !errors.Is(err, crdt.ErrNotFound) {
+		t.Fatalf("empty document err = %v, want crdt.ErrNotFound", err)
 	}
-	if _, err := s.GetCRDTSnapshot("never"); !errors.Is(err, ErrCRDTNotFound) {
-		t.Fatalf("empty snapshot err = %v, want ErrCRDTNotFound", err)
+	if _, err := s.GetCRDTSnapshot("never"); !errors.Is(err, crdt.ErrNotFound) {
+		t.Fatalf("empty snapshot err = %v, want crdt.ErrNotFound", err)
 	}
 
 	// None of the rejections trimmed anything.
@@ -279,17 +284,17 @@ func TestCompactGateAndMissingState(t *testing.T) {
 }
 
 func TestCompactLeavesChangeLogAndSubscribersAlone(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
 	// A change-log document shares the document id; compaction must not
 	// allocate cursors or append changes to it.
-	if _, err := s.PostChanges("doc", []Change{{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"k":1}`)}}); err != nil {
+	if _, err := s.PostChanges("doc", []events.Change{{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"k":1}`)}}); err != nil {
 		t.Fatal(err)
 	}
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
 
 	sub, unregister := s.AddCRDTSubscription("doc", "dev-1")
 	defer unregister()
@@ -319,14 +324,14 @@ func TestCompactLeavesChangeLogAndSubscribersAlone(t *testing.T) {
 }
 
 func TestCompactConcurrentRunsSerialize(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
 
 	var wg sync.WaitGroup
-	snapshots := make([]CRDTSnapshot, 4)
+	snapshots := make([]crdt.Snapshot, 4)
 	for i := range snapshots {
 		wg.Add(1)
 		go func(i int) {
@@ -353,13 +358,13 @@ func TestCompactConcurrentRunsSerialize(t *testing.T) {
 
 func TestCompactPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registerDevices(t, s, "dev-1")
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
 	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +372,7 @@ func TestCompactPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,15 +386,15 @@ func TestCompactPersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("snapshot after reopen = %+v", snapshot)
 	}
 	// The regression gate survives the restart exactly as before.
-	_, err = s2.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err = s2.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "a3", DeviceID: "dev-1", Value: rawInt(7)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("regression after reopen err = %v, want *ErrCRDTConflict", err)
+		t.Fatalf("regression after reopen err = %v, want *crdt.ErrConflict", err)
 	}
 	// A retained op stays idempotent after the restart.
-	results, err := s2.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	results, err := s2.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)},
 	})
 	if err != nil || results[0].Created {
@@ -397,13 +402,13 @@ func TestCompactPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// wantConflict submits ops and asserts an *ErrCRDTConflict that names id.
-func wantConflict(t *testing.T, s *Store, doc, typ string, id string, ops ...CRDTOp) {
+// wantConflict submits ops and asserts an *crdt.ErrConflict that names id.
+func wantConflict(t *testing.T, s *app.App, doc, typ string, id string, ops ...crdt.Op) {
 	t.Helper()
 	_, err := s.SubmitCRDTOps(doc, typ, ops)
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("submit %s after compaction err = %v, want *ErrCRDTConflict", id, err)
+		t.Fatalf("submit %s after compaction err = %v, want *crdt.ErrConflict", id, err)
 	}
 	if conflict.ID != id {
 		t.Fatalf("conflict id = %q, want %q", conflict.ID, id)
@@ -411,7 +416,7 @@ func wantConflict(t *testing.T, s *Store, doc, typ string, id string, ops ...CRD
 }
 
 // replay submits ops and asserts the first result is an idempotent no-op.
-func replay(t *testing.T, s *Store, doc, typ string, ops ...CRDTOp) {
+func replay(t *testing.T, s *app.App, doc, typ string, ops ...crdt.Op) {
 	t.Helper()
 	results, err := s.SubmitCRDTOps(doc, typ, ops)
 	if err != nil {
@@ -428,12 +433,12 @@ func replay(t *testing.T, s *Store, doc, typ string, ops ...CRDTOp) {
 }
 
 func TestCompactCounterTrimmedIDStillDecides(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
 
 	snapshot, err := s.CompactCRDT("doc", "dev-1")
 	if err != nil {
@@ -446,7 +451,7 @@ func TestCompactCounterTrimmedIDStillDecides(t *testing.T) {
 
 	// Same device and value: the trimmed id still replays idempotently with
 	// its original result (created=false), and creates nothing.
-	replay(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	replay(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
 	if got := crdtStateValue(t, s, "doc"); got != "8" {
 		t.Fatalf("state after trimmed replay = %s, want 8", got)
 	}
@@ -455,9 +460,9 @@ func TestCompactCounterTrimmedIDStillDecides(t *testing.T) {
 	}
 
 	// Different value: 409 and nothing changes, even though the row is gone.
-	wantConflict(t, s, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(9)})
+	wantConflict(t, s, "doc", crdt.TypeCounter, "a1", crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(9)})
 	// Different device: likewise 409 with the state untouched.
-	wantConflict(t, s, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-2", Value: rawInt(5)})
+	wantConflict(t, s, "doc", crdt.TypeCounter, "a1", crdt.Op{ID: "a1", DeviceID: "dev-2", Value: rawInt(5)})
 	if got := crdtStateValue(t, s, "doc"); got != "8" {
 		t.Fatalf("state after trimmed conflicts = %s, want 8", got)
 	}
@@ -467,21 +472,21 @@ func TestCompactCounterTrimmedIDStillDecides(t *testing.T) {
 
 	// A genuinely new id still follows the normal path: a regression is
 	// rejected by the retained per-device maximum, an advance is accepted.
-	wantConflict(t, s, "doc", CRDTTypeCounter, "a3", CRDTOp{ID: "a3", DeviceID: "dev-1", Value: rawInt(7)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a4", DeviceID: "dev-1", Value: rawInt(10)})
+	wantConflict(t, s, "doc", crdt.TypeCounter, "a3", crdt.Op{ID: "a3", DeviceID: "dev-1", Value: rawInt(7)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a4", DeviceID: "dev-1", Value: rawInt(10)})
 	if got := crdtStateValue(t, s, "doc"); got != "10" {
 		t.Fatalf("state after new advance = %s, want 10", got)
 	}
 }
 
 func TestCompactGSetTrimmedIDStillDecides(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g1", DeviceID: "dev-1", Elements: []string{"apple", "banana"}})
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g2", DeviceID: "dev-1", Elements: []string{"cherry"}})
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g1", DeviceID: "dev-1", Elements: []string{"apple", "banana"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g2", DeviceID: "dev-1", Elements: []string{"cherry"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple"}})
 
 	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
 		t.Fatal(err)
@@ -490,32 +495,32 @@ func TestCompactGSetTrimmedIDStillDecides(t *testing.T) {
 
 	// Same elements, different order and duplicated: the element-set content
 	// compares equal, so the trimmed id replays idempotently.
-	replay(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple", "apple"}})
+	replay(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g3", DeviceID: "dev-1", Elements: []string{"apple", "apple"}})
 	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry"]` {
 		t.Fatalf("state after trimmed replay = %s", got)
 	}
 
 	// A different element set conflicts; so does a different device.
-	wantConflict(t, s, "doc", CRDTTypeGSet, "g3", CRDTOp{ID: "g3", DeviceID: "dev-1", Elements: []string{"date"}})
-	wantConflict(t, s, "doc", CRDTTypeGSet, "g3", CRDTOp{ID: "g3", DeviceID: "dev-2", Elements: []string{"apple"}})
+	wantConflict(t, s, "doc", crdt.TypeGSet, "g3", crdt.Op{ID: "g3", DeviceID: "dev-1", Elements: []string{"date"}})
+	wantConflict(t, s, "doc", crdt.TypeGSet, "g3", crdt.Op{ID: "g3", DeviceID: "dev-2", Elements: []string{"apple"}})
 	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry"]` {
 		t.Fatalf("state after trimmed conflicts = %s", got)
 	}
 
 	// A new element still merges through the normal path.
-	submitCRDT(t, s, "doc", CRDTTypeGSet, CRDTOp{ID: "g4", DeviceID: "dev-1", Elements: []string{"date"}})
+	submitCRDT(t, s, "doc", crdt.TypeGSet, crdt.Op{ID: "g4", DeviceID: "dev-1", Elements: []string{"date"}})
 	if got := crdtStateValue(t, s, "doc"); got != `["apple","banana","cherry","date"]` {
 		t.Fatalf("state after new element = %s", got)
 	}
 }
 
 func TestCompactRegisterTrimmedIDStillDecides(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
-	submitCRDT(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	submitCRDT(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
 
 	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
 		t.Fatal(err)
@@ -526,16 +531,16 @@ func TestCompactRegisterTrimmedIDStillDecides(t *testing.T) {
 	// the device's retained maximum — the identity is decided before the
 	// monotonicity gate. Object key order (and 1 vs 1.0-style JSON equality)
 	// is irrelevant to the comparison.
-	replay(t, s, "doc", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"a":1,"b":2}`)})
+	replay(t, s, "doc", crdt.TypeRegister, crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`{"a":1,"b":2}`)})
 	if got := crdtStateValue(t, s, "doc"); got != `"second"` {
 		t.Fatalf("state after trimmed replay = %s, want \"second\"", got)
 	}
 
 	// Different version, different value or different device all conflict and
 	// leave the winning value and the retained operation count untouched.
-	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
-	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 3, Value: json.RawMessage(`{"b":2,"a":1}`)})
-	wantConflict(t, s, "doc", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-2", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	wantConflict(t, s, "doc", crdt.TypeRegister, "r1", crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
+	wantConflict(t, s, "doc", crdt.TypeRegister, "r1", crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 3, Value: json.RawMessage(`{"b":2,"a":1}`)})
+	wantConflict(t, s, "doc", crdt.TypeRegister, "r1", crdt.Op{ID: "r1", DeviceID: "dev-2", Version: 1, Value: json.RawMessage(`{"b":2,"a":1}`)})
 	if got := crdtStateValue(t, s, "doc"); got != `"second"` {
 		t.Fatalf("state after trimmed conflicts = %s, want \"second\"", got)
 	}
@@ -546,15 +551,15 @@ func TestCompactRegisterTrimmedIDStillDecides(t *testing.T) {
 
 func TestCompactTrimmedIdentitiesPersistAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registerDevices(t, s, "dev-1")
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	submitCRDT(t, s, "doc", CRDTTypeCounter, CRDTOp{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
-	submitCRDT(t, s, "doc2", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
-	submitCRDT(t, s, "doc2", CRDTTypeRegister, CRDTOp{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	submitCRDT(t, s, "doc", crdt.TypeCounter, crdt.Op{ID: "a2", DeviceID: "dev-1", Value: rawInt(8)})
+	submitCRDT(t, s, "doc2", crdt.TypeRegister, crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
+	submitCRDT(t, s, "doc2", crdt.TypeRegister, crdt.Op{ID: "r2", DeviceID: "dev-1", Version: 2, Value: json.RawMessage(`"second"`)})
 	if _, err := s.CompactCRDT("doc", "dev-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -565,17 +570,17 @@ func TestCompactTrimmedIdentitiesPersistAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s2.Close() }()
 
 	// The trimmed ids keep deciding identically after the restart.
-	replay(t, s2, "doc", CRDTTypeCounter, CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
-	wantConflict(t, s2, "doc", CRDTTypeCounter, "a1", CRDTOp{ID: "a1", DeviceID: "dev-1", Value: rawInt(6)})
-	replay(t, s2, "doc2", CRDTTypeRegister, CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
-	wantConflict(t, s2, "doc2", CRDTTypeRegister, "r1", CRDTOp{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
+	replay(t, s2, "doc", crdt.TypeCounter, crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(5)})
+	wantConflict(t, s2, "doc", crdt.TypeCounter, "a1", crdt.Op{ID: "a1", DeviceID: "dev-1", Value: rawInt(6)})
+	replay(t, s2, "doc2", crdt.TypeRegister, crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"first"`)})
+	wantConflict(t, s2, "doc2", crdt.TypeRegister, "r1", crdt.Op{ID: "r1", DeviceID: "dev-1", Version: 1, Value: json.RawMessage(`"other"`)})
 	if got := crdtStateValue(t, s2, "doc"); got != "8" {
 		t.Fatalf("counter state after reopen = %s, want 8", got)
 	}

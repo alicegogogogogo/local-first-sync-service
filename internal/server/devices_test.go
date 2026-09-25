@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 func newJSONRequest(method, url, body, contentType string) *http.Request {
@@ -452,7 +452,7 @@ func TestDeviceSessionEmptyIDsReturnJSON400(t *testing.T) {
 func TestDeviceSessionHTTPRestartPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := store.Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +466,7 @@ func TestDeviceSessionHTTPRestartPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestDeviceSessionHTTPRestartPersists(t *testing.T) {
 	if err := s2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s3, err := store.Open(path)
+	s3, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

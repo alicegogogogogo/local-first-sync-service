@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 func sha256Hex(data []byte) string {
@@ -483,9 +483,9 @@ func TestGetChunkOutOfRangeIs400(t *testing.T) {
 
 func TestAttachmentsSurviveRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
-	open := func(t *testing.T) (http.Handler, *store.Store) {
+	open := func(t *testing.T) (http.Handler, *app.App) {
 		t.Helper()
-		s, err := store.Open(dbPath)
+		s, err := app.Open(dbPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -542,9 +542,9 @@ func TestAttachmentsSurviveRestart(t *testing.T) {
 
 func TestAttachmentDedupSurvivesRestart(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
-	open := func(t *testing.T) (http.Handler, *store.Store) {
+	open := func(t *testing.T) (http.Handler, *app.App) {
 		t.Helper()
-		s, err := store.Open(dbPath)
+		s, err := app.Open(dbPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -603,9 +603,9 @@ func TestAttachmentDedupSurvivesRestart(t *testing.T) {
 // rejection and the original bytes survive a restart.
 func TestSealedAttachmentRejectsChunksHTTP(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "sync.db")
-	open := func(t *testing.T) (http.Handler, *store.Store) {
+	open := func(t *testing.T) (http.Handler, *app.App) {
 		t.Helper()
-		s, err := store.Open(dbPath)
+		s, err := app.Open(dbPath)
 		if err != nil {
 			t.Fatal(err)
 		}

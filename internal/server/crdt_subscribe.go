@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -41,7 +43,7 @@ import (
 // signal ends every subscription with 1001. Subscriptions are not persisted;
 // after a restart a fresh subscription immediately receives the consistent
 // current merged state.
-func handleCRDTStateSubscribe(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCRDTStateSubscribe(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
 
@@ -87,7 +89,7 @@ func handleCRDTStateSubscribe(s *store.Store, w http.ResponseWriter, r *http.Req
 // and every later frame is strictly newer, in commit order. The method
 // returns when the client leaves, permission is revoked or the store starts
 // closing; the hijacked connection is closed on exit.
-func serveCRDTStateSubscription(r *http.Request, s *store.Store, conn *wsConn, documentID, deviceID string) {
+func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, deviceID string) {
 	initial, sub, unregister, err := s.OpenCRDTSubscription(documentID, deviceID)
 	if err != nil {
 		_ = conn.Close(wsCloseInternalError, "internal error")
@@ -151,7 +153,7 @@ func serveCRDTStateSubscription(r *http.Request, s *store.Store, conn *wsConn, d
 	// this unnecessary (a queued state is always strictly newer), so this is
 	// only a belt-and-braces guard for the register/read boundary.
 	var lastSent []byte
-	send := func(state store.CRDTState) bool {
+	send := func(state crdt.State) bool {
 		frame := encodeCRDTStateFrame(state)
 		if bytes.Equal(frame, lastSent) {
 			return true
@@ -217,6 +219,6 @@ func serveCRDTStateSubscription(r *http.Request, s *store.Store, conn *wsConn, d
 // map keys sorted to type then value) and the same trailing newline, so a
 // pushed frame can be compared byte-for-byte with a GET .../crdt/state
 // response at either the document or session path.
-func encodeCRDTStateFrame(state store.CRDTState) []byte {
+func encodeCRDTStateFrame(state crdt.State) []byte {
 	return marshalCRDTState(state)
 }

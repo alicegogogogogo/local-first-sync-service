@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 // sessionCRDTStatePath is the session-scoped CRDT state read path.
@@ -384,7 +384,7 @@ func TestSessionCRDTStateKeywordIdentifiers(t *testing.T) {
 func TestSessionCRDTStateConsistentAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session-crdt.db")
 
-	s1, err := store.Open(path)
+	s1, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestSessionCRDTStateConsistentAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

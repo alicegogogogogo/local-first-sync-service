@@ -11,12 +11,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 )
 
-func newTestHandler(t *testing.T) (http.Handler, *store.Store) {
+func newTestHandler(t *testing.T) (http.Handler, *app.App) {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	s, err := app.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +103,7 @@ func TestPostValidBatch(t *testing.T) {
 func TestPostRejectsBadInput(t *testing.T) {
 	h, s := newTestHandler(t)
 	url := "/v1/documents/doc1/changes"
-	if _, err := s.PostChanges("doc1", []store.Change{
+	if _, err := s.PostChanges("doc1", []events.Change{
 		{ID: "existing", DeviceID: "dev", Payload: json.RawMessage(`{"v":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -731,7 +732,7 @@ func TestSnapshotGetMissing(t *testing.T) {
 func TestSnapshotPersistenceAcrossRestartHTTP(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := store.Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +747,7 @@ func TestSnapshotPersistenceAcrossRestartHTTP(t *testing.T) {
 	}
 
 	// Restart: snapshot is readable and retry/conflict semantics hold.
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -982,7 +983,7 @@ func TestRestoreHTTPIdempotentAndConflict(t *testing.T) {
 func TestRestoreHTTPPersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := store.Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,7 +999,7 @@ func TestRestoreHTTPPersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

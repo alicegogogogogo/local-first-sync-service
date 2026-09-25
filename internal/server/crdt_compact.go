@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -32,7 +34,7 @@ type crdtCompactRequest struct {
 // body — and touches only the CRDT state layer: it allocates no change
 // cursor, writes no change record and, because the merged value never moves,
 // pushes no notification.
-func handleCRDTCompact(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCRDTCompact(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	var req crdtCompactRequest
@@ -51,7 +53,7 @@ func handleCRDTCompact(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "device not found")
 		case errors.Is(err, store.ErrPermissionDenied):
 			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
-		case errors.Is(err, store.ErrCRDTNotFound):
+		case errors.Is(err, crdt.ErrNotFound):
 			writeError(w, http.StatusNotFound, "crdt state not found")
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to compact crdt state")
@@ -68,12 +70,12 @@ func handleCRDTCompact(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // document-level state read it is open, and a document with no committed CRDT
 // operation answers the same 404 JSON as the state read. The read is pure —
 // no cursor, no change record, no subscription.
-func handleCRDTSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCRDTSnapshot(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	snapshot, err := s.GetCRDTSnapshot(documentID)
 	if err != nil {
-		if errors.Is(err, store.ErrCRDTNotFound) {
+		if errors.Is(err, crdt.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "crdt state not found")
 			return
 		}
@@ -88,7 +90,7 @@ func handleCRDTSnapshot(s *store.Store, w http.ResponseWriter, r *http.Request) 
 // must emit it: compact single-line JSON with the keys in type, value,
 // operations, tombstones order, terminated by a newline, so the compaction
 // response and the snapshot read can be compared byte-for-byte.
-func writeCRDTSnapshot(w http.ResponseWriter, snapshot store.CRDTSnapshot) {
+func writeCRDTSnapshot(w http.ResponseWriter, snapshot crdt.Snapshot) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(marshalCRDTSnapshot(snapshot))
@@ -101,7 +103,7 @@ func writeCRDTSnapshot(w http.ResponseWriter, snapshot store.CRDTSnapshot) {
 // rather than an escaped blob, and the two counts are non-negative integers.
 // The key order is fixed by construction — not by the encoder's map ordering
 // — so the bytes are stable across every reader.
-func marshalCRDTSnapshot(snapshot store.CRDTSnapshot) []byte {
+func marshalCRDTSnapshot(snapshot crdt.Snapshot) []byte {
 	var buf strings.Builder
 	typeRaw, _ := json.Marshal(snapshot.Type)
 	buf.WriteString(`{"type":`)

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 // compactBody is the exact response body both CRDT snapshot surfaces emit.
@@ -292,7 +292,7 @@ func TestCRDTCompactLeavesChangeLogAlone(t *testing.T) {
 
 func TestCRDTSnapshotPersistsAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
-	s1, err := store.Open(filepath.Join(dir, "sync.db"))
+	s1, err := app.Open(filepath.Join(dir, "sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestCRDTSnapshotPersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(filepath.Join(dir, "sync.db"))
+	s2, err := app.Open(filepath.Join(dir, "sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

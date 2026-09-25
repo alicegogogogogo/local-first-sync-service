@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 )
 
 // upgradeRequest builds a GET with a valid WebSocket handshake for the
@@ -187,7 +187,7 @@ func TestSubscribeCatchUpThenLive(t *testing.T) {
 	}
 	defer conn.close()
 
-	got := []store.ListedChange{conn.readChange(), conn.readChange()}
+	got := []events.ListedChange{conn.readChange(), conn.readChange()}
 	if got[0].Cursor != 2 || got[0].ID != "seed-2" || got[1].Cursor != 3 || got[1].ID != "seed-3" {
 		t.Fatalf("catch-up = %+v", got)
 	}
@@ -518,7 +518,7 @@ func TestSubscribeClientDisconnectReleases(t *testing.T) {
 	// Give the read pump a moment to observe the EOF and unregister.
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := st.PostChanges("doc", []store.Change{
+	if _, err := st.PostChanges("doc", []events.Change{
 		{ID: "later", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":2}`)},
 	}); err != nil {
 		t.Fatalf("commit after disconnect: %v", err)
@@ -642,9 +642,9 @@ func TestSubscribeLargeCatchUp(t *testing.T) {
 	setupSession(t, srv, "dev-1", "sess", "doc", 0)
 
 	const total = 2500
-	batch := make([]store.Change, total)
+	batch := make([]events.Change, total)
 	for i := range batch {
-		batch[i] = store.Change{
+		batch[i] = events.Change{
 			ID:       "b-" + itoa(i+1),
 			DeviceID: "dev-1",
 			Payload:  json.RawMessage(`{"i":` + itoa(i+1) + `}`),

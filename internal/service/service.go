@@ -25,8 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/server"
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
 const (
@@ -107,7 +107,7 @@ func Run(ctx context.Context, opts Options) error {
 			return fmt.Errorf("create data directory %q: %w", dir, err)
 		}
 	}
-	st, err := store.Open(dataPath)
+	st, err := app.Open(dataPath)
 	if err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("open store at %q: %w", dataPath, err)

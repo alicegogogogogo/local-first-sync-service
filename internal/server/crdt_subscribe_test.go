@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 )
 
 // crdtSubscribeURL builds the CRDT state subscription URL.
@@ -21,7 +21,7 @@ func crdtSubscribeURL(srv *httptest.Server, session, doc string) string {
 // readCRDTState reads the next complete text frame, validates the wire format
 // (compact single-line JSON terminated by one newline, keys type then value)
 // and decodes the state. Pongs are skipped; a close frame fails the test.
-func (c *wsClient) readCRDTState() store.CRDTState {
+func (c *wsClient) readCRDTState() crdt.State {
 	c.t.Helper()
 	for {
 		fin, opcode, payload := c.readFrame()
@@ -40,7 +40,7 @@ func (c *wsClient) readCRDTState() store.CRDTState {
 			if strings.Contains(line, ", ") || strings.Contains(line, ": ") {
 				c.t.Fatalf("state frame is not compact JSON: %q", payload)
 			}
-			var state store.CRDTState
+			var state crdt.State
 			if err := json.Unmarshal(payload, &state); err != nil {
 				c.t.Fatalf("text frame is not a crdt state: %s (%v)", payload, err)
 			}
@@ -84,7 +84,7 @@ func postCRDTOps(t *testing.T, srv *httptest.Server, doc string, body map[string
 	return postHTTP(t, srv, "/v1/documents/"+doc+"/crdt/ops", body)
 }
 
-func crdtCounterValue(t *testing.T, state store.CRDTState) int64 {
+func crdtCounterValue(t *testing.T, state crdt.State) int64 {
 	t.Helper()
 	var n int64
 	if err := json.Unmarshal(state.Value, &n); err != nil {
@@ -93,7 +93,7 @@ func crdtCounterValue(t *testing.T, state store.CRDTState) int64 {
 	return n
 }
 
-func crdtSetElements(t *testing.T, state store.CRDTState) []string {
+func crdtSetElements(t *testing.T, state crdt.State) []string {
 	t.Helper()
 	var elements []string
 	if err := json.Unmarshal(state.Value, &elements); err != nil {
@@ -234,7 +234,7 @@ func TestCRDTSubscribeInitialCounterState(t *testing.T) {
 	if string(raw) != stateBody {
 		t.Fatalf("frame %q != state read body %q", raw, stateBody)
 	}
-	var state store.CRDTState
+	var state crdt.State
 	_ = json.Unmarshal(raw, &state)
 	if state.Type != "counter" || crdtCounterValue(t, state) != 5 {
 		t.Fatalf("initial state = %+v", state)
@@ -438,15 +438,15 @@ func TestCRDTSubscribeFanoutAndCommitOrder(t *testing.T) {
 		count := 0
 		c.setReadDeadline(5 * time.Second)
 		for {
-			state, ok := func() (store.CRDTState, bool) {
+			state, ok := func() (crdt.State, bool) {
 				fin, opcode, payload, ok := c.readFrameMaybe()
 				if !ok {
-					return store.CRDTState{}, false
+					return crdt.State{}, false
 				}
 				if opcode != wsOpcodeText || !fin {
 					t.Fatalf("subscriber %d unexpected opcode %d", i, opcode)
 				}
-				var st store.CRDTState
+				var st crdt.State
 				if err := json.Unmarshal(payload, &st); err != nil {
 					t.Fatalf("subscriber %d bad frame %s: %v", i, payload, err)
 				}
@@ -650,7 +650,7 @@ func TestCRDTSubscribePushOnlyAndPingPong(t *testing.T) {
 	if string(state.Value) != "1" {
 		t.Fatalf("state = %s, want 1 (client frame was applied)", state.Value)
 	}
-	results, err := st.SubmitCRDTOps("doc", store.CRDTTypeCounter, []store.CRDTOp{
+	results, err := st.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "forged", DeviceID: "dev-1", Value: json.RawMessage(`99`)},
 	})
 	if err != nil {

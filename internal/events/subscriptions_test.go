@@ -1,10 +1,13 @@
-package store
+package events_test
 
 import (
 	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 	"time"
 )
 
@@ -38,7 +41,7 @@ func assertNoWake(t *testing.T, ch <-chan struct{}, what string) {
 // Every change-producing write path signals a live subscription immediately
 // after commit.
 func TestSubscriptionWakesOnAllCommitPaths(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
 		t.Fatal(err)
@@ -63,7 +66,7 @@ func TestSubscriptionWakesOnAllCommitPaths(t *testing.T) {
 	drainWait(ch)
 
 	// Merge appends a change.
-	if _, err := s.MergeChange("doc", 1, Change{ID: "m1", DeviceID: "dev-1", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "m1", DeviceID: "dev-1", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
 		t.Fatal(err)
 	}
 	waitWake(t, ch, "merge")
@@ -78,7 +81,7 @@ func TestSubscriptionWakesOnAllCommitPaths(t *testing.T) {
 
 	// Replay appends a change and shares the cursor space (cursor 5:
 	// c1=1, c2=2, merge=3, restore=4).
-	results, err := s.ReplayChanges("doc", []Change{
+	results, err := s.ReplayChanges("doc", []events.Change{
 		{ID: "rp1", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":1}`)},
 	})
 	if err != nil {
@@ -102,7 +105,7 @@ func TestSubscriptionWakesOnAllCommitPaths(t *testing.T) {
 // Idempotent writes add no row and do not signal, so a subscription is pushed
 // new changes only.
 func TestSubscriptionIdempotentWritesDoNotWake(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
 		t.Fatal(err)
@@ -120,7 +123,7 @@ func TestSubscriptionIdempotentWritesDoNotWake(t *testing.T) {
 	}
 	assertNoWake(t, ch, "idempotent repost")
 
-	if _, err := s.MergeChange("doc", 1, Change{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":1}`)}); err != nil {
 		t.Fatal(err)
 	}
 	assertNoWake(t, ch, "idempotent merge")
@@ -129,7 +132,7 @@ func TestSubscriptionIdempotentWritesDoNotWake(t *testing.T) {
 // A commit to one document wakes every device subscription on that document
 // and none on another document.
 func TestSubscriptionCommitScopedToDocument(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	chA, _, unregA := s.AddSubscription("docA", "dev-1")
@@ -153,7 +156,7 @@ func TestSubscriptionCommitScopedToDocument(t *testing.T) {
 // A revoke wakes only the one (document, device) pair, not other devices or
 // other documents.
 func TestSubscriptionRevokeScopedToPair(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
 		t.Fatal(err)
@@ -200,7 +203,7 @@ func TestSubscriptionRevokeScopedToPair(t *testing.T) {
 
 // Unregister is idempotent, stops further wakes and lets Close return.
 func TestSubscriptionUnregisterAndClose(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +222,7 @@ func TestSubscriptionUnregisterAndClose(t *testing.T) {
 
 // InterruptWaits/Close wakes every live subscription and Closing reports it.
 func TestSubscriptionWokenByClose(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	ch, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
 
@@ -235,7 +238,7 @@ func TestSubscriptionWokenByClose(t *testing.T) {
 
 // A subscription opened while the store is closing is signaled immediately.
 func TestSubscriptionAddedWhileClosing(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	s.InterruptWaits()
 	ch, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
@@ -244,7 +247,7 @@ func TestSubscriptionAddedWhileClosing(t *testing.T) {
 
 // Many live subscribers all receive the one commit signal concurrently.
 func TestSubscriptionManyConcurrent(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	const n = 50
@@ -263,7 +266,7 @@ func TestSubscriptionManyConcurrent(t *testing.T) {
 		}
 	}()
 
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"i":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -281,7 +284,7 @@ func TestSubscriptionManyConcurrent(t *testing.T) {
 // Subscribing, waking and unsubscribing leave no rows, no cursor advance and
 // no permission deviation.
 func TestSubscriptionWritesNothing(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
 		t.Fatal(err)

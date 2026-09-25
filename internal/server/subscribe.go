@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -45,7 +46,7 @@ const wsCloseEchoWait = 500 * time.Millisecond
 // code 4403 and no further frame follows; a termination signal ends every
 // subscription with 1001. A client disconnect simply unregisters — like long
 // polling, a subscription writes no change, cursor or other record.
-func handleSubscribe(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleSubscribe(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
 
@@ -114,7 +115,7 @@ func parseSubscribeCursor(w http.ResponseWriter, r *http.Request) (int64, bool) 
 // authorized when it landed is still delivered ahead of the 4403. The method
 // returns when the client leaves, permission is revoked or the store starts
 // closing; the hijacked connection is closed on exit.
-func serveSubscription(r *http.Request, s *store.Store, conn *wsConn, documentID, deviceID string, cursor int64) {
+func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, deviceID string, cursor int64) {
 	// Registration precedes the first read: the wake channel is buffered, so
 	// a commit during a read leaves a pending wake that makes the next park
 	// return immediately — no wake is lost. The revoked channel closes once

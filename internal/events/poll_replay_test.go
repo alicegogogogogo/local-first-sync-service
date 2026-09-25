@@ -1,4 +1,4 @@
-package store
+package events_test
 
 import (
 	"context"
@@ -8,18 +8,22 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 	"time"
 )
 
 // waitResult captures one WaitForChanges outcome for the goroutine tests.
 type waitResult struct {
-	changes  []ListedChange
+	changes  []events.ListedChange
 	next     int64
 	timedOut bool
 	err      error
 }
 
-func waitInBackground(ctx context.Context, s *Store, doc string, after, limit int64, wait time.Duration) <-chan waitResult {
+func waitInBackground(ctx context.Context, s *app.App, doc string, after, limit int64, wait time.Duration) <-chan waitResult {
 	ch := make(chan waitResult, 1)
 	go func() {
 		changes, next, timedOut, err := s.WaitForChanges(ctx, doc, after, limit, wait)
@@ -29,7 +33,7 @@ func waitInBackground(ctx context.Context, s *Store, doc string, after, limit in
 }
 
 func TestPollReturnsExistingRowsImmediately(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
 		t.Fatal(err)
@@ -50,7 +54,7 @@ func TestPollReturnsExistingRowsImmediately(t *testing.T) {
 }
 
 func TestPollUnknownDocumentReturnsImmediately(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	// A long wait must return at once for a document that has no rows.
@@ -69,7 +73,7 @@ func TestPollUnknownDocumentReturnsImmediately(t *testing.T) {
 }
 
 func TestPollWakesOnNewCommit(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
@@ -105,7 +109,7 @@ func TestPollWakesOnNewCommit(t *testing.T) {
 }
 
 func TestPollWakesOnMergeAndRestore(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
@@ -116,7 +120,7 @@ func TestPollWakesOnMergeAndRestore(t *testing.T) {
 	}
 
 	ch := waitInBackground(context.Background(), s, "doc", 1, 100, 5*time.Second)
-	if _, err := s.MergeChange("doc", 1, Change{ID: "m1", DeviceID: "dev-1", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "m1", DeviceID: "dev-1", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -143,7 +147,7 @@ func TestPollWakesOnMergeAndRestore(t *testing.T) {
 }
 
 func TestPollTimeoutEchoesCursor(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
 		t.Fatal(err)
@@ -163,7 +167,7 @@ func TestPollTimeoutEchoesCursor(t *testing.T) {
 }
 
 func TestPollZeroWaitOnCaughtUpDocument(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
@@ -179,7 +183,7 @@ func TestPollZeroWaitOnCaughtUpDocument(t *testing.T) {
 }
 
 func TestPollCanceledByClient(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
@@ -206,7 +210,7 @@ func TestPollCanceledByClient(t *testing.T) {
 }
 
 func TestPollWokenByStoreClose(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
 	}
@@ -219,8 +223,8 @@ func TestPollWokenByStoreClose(t *testing.T) {
 
 	select {
 	case res := <-ch:
-		if !errors.Is(res.err, ErrStoreClosing) {
-			t.Fatalf("err = %v, want ErrStoreClosing", res.err)
+		if !errors.Is(res.err, events.ErrStoreClosing) {
+			t.Fatalf("err = %v, want events.ErrStoreClosing", res.err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("close did not wake the poll")
@@ -228,20 +232,20 @@ func TestPollWokenByStoreClose(t *testing.T) {
 }
 
 func TestReplayNewBatchSharesCursorSpace(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
 	}
 
 	// One ordinary commit first: replay must continue the cursor sequence.
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "p1", DeviceID: "dev", Payload: json.RawMessage(`{"n":0}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	results, err := s.ReplayChanges("doc", []Change{
+	results, err := s.ReplayChanges("doc", []events.Change{
 		{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"n":1}`)},
 		{ID: "r2", DeviceID: "dev", Payload: json.RawMessage(`{"n":2}`)},
 	})
@@ -259,7 +263,7 @@ func TestReplayNewBatchSharesCursorSpace(t *testing.T) {
 	}
 
 	// Repeating the same batch is idempotent: no new cursors, original ones.
-	again, err := s.ReplayChanges("doc", []Change{
+	again, err := s.ReplayChanges("doc", []events.Change{
 		{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{ "n": 1 }`)},
 		{ID: "r2", DeviceID: "dev", Payload: json.RawMessage(`{"n":2.0}`)},
 	})
@@ -280,31 +284,31 @@ func TestReplayNewBatchSharesCursorSpace(t *testing.T) {
 }
 
 func TestReplayUnknownDeviceAndRevoked(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "p1", DeviceID: "dev", Payload: json.RawMessage(`{"n":0}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	ops := []Change{{ID: "r1", DeviceID: "stranger", Payload: json.RawMessage(`{"n":1}`)}}
+	ops := []events.Change{{ID: "r1", DeviceID: "stranger", Payload: json.RawMessage(`{"n":1}`)}}
 
 	// Unregistered device: 404-class error, zero writes.
-	if _, err := s.ReplayChanges("doc", ops); !errors.Is(err, ErrDeviceNotFound) {
-		t.Fatalf("err = %v, want ErrDeviceNotFound", err)
+	if _, err := s.ReplayChanges("doc", ops); !errors.Is(err, store.ErrDeviceNotFound) {
+		t.Fatalf("err = %v, want store.ErrDeviceNotFound", err)
 	}
 
 	// Revoke the registered device's permission: 403-class error, zero writes.
 	if _, err := s.SetDocumentPermission("doc", "dev", false); err != nil {
 		t.Fatal(err)
 	}
-	revoked := []Change{{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"n":1}`)}}
-	if _, err := s.ReplayChanges("doc", revoked); !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("err = %v, want ErrPermissionDenied", err)
+	revoked := []events.Change{{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"n":1}`)}}
+	if _, err := s.ReplayChanges("doc", revoked); !errors.Is(err, store.ErrPermissionDenied) {
+		t.Fatalf("err = %v, want store.ErrPermissionDenied", err)
 	}
 
 	// Neither rejected replay wrote anything.
@@ -327,7 +331,7 @@ func TestReplayUnknownDeviceAndRevoked(t *testing.T) {
 }
 
 func TestReplayConflictAndBatchZeroWrite(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
@@ -335,20 +339,20 @@ func TestReplayConflictAndBatchZeroWrite(t *testing.T) {
 	if _, err := s.RegisterDevice("other"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"v":1}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	batch := []Change{
+	batch := []events.Change{
 		{ID: "new1", DeviceID: "dev", Payload: json.RawMessage(`{"v":2}`)},
 		{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"v":99}`)},
 	}
 	_, err := s.ReplayChanges("doc", batch)
-	var conflict *ErrConflict
+	var conflict *events.ErrConflict
 	if !errors.As(err, &conflict) || conflict.ID != "x" {
-		t.Fatalf("err = %v, want ErrConflict{x}", err)
+		t.Fatalf("err = %v, want events.ErrConflict{x}", err)
 	}
 
 	// The whole batch aborted, including the otherwise-new id.
@@ -358,7 +362,7 @@ func TestReplayConflictAndBatchZeroWrite(t *testing.T) {
 	}
 
 	// A device mismatch on the existing id is likewise a conflict.
-	_, err = s.ReplayChanges("doc", []Change{
+	_, err = s.ReplayChanges("doc", []events.Change{
 		{ID: "x", DeviceID: "other", Payload: json.RawMessage(`{"v":1}`)},
 	})
 	if !errors.As(err, &conflict) {
@@ -367,7 +371,7 @@ func TestReplayConflictAndBatchZeroWrite(t *testing.T) {
 }
 
 func TestReplayConcurrentCursorsContiguous(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
@@ -381,9 +385,9 @@ func TestReplayConcurrentCursorsContiguous(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			ops := make([]Change, 0, perWriter)
+			ops := make([]events.Change, 0, perWriter)
 			for i := 0; i < perWriter; i++ {
-				ops = append(ops, Change{
+				ops = append(ops, events.Change{
 					ID:       fmt.Sprintf("w%02d-o%02d", w, i),
 					DeviceID: "dev",
 					Payload:  json.RawMessage(fmt.Sprintf(`{"w":%d,"i":%d}`, w, i)),
@@ -424,14 +428,14 @@ func TestReplayConcurrentCursorsContiguous(t *testing.T) {
 func TestReplayPersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ReplayChanges("doc", []Change{
+	if _, err := s.ReplayChanges("doc", []events.Change{
 		{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"v":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -440,14 +444,14 @@ func TestReplayPersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s2.Close() }()
 
 	// Identical replay is still idempotent with the first cursor.
-	results, err := s2.ReplayChanges("doc", []Change{
+	results, err := s2.ReplayChanges("doc", []events.Change{
 		{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"v":1.0}`)},
 	})
 	if err != nil {
@@ -458,7 +462,7 @@ func TestReplayPersistsAcrossRestart(t *testing.T) {
 	}
 
 	// A differing payload is still a conflict after restart.
-	if _, err := s2.ReplayChanges("doc", []Change{
+	if _, err := s2.ReplayChanges("doc", []events.Change{
 		{ID: "r1", DeviceID: "dev", Payload: json.RawMessage(`{"v":2}`)},
 	}); err == nil {
 		t.Fatal("conflict expected after restart")
@@ -471,14 +475,14 @@ func TestReplayPersistsAcrossRestart(t *testing.T) {
 	if err := s2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s3, err := Open(path)
+	s3, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s3.Close() }()
-	if _, err := s3.ReplayChanges("doc", []Change{
+	if _, err := s3.ReplayChanges("doc", []events.Change{
 		{ID: "r2", DeviceID: "dev", Payload: json.RawMessage(`{"v":3}`)},
-	}); !errors.Is(err, ErrPermissionDenied) {
+	}); !errors.Is(err, store.ErrPermissionDenied) {
 		t.Fatalf("revocation did not survive restart: %v", err)
 	}
 }

@@ -6,12 +6,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 func newGatedHandler(t *testing.T, isReady func() bool) http.Handler {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	s, err := app.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

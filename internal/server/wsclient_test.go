@@ -18,7 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 )
 
 // wsClient is a minimal raw RFC 6455 client used to drive the subscription
@@ -184,7 +185,7 @@ func (c *wsClient) readFrameMaybe() (fin bool, opcode byte, payload []byte, ok b
 
 // readChange reads the next complete text message and decodes one change row.
 // The server only ever sends whole (FIN) text frames; pongs are skipped.
-func (c *wsClient) readChange() store.ListedChange {
+func (c *wsClient) readChange() events.ListedChange {
 	c.t.Helper()
 	for {
 		fin, opcode, payload := c.readFrame()
@@ -193,7 +194,7 @@ func (c *wsClient) readChange() store.ListedChange {
 			if !fin {
 				c.t.Fatal("server sent a fragmented text frame")
 			}
-			var change store.ListedChange
+			var change events.ListedChange
 			if err := json.Unmarshal(payload, &change); err != nil {
 				c.t.Fatalf("text frame is not a change row: %s (%v)", payload, err)
 			}
@@ -273,9 +274,9 @@ func (c *wsClient) close() { _ = c.conn.Close() }
 
 // --- fixtures ---------------------------------------------------------------
 
-func newWSTestServer(t *testing.T) (*httptest.Server, *store.Store) {
+func newWSTestServer(t *testing.T) (*httptest.Server, *app.App) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "ws.db"))
+	st, err := app.Open(filepath.Join(t.TempDir(), "ws.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

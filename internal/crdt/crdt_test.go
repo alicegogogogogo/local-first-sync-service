@@ -1,4 +1,4 @@
-package store
+package crdt_test
 
 import (
 	"encoding/json"
@@ -7,13 +7,17 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
 func rawInt(n int64) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf("%d", n))
 }
 
-func registerDevices(t *testing.T, s *Store, devices ...string) {
+func registerDevices(t *testing.T, s *app.App, devices ...string) {
 	t.Helper()
 	for _, d := range devices {
 		if _, err := s.RegisterDevice(d); err != nil {
@@ -22,31 +26,31 @@ func registerDevices(t *testing.T, s *Store, devices ...string) {
 	}
 }
 
-func counterOps(device string, vals ...int64) []CRDTOp {
-	ops := make([]CRDTOp, len(vals))
+func counterOps(device string, vals ...int64) []crdt.Op {
+	ops := make([]crdt.Op, len(vals))
 	for i, v := range vals {
-		ops[i] = CRDTOp{ID: fmt.Sprintf("%s-op-%d", device, i+1), DeviceID: device, Value: rawInt(v)}
+		ops[i] = crdt.Op{ID: fmt.Sprintf("%s-op-%d", device, i+1), DeviceID: device, Value: rawInt(v)}
 	}
 	return ops
 }
 
 func TestCRDTNotFoundBeforeAnyOp(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	if _, err := s.GetCRDTState("doc"); !errors.Is(err, ErrCRDTNotFound) {
-		t.Fatalf("empty state err = %v, want ErrCRDTNotFound", err)
+	if _, err := s.GetCRDTState("doc"); !errors.Is(err, crdt.ErrNotFound) {
+		t.Fatalf("empty state err = %v, want crdt.ErrNotFound", err)
 	}
 }
 
 func TestCRDTCounterMergeIsSumOfPerDeviceMaxima(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2", "dev-3")
 
 	submit := func(device string, val int64, id string) {
 		t.Helper()
-		results, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+		results, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 			{ID: id, DeviceID: device, Value: rawInt(val)},
 		})
 		if err != nil {
@@ -68,7 +72,7 @@ func TestCRDTCounterMergeIsSumOfPerDeviceMaxima(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Type != CRDTTypeCounter {
+	if state.Type != crdt.TypeCounter {
 		t.Fatalf("type = %q", state.Type)
 	}
 	if string(state.Value) != "11" { // 9 + 2 + 0
@@ -77,20 +81,20 @@ func TestCRDTCounterMergeIsSumOfPerDeviceMaxima(t *testing.T) {
 }
 
 func TestCRDTCounterRejectsRegression(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 5)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 5)); err != nil {
 		t.Fatal(err)
 	}
 	// A regression is a 409 conflict and leaves the state untouched.
-	_, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "dev-1-op-regress", DeviceID: "dev-1", Value: rawInt(4)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("regression err = %v, want *ErrCRDTConflict", err)
+		t.Fatalf("regression err = %v, want *crdt.ErrConflict", err)
 	}
 	state, _ := s.GetCRDTState("doc")
 	if string(state.Value) != "5" {
@@ -98,7 +102,7 @@ func TestCRDTCounterRejectsRegression(t *testing.T) {
 	}
 
 	// Another device advancing must not be blocked by the rejected batch.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-2", 7)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-2", 7)); err != nil {
 		t.Fatal(err)
 	}
 	state, _ = s.GetCRDTState("doc")
@@ -108,36 +112,36 @@ func TestCRDTCounterRejectsRegression(t *testing.T) {
 }
 
 func TestCRDTTypeIsFixedOnFirstBatch(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 1)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 1)); err != nil {
 		t.Fatal(err)
 	}
 	// Declaring the other type later is a conflict, even from another device.
-	_, err := s.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+	_, err := s.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-2", Elements: []string{"x"}},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
-		t.Fatalf("type change err = %v, want *ErrCRDTConflict", err)
+		t.Fatalf("type change err = %v, want *crdt.ErrConflict", err)
 	}
 	if conflict.ID != "" {
 		t.Fatalf("document-level conflict should carry no op id, got %q", conflict.ID)
 	}
 	// Re-declaring the fixed type still works.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-2", 3)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-2", 3)); err != nil {
 		t.Fatalf("same-type submit: %v", err)
 	}
 	state, _ := s.GetCRDTState("doc")
-	if state.Type != CRDTTypeCounter || string(state.Value) != "4" {
+	if state.Type != crdt.TypeCounter || string(state.Value) != "4" {
 		t.Fatalf("state = %s %s", state.Type, state.Value)
 	}
 }
 
 func TestCRDTConcurrentTypeDeclarationExactlyOneWins(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
@@ -150,7 +154,7 @@ func TestCRDTConcurrentTypeDeclarationExactlyOneWins(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, err := s.SubmitCRDTOps("race", CRDTTypeCounter, []CRDTOp{
+			_, err := s.SubmitCRDTOps("race", crdt.TypeCounter, []crdt.Op{
 				{ID: fmt.Sprintf("c-%d", i), DeviceID: "dev-1", Value: rawInt(int64(i + 1))},
 			})
 			if err == nil {
@@ -160,7 +164,7 @@ func TestCRDTConcurrentTypeDeclarationExactlyOneWins(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, err := s.SubmitCRDTOps("race", CRDTTypeGSet, []CRDTOp{
+			_, err := s.SubmitCRDTOps("race", crdt.TypeGSet, []crdt.Op{
 				{ID: fmt.Sprintf("g-%d", i), DeviceID: "dev-2", Elements: []string{fmt.Sprintf("e%d", i)}},
 			})
 			if err == nil {
@@ -189,22 +193,22 @@ func TestCRDTConcurrentTypeDeclarationExactlyOneWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if counts["counter"] > 0 && state.Type != CRDTTypeCounter {
+	if counts["counter"] > 0 && state.Type != crdt.TypeCounter {
 		t.Fatalf("counter won but state type = %q", state.Type)
 	}
-	if counts["gset"] > 0 && state.Type != CRDTTypeGSet {
+	if counts["gset"] > 0 && state.Type != crdt.TypeGSet {
 		t.Fatalf("gset won but state type = %q", state.Type)
 	}
 }
 
 func TestCRDTGSetUnionSortedAndIdempotent(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	submit := func(device, id string, elements ...string) []CRDTResult {
+	submit := func(device, id string, elements ...string) []crdt.Result {
 		t.Helper()
-		results, err := s.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+		results, err := s.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 			{ID: id, DeviceID: device, Elements: elements},
 		})
 		if err != nil {
@@ -225,7 +229,7 @@ func TestCRDTGSetUnionSortedAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Type != CRDTTypeGSet {
+	if state.Type != crdt.TypeGSet {
 		t.Fatalf("type = %q", state.Type)
 	}
 	var got []string
@@ -244,14 +248,14 @@ func TestCRDTGSetUnionSortedAndIdempotent(t *testing.T) {
 }
 
 func TestCRDTGSetEmptyStateIsEmptyArray(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
 	// A first batch always adds at least one element at the API boundary; at
 	// the store layer the document exists once a batch lands, and the union is
 	// presented as [] rather than null when nothing remains.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-1", Elements: []string{"only"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -264,16 +268,16 @@ func TestCRDTGSetEmptyStateIsEmptyArray(t *testing.T) {
 }
 
 func TestCRDTOpIdempotencyAndConflict(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	op := []CRDTOp{{ID: "same-id", DeviceID: "dev-1", Value: rawInt(5)}}
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, op); err != nil {
+	op := []crdt.Op{{ID: "same-id", DeviceID: "dev-1", Value: rawInt(5)}}
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, op); err != nil {
 		t.Fatal(err)
 	}
 	// Identical repeat is idempotent.
-	results, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, op)
+	results, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, op)
 	if err != nil {
 		t.Fatalf("identical repeat: %v", err)
 	}
@@ -281,15 +285,15 @@ func TestCRDTOpIdempotencyAndConflict(t *testing.T) {
 		t.Fatal("identical repeat must report created=false")
 	}
 	// Same id, different value -> 409, state unchanged.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "same-id", DeviceID: "dev-1", Value: rawInt(6)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) || conflict.ID != "same-id" {
 		t.Fatalf("different value err = %v", err)
 	}
 	// Same id, different device -> 409.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "same-id", DeviceID: "dev-2", Value: rawInt(5)},
 	})
 	if !errors.As(err, &conflict) {
@@ -302,34 +306,34 @@ func TestCRDTOpIdempotencyAndConflict(t *testing.T) {
 }
 
 func TestCRDTPermissionAndRegistrationGating(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
 	// Unregistered device is 404 even with no document state.
-	_, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "x", DeviceID: "ghost", Value: rawInt(1)},
 	})
-	if !errors.Is(err, ErrDeviceNotFound) {
-		t.Fatalf("unregistered err = %v, want ErrDeviceNotFound", err)
+	if !errors.Is(err, store.ErrDeviceNotFound) {
+		t.Fatalf("unregistered err = %v, want store.ErrDeviceNotFound", err)
 	}
 
 	// Establish state with dev-1.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 1)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 1)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.SetDocumentPermission("doc", "dev-2", false); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-2", 2))
-	if !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("revoked err = %v, want ErrPermissionDenied", err)
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-2", 2))
+	if !errors.Is(err, store.ErrPermissionDenied) {
+		t.Fatalf("revoked err = %v, want store.ErrPermissionDenied", err)
 	}
 	// Re-grant restores the ability to submit.
 	if _, err := s.SetDocumentPermission("doc", "dev-2", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-2", 2)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-2", 2)); err != nil {
 		t.Fatalf("after grant: %v", err)
 	}
 	state, _ := s.GetCRDTState("doc")
@@ -339,7 +343,7 @@ func TestCRDTPermissionAndRegistrationGating(t *testing.T) {
 }
 
 func TestCRDTConcurrentCountersConverge(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	devices := make([]string, 8)
 	for i := range devices {
@@ -358,7 +362,7 @@ func TestCRDTConcurrentCountersConverge(t *testing.T) {
 			go func(device string, r int) {
 				defer wg.Done()
 				<-start
-				_, _ = s.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+				_, _ = s.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 					{ID: fmt.Sprintf("%s-%d", device, r), DeviceID: device, Value: rawInt(int64(r + 1))},
 				})
 			}(d, r)
@@ -380,12 +384,12 @@ func TestCRDTConcurrentCountersConverge(t *testing.T) {
 func TestCRDTPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registerDevices(t, s, "dev-1", "dev-2")
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-1", Elements: []string{"b", "a"}},
 	}); err != nil {
 		t.Fatal(err)
@@ -394,7 +398,7 @@ func TestCRDTPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,19 +408,19 @@ func TestCRDTPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Type != CRDTTypeGSet || string(state.Value) != `["a","b"]` {
+	if state.Type != crdt.TypeGSet || string(state.Value) != `["a","b"]` {
 		t.Fatalf("state after restart = %s %s", state.Type, state.Value)
 	}
 	// Type fixation survives: declaring a counter now is a 409.
-	_, err = s2.SubmitCRDTOps("doc", CRDTTypeCounter, []CRDTOp{
+	_, err = s2.SubmitCRDTOps("doc", crdt.TypeCounter, []crdt.Op{
 		{ID: "c1", DeviceID: "dev-2", Value: rawInt(1)},
 	})
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	if !errors.As(err, &conflict) {
 		t.Fatalf("type change after restart err = %v", err)
 	}
 	// Idempotency decisions survive as well.
-	results, err := s2.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+	results, err := s2.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-1", Elements: []string{"a", "b"}},
 	})
 	if err != nil || results[0].Created {
@@ -425,11 +429,11 @@ func TestCRDTPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestCRDTIsIndependentOfChangeLog(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 4)); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 4)); err != nil {
 		t.Fatal(err)
 	}
 	// The change log is untouched: the document is unknown to it.
@@ -446,18 +450,18 @@ func TestCRDTIsIndependentOfChangeLog(t *testing.T) {
 	}
 }
 
-func registerOp(id, device string, version int64, value string) CRDTOp {
-	return CRDTOp{ID: id, DeviceID: device, Version: version, Value: json.RawMessage(value)}
+func registerOp(id, device string, version int64, value string) crdt.Op {
+	return crdt.Op{ID: id, DeviceID: device, Version: version, Value: json.RawMessage(value)}
 }
 
 func TestCRDTRegisterLastWriterWins(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2", "dev-3")
 
-	submit := func(op CRDTOp) {
+	submit := func(op crdt.Op) {
 		t.Helper()
-		results, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{op})
+		results, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{op})
 		if err != nil {
 			t.Fatalf("submit %s: %v", op.ID, err)
 		}
@@ -471,7 +475,7 @@ func TestCRDTRegisterLastWriterWins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if st.Type != CRDTTypeRegister {
+		if st.Type != crdt.TypeRegister {
 			t.Fatalf("type = %q", st.Type)
 		}
 		return string(st.Value)
@@ -493,18 +497,18 @@ func TestCRDTRegisterLastWriterWins(t *testing.T) {
 }
 
 func TestCRDTRegisterVersionTieBreaksBySmallerID(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
 	// Same version from two devices: the lexicographically smaller op id wins,
 	// independent of arrival order.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("z-op", "dev-1", 4, `"from-z"`),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("a-op", "dev-2", 4, `"from-a"`),
 	}); err != nil {
 		t.Fatal(err)
@@ -519,30 +523,30 @@ func TestCRDTRegisterVersionTieBreaksBySmallerID(t *testing.T) {
 }
 
 func TestCRDTRegisterRejectsVersionRegressionAndStall(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("a1", "dev-1", 5, `"five"`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	// A lower version from the same device is a 409.
-	_, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("a2", "dev-1", 4, `"four"`),
 	})
 	if !errors.As(err, &conflict) || conflict.ID != "a2" {
-		t.Fatalf("regression err = %v, want *ErrCRDTConflict for a2", err)
+		t.Fatalf("regression err = %v, want *crdt.ErrConflict for a2", err)
 	}
 	// An equal version (a stall) is a 409 too, even with a fresh id.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("a3", "dev-1", 5, `"five-again"`),
 	})
 	if !errors.As(err, &conflict) || conflict.ID != "a3" {
-		t.Fatalf("stall err = %v, want *ErrCRDTConflict for a3", err)
+		t.Fatalf("stall err = %v, want *crdt.ErrConflict for a3", err)
 	}
 	// Both rejections leave the state untouched.
 	state, _ := s.GetCRDTState("doc")
@@ -551,13 +555,13 @@ func TestCRDTRegisterRejectsVersionRegressionAndStall(t *testing.T) {
 	}
 
 	// Another device is unaffected by dev-1's rejected batches.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("b1", "dev-2", 6, `"six"`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// And dev-1 can still move strictly forward.
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("a4", "dev-1", 7, `"seven"`),
 	}); err != nil {
 		t.Fatal(err)
@@ -569,16 +573,16 @@ func TestCRDTRegisterRejectsVersionRegressionAndStall(t *testing.T) {
 }
 
 func TestCRDTRegisterIdempotencyAndConflict(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1", "dev-2")
 
 	op := registerOp("same-id", "dev-1", 3, `{"k":1}`)
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{op}); err != nil {
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{op}); err != nil {
 		t.Fatal(err)
 	}
 	// Identical repeat (device, version and value) is idempotent.
-	results, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{op})
+	results, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{op})
 	if err != nil {
 		t.Fatalf("identical repeat: %v", err)
 	}
@@ -586,23 +590,23 @@ func TestCRDTRegisterIdempotencyAndConflict(t *testing.T) {
 		t.Fatal("identical repeat must report created=false")
 	}
 
-	var conflict *ErrCRDTConflict
+	var conflict *crdt.ErrConflict
 	// Same id, different value -> 409.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("same-id", "dev-1", 3, `{"k":2}`),
 	})
 	if !errors.As(err, &conflict) || conflict.ID != "same-id" {
 		t.Fatalf("different value err = %v", err)
 	}
 	// Same id, different version -> 409.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("same-id", "dev-1", 4, `{"k":1}`),
 	})
 	if !errors.As(err, &conflict) {
 		t.Fatalf("different version err = %v", err)
 	}
 	// Same id, different device -> 409.
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("same-id", "dev-2", 3, `{"k":1}`),
 	})
 	if !errors.As(err, &conflict) {
@@ -615,7 +619,7 @@ func TestCRDTRegisterIdempotencyAndConflict(t *testing.T) {
 }
 
 func TestCRDTRegisterValueShapes(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
@@ -628,7 +632,7 @@ func TestCRDTRegisterValueShapes(t *testing.T) {
 		`{"nested":{"ok":true},"list":[1,2]}`,
 	}
 	for i, v := range values {
-		if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+		if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 			registerOp(fmt.Sprintf("op-%d", i), "dev-1", int64(i+1), v),
 		}); err != nil {
 			t.Fatalf("submit %s: %v", v, err)
@@ -644,32 +648,32 @@ func TestCRDTRegisterValueShapes(t *testing.T) {
 }
 
 func TestCRDTRegisterTypeFixation(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r1", "dev-1", 1, `1`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// Declaring counter or gset afterwards is a 409.
-	var conflict *ErrCRDTConflict
-	_, err := s.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 1))
+	var conflict *crdt.ErrConflict
+	_, err := s.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 1))
 	if !errors.As(err, &conflict) {
 		t.Fatalf("counter after register err = %v", err)
 	}
-	_, err = s.SubmitCRDTOps("doc", CRDTTypeGSet, []CRDTOp{
+	_, err = s.SubmitCRDTOps("doc", crdt.TypeGSet, []crdt.Op{
 		{ID: "g1", DeviceID: "dev-1", Elements: []string{"x"}},
 	})
 	if !errors.As(err, &conflict) {
 		t.Fatalf("gset after register err = %v", err)
 	}
 	// And a register declared after a counter is likewise a 409.
-	if _, err := s.SubmitCRDTOps("other", CRDTTypeCounter, counterOps("dev-1", 1)); err != nil {
+	if _, err := s.SubmitCRDTOps("other", crdt.TypeCounter, counterOps("dev-1", 1)); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.SubmitCRDTOps("other", CRDTTypeRegister, []CRDTOp{
+	_, err = s.SubmitCRDTOps("other", crdt.TypeRegister, []crdt.Op{
 		registerOp("r1", "dev-1", 1, `1`),
 	})
 	if !errors.As(err, &conflict) {
@@ -680,17 +684,17 @@ func TestCRDTRegisterTypeFixation(t *testing.T) {
 func TestCRDTRegisterPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	registerDevices(t, s, "dev-1", "dev-2")
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r1", "dev-1", 3, `{"a":1}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r2", "dev-2", 5, `"winner"`),
 	}); err != nil {
 		t.Fatal(err)
@@ -699,7 +703,7 @@ func TestCRDTRegisterPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -709,37 +713,37 @@ func TestCRDTRegisterPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Type != CRDTTypeRegister || string(state.Value) != `"winner"` {
+	if state.Type != crdt.TypeRegister || string(state.Value) != `"winner"` {
 		t.Fatalf("state after restart = %s %s", state.Type, state.Value)
 	}
 	// Idempotency decisions survive the restart.
-	results, err := s2.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	results, err := s2.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r2", "dev-2", 5, `"winner"`),
 	})
 	if err != nil || results[0].Created {
 		t.Fatalf("idempotent replay after restart = created:%v err:%v", results[0].Created, err)
 	}
 	// The per-device version clock survives: a stalled version is still a 409.
-	var conflict *ErrCRDTConflict
-	_, err = s2.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	var conflict *crdt.ErrConflict
+	_, err = s2.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r3", "dev-1", 3, `"stall"`),
 	})
 	if !errors.As(err, &conflict) {
 		t.Fatalf("stalled version after restart err = %v", err)
 	}
 	// Type fixation survives as well.
-	_, err = s2.SubmitCRDTOps("doc", CRDTTypeCounter, counterOps("dev-1", 1))
+	_, err = s2.SubmitCRDTOps("doc", crdt.TypeCounter, counterOps("dev-1", 1))
 	if !errors.As(err, &conflict) {
 		t.Fatalf("type change after restart err = %v", err)
 	}
 }
 
 func TestCRDTRegisterIsIndependentOfChangeLog(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	registerDevices(t, s, "dev-1")
 
-	if _, err := s.SubmitCRDTOps("doc", CRDTTypeRegister, []CRDTOp{
+	if _, err := s.SubmitCRDTOps("doc", crdt.TypeRegister, []crdt.Op{
 		registerOp("r1", "dev-1", 1, `"v"`),
 	}); err != nil {
 		t.Fatal(err)

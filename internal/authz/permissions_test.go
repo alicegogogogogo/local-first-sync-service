@@ -1,19 +1,22 @@
-package store
+package authz_test
 
 import (
 	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
 func TestSetDocumentPermissionLifecycle(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	// Unknown device -> ErrDeviceNotFound, nothing written.
-	if _, err := s.SetDocumentPermission("doc", "ghost", false); !errors.Is(err, ErrDeviceNotFound) {
-		t.Fatalf("unknown device err = %v, want ErrDeviceNotFound", err)
+	// Unknown device -> store.ErrDeviceNotFound, nothing written.
+	if _, err := s.SetDocumentPermission("doc", "ghost", false); !errors.Is(err, store.ErrDeviceNotFound) {
+		t.Fatalf("unknown device err = %v, want store.ErrDeviceNotFound", err)
 	}
 
 	if _, err := s.RegisterDevice("dev-1"); err != nil {
@@ -74,7 +77,7 @@ func TestSetDocumentPermissionLifecycle(t *testing.T) {
 func TestSetDocumentPermissionPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +92,7 @@ func TestSetDocumentPermissionPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +113,7 @@ func TestSetDocumentPermissionPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestConcurrentSetDocumentPermission(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)

@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 )
 
 func pollPage(t *testing.T, h http.Handler, url string) (*httptest.ResponseRecorder, map[string]any) {
@@ -328,7 +329,7 @@ func TestReplayRejectsBadInput(t *testing.T) {
 	if _, err := s.RegisterDevice("dev"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PostChanges("doc", []store.Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "existing", DeviceID: "dev", Payload: json.RawMessage(`{"v":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -524,7 +525,7 @@ func TestReplayConcurrentWithPosts(t *testing.T) {
 
 func TestReplayPersistsAcrossRestartHTTP(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
-	s, err := store.Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +546,7 @@ func TestReplayPersistsAcrossRestartHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

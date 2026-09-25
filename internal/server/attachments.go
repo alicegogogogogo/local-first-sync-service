@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -27,7 +28,7 @@ type attachmentRequest struct {
 // and writes nothing; an unregistered device is a 404; an id already taken —
 // by another device, or by this device with different metadata — is a 409
 // that leaves the original record untouched.
-func handleCreateAttachment(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCreateAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
 
 	var req attachmentRequest
@@ -84,7 +85,7 @@ func handleCreateAttachment(s *store.Store, w http.ResponseWriter, r *http.Reque
 // the same index are a 409 and the first content is kept. Once the upload is
 // finished it is sealed: every further chunk write, even a byte-identical
 // one, is a 409 and the stored content is unchanged.
-func handlePutChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handlePutChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
 
@@ -138,7 +139,7 @@ func handlePutChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // attachment already holds the same digest and size, the content is reused
 // without copying bytes (reused=true); the same digest at a different size is
 // a 409. A successful or repeated finish returns the same recorded result.
-func handleCompleteAttachment(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCompleteAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
 
@@ -167,7 +168,7 @@ func handleCompleteAttachment(s *store.Store, w http.ResponseWriter, r *http.Req
 // handleGetAttachment returns the creator's view of an upload: the original
 // metadata, the sorted indices received so far and the completion status. A
 // non-creator device gets a 403, an unknown attachment a 404.
-func handleGetAttachment(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleGetAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
 
@@ -198,7 +199,7 @@ func handleGetAttachment(s *store.Store, w http.ResponseWriter, r *http.Request)
 // identifier is rejected by the path guard; an illegal index is a 400; an
 // unknown attachment or a chunk that never arrived is a 404; a non-creator
 // device is a 403.
-func handleGetChunk(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
 

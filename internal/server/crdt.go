@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -44,7 +46,7 @@ type crdtOpsRequest struct {
 // array; register: any JSON value — null included — plus a non-negative
 // integer version; orset: action "add" or "remove" plus a non-empty string
 // element). Any violation is a 400 with zero writes.
-func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	var req crdtOpsRequest
@@ -55,7 +57,7 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
 		return
 	}
-	if req.Type != store.CRDTTypeCounter && req.Type != store.CRDTTypeGSet && req.Type != store.CRDTTypeRegister && req.Type != store.CRDTTypeORSet {
+	if req.Type != crdt.TypeCounter && req.Type != crdt.TypeGSet && req.Type != crdt.TypeRegister && req.Type != crdt.TypeORSet {
 		writeError(w, http.StatusBadRequest, `type must be "counter", "gset", "register" or "orset"`)
 		return
 	}
@@ -64,7 +66,7 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ops := make([]store.CRDTOp, len(req.Ops))
+	ops := make([]crdt.Op, len(req.Ops))
 	seen := make(map[string]struct{}, len(req.Ops))
 	for i, op := range req.Ops {
 		if op.ID == "" {
@@ -77,9 +79,9 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		}
 		seen[op.ID] = struct{}{}
 
-		crdtOp := store.CRDTOp{ID: op.ID, DeviceID: req.DeviceID}
+		crdtOp := crdt.Op{ID: op.ID, DeviceID: req.DeviceID}
 		switch req.Type {
-		case store.CRDTTypeCounter:
+		case crdt.TypeCounter:
 			v, ok := parseNonNegativeInt(op.Value)
 			if !ok {
 				writeError(w, http.StatusBadRequest, "each counter op must carry an integer value >= 0")
@@ -89,7 +91,7 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			// decoded value rather than the client's literal formatting.
 			raw, _ := json.Marshal(v)
 			crdtOp.Value = raw
-		case store.CRDTTypeGSet:
+		case crdt.TypeGSet:
 			if len(op.Elements) == 0 {
 				writeError(w, http.StatusBadRequest, "each gset op must add at least one element")
 				return
@@ -101,7 +103,7 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			crdtOp.Elements = op.Elements
-		case store.CRDTTypeRegister:
+		case crdt.TypeRegister:
 			// The value may be any JSON, null included; only an absent field
 			// (a nil RawMessage — an explicit null decodes to the bytes
 			// "null") is a missing field. The value is stored verbatim.
@@ -116,8 +118,8 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			}
 			crdtOp.Value = op.Value
 			crdtOp.Version = v
-		case store.CRDTTypeORSet:
-			if op.Action != store.CRDTORSetAdd && op.Action != store.CRDTORSetRemove {
+		case crdt.TypeORSet:
+			if op.Action != crdt.ORSetAdd && op.Action != crdt.ORSetRemove {
 				writeError(w, http.StatusBadRequest, `each orset op must carry action "add" or "remove"`)
 				return
 			}
@@ -133,7 +135,7 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 
 	results, err := s.SubmitCRDTOps(documentID, req.Type, ops)
 	if err != nil {
-		var conflict *store.ErrCRDTConflict
+		var conflict *crdt.ErrConflict
 		switch {
 		case errors.Is(err, store.ErrDeviceNotFound):
 			writeError(w, http.StatusNotFound, "device not found")
@@ -152,12 +154,12 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 
 // handleCRDTState returns the document's current type and merged result. A
 // document with no committed operations has no state yet and answers 404.
-func handleCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleCRDTState(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
 	state, err := s.GetCRDTState(documentID)
 	if err != nil {
-		if errors.Is(err, store.ErrCRDTNotFound) {
+		if errors.Is(err, crdt.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "crdt state not found")
 			return
 		}
@@ -190,7 +192,7 @@ func handleCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
 // the store without advancing a cursor, writing a change, registering a
 // subscription or affecting CRDT type fixation, idempotency or persistence; a
 // restart changes neither the answer nor the status codes.
-func handleSessionCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
+func handleSessionCRDTState(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
 
@@ -216,7 +218,7 @@ func handleSessionCRDTState(s *store.Store, w http.ResponseWriter, r *http.Reque
 
 	state, err := s.GetCRDTState(documentID)
 	if err != nil {
-		if errors.Is(err, store.ErrCRDTNotFound) {
+		if errors.Is(err, crdt.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "crdt state not found")
 			return
 		}
@@ -232,7 +234,7 @@ func handleSessionCRDTState(s *store.Store, w http.ResponseWriter, r *http.Reque
 // newline (the json.Encoder output), shared by the document-level read, the
 // session-scoped read and — via marshalCRDTState — the subscription push
 // frames, so the three can be compared byte-for-byte.
-func writeCRDTState(w http.ResponseWriter, state store.CRDTState) {
+func writeCRDTState(w http.ResponseWriter, state crdt.State) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(marshalCRDTState(state))
@@ -242,7 +244,7 @@ func writeCRDTState(w http.ResponseWriter, state store.CRDTState) {
 // compact single-line JSON with the keys in type, value order and one trailing
 // newline. The value is embedded as native JSON (a number, an array, or a
 // register's arbitrary JSON value) rather than an escaped blob.
-func marshalCRDTState(state store.CRDTState) []byte {
+func marshalCRDTState(state crdt.State) []byte {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	_ = enc.Encode(map[string]any{

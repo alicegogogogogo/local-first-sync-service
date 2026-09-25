@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
 func crdtCounterBody(device string, ops ...map[string]any) map[string]any {
@@ -336,7 +336,7 @@ func TestCRDTDocumentNamedCrdtKeepsOrdinaryRoutes(t *testing.T) {
 
 func TestCRDTStatePersistsAcrossRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "crdt.db")
-	s1, err := store.Open(path)
+	s1, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestCRDTStatePersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := store.Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}

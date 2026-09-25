@@ -1,4 +1,4 @@
-package store
+package events_test
 
 import (
 	"encoding/json"
@@ -8,18 +8,22 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
-func changes(ids ...string) []Change {
-	out := make([]Change, len(ids))
+func changes(ids ...string) []events.Change {
+	out := make([]events.Change, len(ids))
 	for i, id := range ids {
-		out[i] = Change{ID: id, DeviceID: "dev-1", Payload: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1))}
+		out[i] = events.Change{ID: id, DeviceID: "dev-1", Payload: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i+1))}
 	}
 	return out
 }
 
 func TestPostAndListBasic(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,10 +61,10 @@ func TestPostAndListBasic(t *testing.T) {
 }
 
 func TestIdempotentRepost(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	first, err := s.PostChanges("doc", []Change{
+	first, err := s.PostChanges("doc", []events.Change{
 		{ID: "x1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1,"b":2}`)},
 	})
 	if err != nil {
@@ -69,7 +73,7 @@ func TestIdempotentRepost(t *testing.T) {
 
 	// Same deviceId and semantically equal payload (reordered keys, whitespace):
 	// idempotent, cursor stays the first value.
-	again, err := s.PostChanges("doc", []Change{
+	again, err := s.PostChanges("doc", []events.Change{
 		{ID: "x1", DeviceID: "dev", Payload: json.RawMessage(`{ "b": 2, "a": 1 }`)},
 	})
 	if err != nil {
@@ -80,7 +84,7 @@ func TestIdempotentRepost(t *testing.T) {
 	}
 
 	// Number vs number-with-fraction decode identically.
-	again2, err := s.PostChanges("doc", []Change{
+	again2, err := s.PostChanges("doc", []events.Change{
 		{ID: "x1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1.0,"b":2}`)},
 	})
 	if err != nil {
@@ -92,10 +96,10 @@ func TestIdempotentRepost(t *testing.T) {
 }
 
 func TestConflictZeroWrite(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "x1", DeviceID: "dev", Payload: json.RawMessage(`{"v":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -103,13 +107,13 @@ func TestConflictZeroWrite(t *testing.T) {
 
 	// Different payload -> 409-equivalent conflict, and the new id in the same
 	// batch must not be written.
-	_, err := s.PostChanges("doc", []Change{
+	_, err := s.PostChanges("doc", []events.Change{
 		{ID: "new-1", DeviceID: "dev", Payload: json.RawMessage(`{"v":2}`)},
 		{ID: "x1", DeviceID: "dev", Payload: json.RawMessage(`{"v":99}`)},
 	})
-	var conflict *ErrConflict
+	var conflict *events.ErrConflict
 	if !errors.As(err, &conflict) || conflict.ID != "x1" {
-		t.Fatalf("want *ErrConflict{x1}, got %v", err)
+		t.Fatalf("want *events.ErrConflict{x1}, got %v", err)
 	}
 	rows, _, err := s.ListChanges("doc", 0, 100)
 	if err != nil {
@@ -120,7 +124,7 @@ func TestConflictZeroWrite(t *testing.T) {
 	}
 
 	// Different deviceId -> conflict as well.
-	_, err = s.PostChanges("doc", []Change{
+	_, err = s.PostChanges("doc", []events.Change{
 		{ID: "x1", DeviceID: "other", Payload: json.RawMessage(`{"v":1}`)},
 	})
 	if !errors.As(err, &conflict) {
@@ -129,7 +133,7 @@ func TestConflictZeroWrite(t *testing.T) {
 }
 
 func TestListPaginationAndUnknownDocument(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("a", "b", "c", "d", "e")); err != nil {
@@ -172,7 +176,7 @@ func TestListPaginationAndUnknownDocument(t *testing.T) {
 }
 
 func TestDocumentsAreIndependent(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	r1, _ := s.PostChanges("doc1", changes("a"))
@@ -183,7 +187,7 @@ func TestDocumentsAreIndependent(t *testing.T) {
 
 	// Same id with different payload in another document: that document has
 	// its own row and must conflict there.
-	r3, err := s.PostChanges("doc2", []Change{{ID: "a", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":2}`)}})
+	r3, err := s.PostChanges("doc2", []events.Change{{ID: "a", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":2}`)}})
 	if err == nil || r3 != nil {
 		t.Fatalf("same doc id with different payload should conflict")
 	}
@@ -192,11 +196,11 @@ func TestDocumentsAreIndependent(t *testing.T) {
 func TestPersistenceAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "k1", DeviceID: "dev", Payload: json.RawMessage(`{"hello":"world"}`)},
 		{ID: "k2", DeviceID: "dev", Payload: json.RawMessage(`[1,2,3]`)},
 	}); err != nil {
@@ -208,7 +212,7 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 
 	// Reopen: previously committed changes and cursors must be readable, and
 	// new cursors continue after the persisted high-water mark.
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,14 +230,14 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	}
 
 	// Idempotent replay after restart.
-	replay, err := s2.PostChanges("doc", []Change{
+	replay, err := s2.PostChanges("doc", []events.Change{
 		{ID: "k1", DeviceID: "dev", Payload: json.RawMessage(`{"hello":"world"}`)},
 	})
 	if err != nil || replay[0].Created || replay[0].Cursor != 1 {
 		t.Fatalf("replay after restart = %+v err=%v", replay, err)
 	}
 
-	more, err := s2.PostChanges("doc", []Change{
+	more, err := s2.PostChanges("doc", []events.Change{
 		{ID: "k3", DeviceID: "dev", Payload: json.RawMessage(`true`)},
 	})
 	if err != nil || !more[0].Created || more[0].Cursor != 3 {
@@ -242,7 +246,7 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 }
 
 func TestConcurrentBatchesNoDuplicateCursors(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	const goroutines = 16
@@ -251,16 +255,16 @@ func TestConcurrentBatchesNoDuplicateCursors(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, goroutines)
 	var mu sync.Mutex
-	all := make([]Result, 0, goroutines*perBatch)
+	all := make([]events.Result, 0, goroutines*perBatch)
 
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			batch := make([]Change, perBatch)
+			batch := make([]events.Change, perBatch)
 			for i := range batch {
 				id := fmt.Sprintf("g%d-i%d", g, i)
-				batch[i] = Change{ID: id, DeviceID: "dev", Payload: json.RawMessage(fmt.Sprintf(`{"g":%d,"i":%d}`, g, i))}
+				batch[i] = events.Change{ID: id, DeviceID: "dev", Payload: json.RawMessage(fmt.Sprintf(`{"g":%d,"i":%d}`, g, i))}
 			}
 			results, err := s.PostChanges("doc", batch)
 			if err != nil {
@@ -311,11 +315,11 @@ func TestConcurrentBatchesNoDuplicateCursors(t *testing.T) {
 }
 
 func TestMergeAppliedAtCurrentCursor(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	// Unknown document, baseCursor 0 -> applied at cursor 1.
-	r, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
+	r, err := s.MergeChange("doc", 0, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +328,7 @@ func TestMergeAppliedAtCurrentCursor(t *testing.T) {
 	}
 
 	// baseCursor == current -> applied.
-	r, err = s.MergeChange("doc", 1, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)})
+	r, err = s.MergeChange("doc", 1, events.Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,34 +338,34 @@ func TestMergeAppliedAtCurrentCursor(t *testing.T) {
 }
 
 func TestMergeUnknownDocRejectsNonZeroBase(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	_, err := s.MergeChange("ghost", 1, Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
-	if !errors.Is(err, ErrStaleCursor) {
-		t.Fatalf("want ErrStaleCursor, got %v", err)
+	_, err := s.MergeChange("ghost", 1, events.Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)})
+	if !errors.Is(err, events.ErrStaleCursor) {
+		t.Fatalf("want events.ErrStaleCursor, got %v", err)
 	}
 
 	// baseCursor ahead of the current cursor is also 400-class.
-	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 0, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeChange("doc", 5, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); !errors.Is(err, ErrStaleCursor) {
-		t.Fatalf("ahead cursor want ErrStaleCursor, got %v", err)
+	if _, err := s.MergeChange("doc", 5, events.Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); !errors.Is(err, events.ErrStaleCursor) {
+		t.Fatalf("ahead cursor want events.ErrStaleCursor, got %v", err)
 	}
 }
 
 func TestMergeIdempotentExisting(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 0, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
 		t.Fatal(err)
 	}
 
 	// Repost identical id/payload/device, even with a stale base, is
 	// idempotent and returns the original result.
-	r, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{ "a": 1 }`)})
+	r, err := s.MergeChange("doc", 0, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{ "a": 1 }`)})
 	if err != nil {
 		t.Fatalf("idempotent merge: %v", err)
 	}
@@ -378,21 +382,21 @@ func TestMergeIdempotentExisting(t *testing.T) {
 	}
 
 	// Mismatched payload -> conflict, zero write.
-	if _, err := s.MergeChange("doc", 1, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":2}`)}); !errors.As(err, new(*ErrConflict)) {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":2}`)}); !errors.As(err, new(*events.ErrConflict)) {
 		t.Fatalf("payload mismatch want conflict, got %v", err)
 	}
 	// Mismatched device -> conflict.
-	if _, err := s.MergeChange("doc", 1, Change{ID: "c1", DeviceID: "other", Payload: json.RawMessage(`{"a":1}`)}); !errors.As(err, new(*ErrConflict)) {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "c1", DeviceID: "other", Payload: json.RawMessage(`{"a":1}`)}); !errors.As(err, new(*events.ErrConflict)) {
 		t.Fatalf("device mismatch want conflict, got %v", err)
 	}
 }
 
 func TestMergeBehindDisjointObjects(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	// cursor 1: {"a":1}, cursor 2: {"b":2}
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "a", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
 		{ID: "b", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)},
 	}); err != nil {
@@ -401,7 +405,7 @@ func TestMergeBehindDisjointObjects(t *testing.T) {
 
 	// Client saw baseCursor 1 (only "a"); new payload {"c":3} shares no
 	// top-level keys with the later {"b":2} -> merged at cursor 3.
-	r, err := s.MergeChange("doc", 1, Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
+	r, err := s.MergeChange("doc", 1, events.Change{ID: "c", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -412,15 +416,15 @@ func TestMergeBehindDisjointObjects(t *testing.T) {
 
 func TestMergeBehindConflicts(t *testing.T) {
 	// Later change reuses a top-level key -> 409, zero write.
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "a", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)},
 		{ID: "b", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeChange("doc", 0, Change{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"b":9}`)}); !errors.As(err, new(*ErrConflict)) {
+	if _, err := s.MergeChange("doc", 0, events.Change{ID: "x", DeviceID: "dev", Payload: json.RawMessage(`{"b":9}`)}); !errors.As(err, new(*events.ErrConflict)) {
 		t.Fatalf("key clash want conflict, got %v", err)
 	}
 	rows, next, _ := s.ListChanges("doc", 0, 100)
@@ -430,28 +434,28 @@ func TestMergeBehindConflicts(t *testing.T) {
 
 	// A disjoint-object merge against the same doc is allowed (cursor 3),
 	// proving the earlier 409 was specifically about the key clash.
-	if r, err := s.MergeChange("doc", 0, Change{ID: "y", DeviceID: "dev", Payload: json.RawMessage(`{"z":3}`)}); err != nil || r.Outcome != "merged" || r.Cursor != 3 {
+	if r, err := s.MergeChange("doc", 0, events.Change{ID: "y", DeviceID: "dev", Payload: json.RawMessage(`{"z":3}`)}); err != nil || r.Outcome != "merged" || r.Cursor != 3 {
 		t.Fatalf("disjoint merge = %+v err=%v", r, err)
 	}
 
 	// Seed a non-object later payload in a fresh doc to prove the rule.
-	s2, _ := Open("")
+	s2, _ := app.Open("")
 	defer func() { _ = s2.Close() }()
-	if _, err := s2.PostChanges("d2", []Change{
+	if _, err := s2.PostChanges("d2", []events.Change{
 		{ID: "arr", DeviceID: "dev", Payload: json.RawMessage(`[1,2,3]`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s2.MergeChange("d2", 0, Change{ID: "o", DeviceID: "dev", Payload: json.RawMessage(`{"k":1}`)}); !errors.As(err, new(*ErrConflict)) {
+	if _, err := s2.MergeChange("d2", 0, events.Change{ID: "o", DeviceID: "dev", Payload: json.RawMessage(`{"k":1}`)}); !errors.As(err, new(*events.ErrConflict)) {
 		t.Fatalf("array later want conflict, got %v", err)
 	}
 }
 
 func TestMergeConcurrentSerialization(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 	// Seed current cursor so most merges race on the same high-water mark.
-	if _, err := s.MergeChange("doc", 0, Change{ID: "seed", DeviceID: "dev", Payload: json.RawMessage(`{"seed":0}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 0, events.Change{ID: "seed", DeviceID: "dev", Payload: json.RawMessage(`{"seed":0}`)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -463,7 +467,7 @@ func TestMergeConcurrentSerialization(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			// Every client observed cursor 1; payloads have disjoint keys.
-			_, err := s.MergeChange("doc", 1, Change{
+			_, err := s.MergeChange("doc", 1, events.Change{
 				ID:       fmt.Sprintf("m%d", i),
 				DeviceID: "dev",
 				Payload:  json.RawMessage(fmt.Sprintf(`{"k%d":%d}`, i, i)),
@@ -491,21 +495,21 @@ func TestMergeConcurrentSerialization(t *testing.T) {
 func TestMergePersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeChange("doc", 0, Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 0, events.Change{ID: "c1", DeviceID: "dev", Payload: json.RawMessage(`{"a":1}`)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.MergeChange("doc", 1, Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); err != nil {
+	if _, err := s.MergeChange("doc", 1, events.Change{ID: "c2", DeviceID: "dev", Payload: json.RawMessage(`{"b":2}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,14 +521,14 @@ func TestMergePersistsAcrossReopen(t *testing.T) {
 	}
 
 	// A merge that was valid before restart still appends at the right cursor.
-	r, err := s2.MergeChange("doc", 2, Change{ID: "c3", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
+	r, err := s2.MergeChange("doc", 2, events.Change{ID: "c3", DeviceID: "dev", Payload: json.RawMessage(`{"c":3}`)})
 	if err != nil || r.Outcome != "applied" || r.Cursor != 3 {
 		t.Fatalf("post-restart merge = %+v err=%v", r, err)
 	}
 }
 
 func TestSnapshotPutGetAndIdempotentRetry(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +547,7 @@ func TestSnapshotPutGetAndIdempotentRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !jsonEqual(state, json.RawMessage(`{"n":1,"text":"hello"}`)) {
+	if !store.JSONEqual(state, json.RawMessage(`{"n":1,"text":"hello"}`)) {
 		t.Fatalf("state = %s", state)
 	}
 
@@ -556,7 +560,7 @@ func TestSnapshotPutGetAndIdempotentRetry(t *testing.T) {
 }
 
 func TestSnapshotConflictKeepsOriginal(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,19 +574,19 @@ func TestSnapshotConflictKeepsOriginal(t *testing.T) {
 	}
 
 	_, err = s.PutSnapshot("doc", 1, json.RawMessage(`{"v":2}`))
-	var conflict *ErrSnapshotConflict
+	var conflict *events.ErrSnapshotConflict
 	if !errors.As(err, &conflict) {
 		t.Fatalf("conflicting put err = %v", err)
 	}
 
 	state, err := s.GetSnapshot("doc", 1)
-	if err != nil || !jsonEqual(state, json.RawMessage(`{"v":1}`)) {
+	if err != nil || !store.JSONEqual(state, json.RawMessage(`{"v":1}`)) {
 		t.Fatalf("state after conflict = %s err=%v", state, err)
 	}
 }
 
 func TestSnapshotRejectsNonExistingCursor(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,10 +608,10 @@ func TestSnapshotRejectsNonExistingCursor(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := s.PutSnapshot(tc.doc, tc.cursor, json.RawMessage(`{"v":1}`))
-			if !errors.Is(err, ErrSnapshotBase) {
-				t.Fatalf("err = %v, want ErrSnapshotBase", err)
+			if !errors.Is(err, events.ErrSnapshotBase) {
+				t.Fatalf("err = %v, want events.ErrSnapshotBase", err)
 			}
-			if _, err := s.GetSnapshot(tc.doc, tc.cursor); !errors.Is(err, ErrSnapshotNotFound) {
+			if _, err := s.GetSnapshot(tc.doc, tc.cursor); !errors.Is(err, events.ErrSnapshotNotFound) {
 				t.Fatalf("zero-write violated: get err = %v", err)
 			}
 		})
@@ -615,19 +619,19 @@ func TestSnapshotRejectsNonExistingCursor(t *testing.T) {
 }
 
 func TestSnapshotGetMissing(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s.Close() }()
 
-	if _, err := s.GetSnapshot("nope", 1); !errors.Is(err, ErrSnapshotNotFound) {
+	if _, err := s.GetSnapshot("nope", 1); !errors.Is(err, events.ErrSnapshotNotFound) {
 		t.Fatalf("unknown doc err = %v", err)
 	}
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetSnapshot("doc", 1); !errors.Is(err, ErrSnapshotNotFound) {
+	if _, err := s.GetSnapshot("doc", 1); !errors.Is(err, events.ErrSnapshotNotFound) {
 		t.Fatalf("known doc without snapshot err = %v", err)
 	}
 }
@@ -635,7 +639,7 @@ func TestSnapshotGetMissing(t *testing.T) {
 func TestSnapshotPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,14 +653,14 @@ func TestSnapshotPersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = s2.Close() }()
 
 	state, err := s2.GetSnapshot("doc", 1)
-	if err != nil || !jsonEqual(state, json.RawMessage(`{"a":1}`)) {
+	if err != nil || !store.JSONEqual(state, json.RawMessage(`{"a":1}`)) {
 		t.Fatalf("state after reopen = %s err=%v", state, err)
 	}
 
@@ -665,7 +669,7 @@ func TestSnapshotPersistsAcrossReopen(t *testing.T) {
 	if err != nil || created {
 		t.Fatalf("retry after reopen = created:%v err:%v", created, err)
 	}
-	var conflict *ErrSnapshotConflict
+	var conflict *events.ErrSnapshotConflict
 	if _, err := s2.PutSnapshot("doc", 1, json.RawMessage(`{"a":9}`)); !errors.As(err, &conflict) {
 		t.Fatalf("conflict after reopen err = %v", err)
 	}
@@ -678,7 +682,7 @@ func TestSnapshotPersistsAcrossReopen(t *testing.T) {
 }
 
 func TestSnapshotConcurrentPuts(t *testing.T) {
-	s, err := Open("")
+	s, err := app.Open("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -715,7 +719,7 @@ func TestSnapshotConcurrentPuts(t *testing.T) {
 }
 
 func TestRestoreAppendsSnapshotState(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
@@ -743,7 +747,7 @@ func TestRestoreAppendsSnapshotState(t *testing.T) {
 		t.Fatalf("rows = %+v next=%d", rows, next)
 	}
 	last := rows[2]
-	if last.ID != "r1" || last.DeviceID != "dev" || last.Cursor != 3 || !jsonEqual(last.Payload, json.RawMessage(`{"v":2}`)) {
+	if last.ID != "r1" || last.DeviceID != "dev" || last.Cursor != 3 || !store.JSONEqual(last.Payload, json.RawMessage(`{"v":2}`)) {
 		t.Fatalf("restored row = %+v", last)
 	}
 	if rows[0].ID != "c1" || rows[1].ID != "c2" {
@@ -758,7 +762,7 @@ func TestRestoreAppendsSnapshotState(t *testing.T) {
 }
 
 func TestRestoreSnapshotMiss(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
@@ -778,8 +782,8 @@ func TestRestoreSnapshotMiss(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := s.RestoreSnapshot(docCursor.doc, "dev", "r", docCursor.cursor)
-			if !errors.Is(err, ErrSnapshotNotFound) {
-				t.Fatalf("err = %v, want ErrSnapshotNotFound", err)
+			if !errors.Is(err, events.ErrSnapshotNotFound) {
+				t.Fatalf("err = %v, want events.ErrSnapshotNotFound", err)
 			}
 		})
 	}
@@ -792,7 +796,7 @@ func TestRestoreSnapshotMiss(t *testing.T) {
 }
 
 func TestRestoreIdempotentRepeat(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
@@ -809,7 +813,7 @@ func TestRestoreIdempotentRepeat(t *testing.T) {
 
 	// Identical repeat is idempotent: created=false, first cursor, and no new
 	// row even when the document advanced in the meantime.
-	if _, err := s.PostChanges("doc", []Change{
+	if _, err := s.PostChanges("doc", []events.Change{
 		{ID: "later", DeviceID: "dev", Payload: json.RawMessage(`{"x":1}`)},
 	}); err != nil {
 		t.Fatal(err)
@@ -828,7 +832,7 @@ func TestRestoreIdempotentRepeat(t *testing.T) {
 }
 
 func TestRestoreConflicts(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
@@ -845,9 +849,9 @@ func TestRestoreConflicts(t *testing.T) {
 		t.Helper()
 		before, beforeNext, _ := s.ListChanges("doc", 0, 100)
 		_, err := s.RestoreSnapshot("doc", deviceID, changeID, snapshotCursor)
-		var conflict *ErrRestoreConflict
+		var conflict *events.ErrRestoreConflict
 		if !errors.As(err, &conflict) {
-			t.Fatalf("%s: err = %v, want *ErrRestoreConflict", name, err)
+			t.Fatalf("%s: err = %v, want *events.ErrRestoreConflict", name, err)
 		}
 		after, afterNext, _ := s.ListChanges("doc", 0, 100)
 		if len(after) != len(before) || afterNext != beforeNext {
@@ -871,7 +875,7 @@ func TestRestoreConflicts(t *testing.T) {
 func TestRestoreCursorMismatchWithEqualState(t *testing.T) {
 	// A different snapshotCursor is a conflict even when the states decode
 	// equal: snapshotCursor is part of the idempotency key.
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1", "c2")); err != nil {
@@ -887,7 +891,7 @@ func TestRestoreCursorMismatchWithEqualState(t *testing.T) {
 	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 2); !errors.As(err, new(*ErrRestoreConflict)) {
+	if _, err := s.RestoreSnapshot("doc", "dev", "r1", 2); !errors.As(err, new(*events.ErrRestoreConflict)) {
 		t.Fatalf("equal state, different snapshotCursor: err = %v, want conflict", err)
 	}
 }
@@ -895,7 +899,7 @@ func TestRestoreCursorMismatchWithEqualState(t *testing.T) {
 func TestRestorePersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sync.db")
 
-	s, err := Open(path)
+	s, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -912,7 +916,7 @@ func TestRestorePersistsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := Open(path)
+	s2, err := app.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -924,18 +928,18 @@ func TestRestorePersistsAcrossReopen(t *testing.T) {
 		t.Fatalf("replay after restart = %+v err=%v", r, err)
 	}
 	// A differing device is still a conflict after restart.
-	if _, err := s2.RestoreSnapshot("doc", "other", "r1", 1); !errors.As(err, new(*ErrRestoreConflict)) {
+	if _, err := s2.RestoreSnapshot("doc", "other", "r1", 1); !errors.As(err, new(*events.ErrRestoreConflict)) {
 		t.Fatalf("conflict after restart err = %v", err)
 	}
 	// The appended change reads back with the snapshot state.
 	rows, next, err := s2.ListChanges("doc", 0, 100)
-	if err != nil || len(rows) != 2 || next != 2 || !jsonEqual(rows[1].Payload, json.RawMessage(`{"v":1}`)) {
+	if err != nil || len(rows) != 2 || next != 2 || !store.JSONEqual(rows[1].Payload, json.RawMessage(`{"v":1}`)) {
 		t.Fatalf("rows after restart = %+v next=%d err=%v", rows, next, err)
 	}
 }
 
 func TestRestoreConcurrent(t *testing.T) {
-	s, _ := Open("")
+	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
 	if _, err := s.PostChanges("doc", changes("c1")); err != nil {
