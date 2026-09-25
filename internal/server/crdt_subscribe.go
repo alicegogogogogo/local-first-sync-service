@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -213,15 +212,10 @@ func serveCRDTStateSubscription(r *http.Request, s *store.Store, conn *wsConn, d
 }
 
 // encodeCRDTStateFrame renders one state message exactly as the state read
-// endpoint renders its body: the same encoder (HTML escaping included, map
-// keys sorted to type then value) and the same trailing newline, so a pushed
-// frame can be compared byte-for-byte with a GET .../crdt/state response.
+// endpoints render their bodies: the shared encoder (HTML escaping included,
+// map keys sorted to type then value) and the same trailing newline, so a
+// pushed frame can be compared byte-for-byte with a GET .../crdt/state
+// response at either the document or session path.
 func encodeCRDTStateFrame(state store.CRDTState) []byte {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	_ = enc.Encode(map[string]any{
-		"type":  state.Type,
-		"value": json.RawMessage(state.Value),
-	})
-	return buf.Bytes()
+	return marshalCRDTState(state)
 }

@@ -132,7 +132,7 @@ func TestCRDTSubscribePreUpgradeValidation(t *testing.T) {
 		{"trailing slash", http.MethodGet, base + "/", true, http.StatusBadRequest},
 		{"extra segment", http.MethodGet, base + "/extra", true, http.StatusBadRequest},
 		{"missing state segment", http.MethodGet, "/v1/sessions/sess/documents/doc/crdt/subscribe", true, http.StatusBadRequest},
-		{"missing subscribe segment", http.MethodGet, "/v1/sessions/sess/documents/doc/crdt/state", true, http.StatusBadRequest},
+		{"extra segment past state", http.MethodGet, "/v1/sessions/sess/documents/doc/crdt/state/extra", true, http.StatusBadRequest},
 		{"wrong terminal word", http.MethodGet, "/v1/sessions/sess/documents/doc/crdt/statex/subscribe", true, http.StatusBadRequest},
 		{"bare crdt namespace", http.MethodGet, "/v1/sessions/sess/documents/doc/crdt", true, http.StatusBadRequest},
 		{"unknown session", http.MethodGet, "/v1/sessions/ghost/documents/doc/crdt/state/subscribe", true, http.StatusNotFound},

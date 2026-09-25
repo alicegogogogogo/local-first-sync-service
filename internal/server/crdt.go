@@ -132,12 +132,91 @@ func handleCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Marshal through a concrete shape so the value stays a native JSON number
-	// or array rather than an escaped blob.
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeCRDTState(w, state)
+}
+
+// handleSessionCRDTState is the session-scoped view of the document-level
+// state read:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
+//
+// The read identity is entirely the existing session (no new auth): the
+// session's owning device is the credential and the validation order matches
+// the other session-scoped reads exactly — request shape (400, enforced by the
+// route and path guard before this handler), then session existence
+// (404 JSON for a session that never existed or was deleted), then the
+// session device's permission for the document (403 JSON with no state
+// content), and finally the document's CRDT state. A document without any
+// committed CRDT operation is the same 404 JSON as the document-level read, so
+// a deleted session, an unknown document-state and a revoked permission remain
+// three independent answers.
+//
+// On success the body is byte-for-byte the document-level state read's body
+// (writeCRDTState): compact single-line JSON, keys type then value, one
+// trailing newline. The endpoint is read-only: it renders the state derived by
+// the store without advancing a cursor, writing a change, registering a
+// subscription or affecting CRDT type fixation, idempotency or persistence; a
+// restart changes neither the answer nor the status codes.
+func handleSessionCRDTState(s *store.Store, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return
+	}
+
+	state, err := s.GetCRDTState(documentID)
+	if err != nil {
+		if errors.Is(err, store.ErrCRDTNotFound) {
+			writeError(w, http.StatusNotFound, "crdt state not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load crdt state")
+		return
+	}
+
+	writeCRDTState(w, state)
+}
+
+// writeCRDTState renders a CRDT state exactly as every state reader must:
+// compact single-line JSON with the keys in type, value order, terminated by a
+// newline (the json.Encoder output), shared by the document-level read, the
+// session-scoped read and — via marshalCRDTState — the subscription push
+// frames, so the three can be compared byte-for-byte.
+func writeCRDTState(w http.ResponseWriter, state store.CRDTState) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(marshalCRDTState(state))
+}
+
+// marshalCRDTState encodes a CRDT state the single way every surface emits it:
+// compact single-line JSON with the keys in type, value order and one trailing
+// newline. The value is a native JSON number or array rather than an escaped
+// blob.
+func marshalCRDTState(state store.CRDTState) []byte {
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	_ = enc.Encode(map[string]any{
 		"type":  state.Type,
 		"value": json.RawMessage(state.Value),
 	})
+	return []byte(buf.String())
 }
 
 // malformedCRDTPath reports whether p targets the CRDT namespace but is not at
