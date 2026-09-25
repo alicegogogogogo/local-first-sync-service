@@ -219,6 +219,57 @@ func TestCRDTCompactDeviceGateAndMissingState(t *testing.T) {
 	}
 }
 
+func TestCRDTCompactedIdReplayAndConflict(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+
+	submit := func(device, id string, value int) *httptest.ResponseRecorder {
+		t.Helper()
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtCounterBody(device,
+			map[string]any{"id": id, "value": value}))
+		return w
+	}
+	if w := submit("dev-1", "a1", 5); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := submit("dev-1", "a2", 8); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+
+	// Compaction trims a1; the snapshot reports only the retained operation.
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/compact", map[string]any{"deviceId": "dev-1"})
+	if w.Code != http.StatusOK || w.Body.String() != compactBody("counter", "8", "1", "0") {
+		t.Fatalf("compact = %d %q", w.Code, w.Body.String())
+	}
+
+	// Re-posting the trimmed id with the same device and content is an
+	// idempotent replay: 200, created=false, nothing applied.
+	w, body := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtCounterBody("dev-1",
+		map[string]any{"id": "a1", "value": 5}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay = %d %s", w.Code, w.Body.String())
+	}
+	results := body["results"].([]any)
+	if len(results) != 1 || results[0].(map[string]any)["created"] != false {
+		t.Fatalf("replay results = %v, want created=false", results)
+	}
+
+	// The trimmed id with a different value or a different device is a 409
+	// that writes nothing.
+	if w := submit("dev-1", "a1", 6); w.Code != http.StatusConflict {
+		t.Fatalf("different value = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+	if w := submit("dev-2", "a1", 5); w.Code != http.StatusConflict {
+		t.Fatalf("different device = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+
+	// Counts and the merged value never moved.
+	if got := getRaw(t, h, "/v1/documents/doc/crdt/snapshot").Body.String(); got != compactBody("counter", "8", "1", "0") {
+		t.Fatalf("snapshot after replays = %q", got)
+	}
+}
+
 func TestCRDTCompactPathAndMethodShape(t *testing.T) {
 	h, _ := newTestHandler(t)
 

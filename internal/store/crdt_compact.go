@@ -11,11 +11,14 @@
 // Compaction rewrites nothing outside the CRDT tables: it never allocates a
 // change cursor, never writes a change record and never notifies subscribers,
 // because the merged value does not move. The trimmed state still reproduces
-// the exact merge and still answers the submission layer's questions — the
+// the exact merge and still answers the submission layer's questions: the
 // per-device counter maxima and register versions that gate regressions live
-// in the retained rows — so merge results, idempotency decisions and conflict
-// responses are computed by the same rules afterward. A snapshot read reports
-// the merged value together with the number of stored operations and
+// in the retained rows, and every accepted operation's comparable identity
+// (its device and a canonical digest of its compared content) lives in the
+// fingerprint table, which compaction never touches — so merge results,
+// idempotency decisions and conflict responses are computed by the same rules
+// afterward, even for an id whose operation row was trimmed. A snapshot read
+// reports the merged value together with the number of stored operations and
 // tombstones, so a client can observe what compaction trimmed; both counts
 // are non-negative and durable across restarts.
 
@@ -72,6 +75,11 @@ type CRDTSnapshot struct {
 //     the merge — so the live element set is unchanged. The operation log is
 //     untouched, so replaying an add or remove stays idempotent and a
 //     replayed remove never tombstones tags that arrived after it.
+//
+// The fingerprint table is not trimmed: it holds one narrow row per accepted
+// operation id (device plus a fixed-size content digest), so idempotency and
+// conflict decisions survive the trim without the storage growing back to
+// what the trimmed rows occupied.
 //
 // Compaction is idempotent: a second run finds nothing to trim and returns
 // the same snapshot. It commits no change-log row, allocates no cursor and,

@@ -37,8 +37,12 @@
 // Every operation carries a stable, client-supplied id, unique per document.
 // Re-posting the same id with the same content and origin is idempotent; the
 // same id with different content or a different device is an
-// ErrCRDTConflict and leaves the state untouched. Operations and the merged
-// result commit together in one serialized transaction and are durable: the
+// ErrCRDTConflict and leaves the state untouched. Each accepted operation's
+// comparable identity — its device and a canonical digest of the content its
+// type compares — is recorded in a fingerprint table that compaction never
+// trims, so both decisions are answered the same way even after the
+// operation's own row was compacted away. Operations and the merged result
+// commit together in one serialized transaction and are durable: the
 // decisions and the merged state are unchanged after a restart.
 //
 // The CRDT layer shares the registration/permission layer with the rest of the
@@ -50,6 +54,7 @@
 package store
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -196,6 +201,13 @@ CREATE TABLE IF NOT EXISTS crdt_orset_tombstones (
 	removed_by  TEXT NOT NULL,
 	PRIMARY KEY (document_id, element, op_id)
 );
+CREATE TABLE IF NOT EXISTS crdt_op_fingerprints (
+	document_id TEXT NOT NULL,
+	id          TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	digest      BLOB NOT NULL,
+	PRIMARY KEY (document_id, id)
+);
 `
 
 // SubmitCRDTOps validates and commits one CRDT batch atomically.
@@ -334,11 +346,13 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 }
 
 // applyCounterOps resolves and applies every counter operation inside tx. A
-// repeated id is idempotent only with the same device and contribution. A new
-// id with a contribution below the device's stored maximum regresses the
-// counter and is rejected; an equal contribution is an accepted no-op; a
-// larger one advances the device's maximum. It reports whether the merged
-// state actually changed — only an advancing contribution moves the sum.
+// repeated id is idempotent only with the same device and contribution — a
+// decision the fingerprint table answers even after compaction trimmed the
+// operation row. A new id with a contribution below the device's stored
+// maximum regresses the counter and is rejected; an equal contribution is an
+// accepted no-op; a larger one advances the device's maximum. It reports
+// whether the merged state actually changed — only an advancing contribution
+// moves the sum.
 func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
 	changed := false
 	for i, op := range ops {
@@ -347,82 +361,77 @@ func applyCounterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDT
 			return false, &ErrCRDTConflict{ID: op.ID, Reason: err.Error()}
 		}
 
-		var existingDevice string
-		var existingValue []byte
-		err = tx.QueryRow(
-			`SELECT device_id, value FROM crdt_ops WHERE document_id = ? AND id = ?`,
-			documentID, op.ID,
-		).Scan(&existingDevice, &existingValue)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			// New id: enforce monotonicity against this device's maximum.
-			var current sql.NullInt64
-			if scanErr := tx.QueryRow(
-				`SELECT value FROM crdt_counter_values WHERE document_id = ? AND device_id = ?`,
-				documentID, op.DeviceID,
-			).Scan(&current); scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-				return false, scanErr
-			}
-			if current.Valid && value < current.Int64 {
-				return false, &ErrCRDTConflict{
-					ID:     op.ID,
-					Reason: "counter contribution must not decrease",
-				}
-			}
-			if _, err := tx.Exec(
-				`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
-				documentID, op.ID, op.DeviceID, []byte(op.Value),
-			); err != nil {
-				return false, err
-			}
-			if !current.Valid || value > current.Int64 {
-				if _, err := tx.Exec(
-					`INSERT INTO crdt_counter_values (document_id, device_id, value) VALUES (?, ?, ?)
-					 ON CONFLICT (document_id, device_id) DO UPDATE SET value = excluded.value`,
-					documentID, op.DeviceID, value,
-				); err != nil {
-					return false, err
-				}
-				changed = true
-			}
-			results[i] = CRDTResult{ID: op.ID, Created: true}
-		case err != nil:
+		digest := counterOpDigest(op.Value)
+		existingDevice, existingDigest, known, err := lookupCRDTOpFingerprint(tx, documentID, op.ID)
+		if err != nil {
 			return false, err
-		default:
-			if existingDevice != op.DeviceID || !jsonEqual(existingValue, op.Value) {
+		}
+		if known {
+			if existingDevice != op.DeviceID || !bytes.Equal(existingDigest, digest) {
 				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device or value",
 				}
 			}
 			results[i] = CRDTResult{ID: op.ID, Created: false}
+			continue
 		}
+
+		// New id: enforce monotonicity against this device's maximum.
+		var current sql.NullInt64
+		if scanErr := tx.QueryRow(
+			`SELECT value FROM crdt_counter_values WHERE document_id = ? AND device_id = ?`,
+			documentID, op.DeviceID,
+		).Scan(&current); scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+			return false, scanErr
+		}
+		if current.Valid && value < current.Int64 {
+			return false, &ErrCRDTConflict{
+				ID:     op.ID,
+				Reason: "counter contribution must not decrease",
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
+			documentID, op.ID, op.DeviceID, []byte(op.Value),
+		); err != nil {
+			return false, err
+		}
+		if err := recordCRDTOpFingerprint(tx, documentID, op.ID, op.DeviceID, digest); err != nil {
+			return false, err
+		}
+		if !current.Valid || value > current.Int64 {
+			if _, err := tx.Exec(
+				`INSERT INTO crdt_counter_values (document_id, device_id, value) VALUES (?, ?, ?)
+				 ON CONFLICT (document_id, device_id) DO UPDATE SET value = excluded.value`,
+				documentID, op.DeviceID, value,
+			); err != nil {
+				return false, err
+			}
+			changed = true
+		}
+		results[i] = CRDTResult{ID: op.ID, Created: true}
 	}
 	return changed, nil
 }
 
 // applyGSetOps resolves and applies every grow-only-set operation inside tx.
 // A repeated id is idempotent only with the same device and the same set of
-// elements (element order is irrelevant to the merge). New elements are
-// inserted into the union table; re-adding an element changes nothing. It
-// reports whether the merged state actually changed — only an element that
-// was not already in the union moves it.
+// elements (element order is irrelevant to the merge) — a decision the
+// fingerprint table answers even after compaction trimmed the operation row.
+// New elements are inserted into the union table; re-adding an element
+// changes nothing. It reports whether the merged state actually changed —
+// only an element that was not already in the union moves it.
 func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
 	changed := false
 	for i, op := range ops {
-		var existingDevice string
-		var existingElements []byte
-		err := tx.QueryRow(
-			`SELECT device_id, value FROM crdt_ops WHERE document_id = ? AND id = ?`,
-			documentID, op.ID,
-		).Scan(&existingDevice, &existingElements)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			// New id; insert the op and its elements below.
-		case err != nil:
+		digest := gsetOpDigest(op.Elements)
+		existingDevice, existingDigest, known, err := lookupCRDTOpFingerprint(tx, documentID, op.ID)
+		if err != nil {
 			return false, err
-		default:
-			if existingDevice != op.DeviceID || !stringSetEqual(existingElements, op.Elements) {
+		}
+		if known {
+			if existingDevice != op.DeviceID || !bytes.Equal(existingDigest, digest) {
 				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device or elements",
@@ -436,6 +445,9 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 			`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
 			documentID, op.ID, op.DeviceID, []byte(encodeSetElements(op.Elements)),
 		); err != nil {
+			return false, err
+		}
+		if err := recordCRDTOpFingerprint(tx, documentID, op.ID, op.DeviceID, digest); err != nil {
 			return false, err
 		}
 		for _, element := range op.Elements {
@@ -458,11 +470,12 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 }
 
 // applyRegisterOps resolves and applies every register operation inside tx. A
-// repeated id is idempotent only with the same device, version and value. A
-// new id whose version is not strictly greater than every version already
-// accepted from the same device regresses (or stalls) the device's clock and
-// is rejected. It reports whether the merged state actually changed — only a
-// change of the winning operation's value moves it.
+// repeated id is idempotent only with the same device, version and value — a
+// decision the fingerprint table answers even after compaction trimmed the
+// operation row. A new id whose version is not strictly greater than every
+// version already accepted from the same device regresses (or stalls) the
+// device's clock and is rejected. It reports whether the merged state
+// actually changed — only a change of the winning operation's value moves it.
 func applyRegisterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
 	// The merged value before the batch, so a batch that leaves the winner's
 	// value untouched (an idempotent replay, or a new op that loses the
@@ -479,49 +492,48 @@ func applyRegisterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRD
 			return false, &ErrCRDTConflict{ID: op.ID, Reason: "register version must be a non-negative integer"}
 		}
 
-		var existingDevice string
-		var existingVersion int64
-		var existingValue []byte
-		err := tx.QueryRow(
-			`SELECT device_id, version, value FROM crdt_register_ops WHERE document_id = ? AND id = ?`,
-			documentID, op.ID,
-		).Scan(&existingDevice, &existingVersion, &existingValue)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			// New id: the device's versions only move strictly forward. The
-			// per-device maximum is derived from the accepted ops, so the
-			// decision is durable across restarts without extra state.
-			var maxVersion sql.NullInt64
-			if scanErr := tx.QueryRow(
-				`SELECT MAX(version) FROM crdt_register_ops WHERE document_id = ? AND device_id = ?`,
-				documentID, op.DeviceID,
-			).Scan(&maxVersion); scanErr != nil {
-				return false, scanErr
-			}
-			if maxVersion.Valid && op.Version <= maxVersion.Int64 {
-				return false, &ErrCRDTConflict{
-					ID:     op.ID,
-					Reason: "register version must be greater than the device's previously accepted version",
-				}
-			}
-			if _, err := tx.Exec(
-				`INSERT INTO crdt_register_ops (document_id, id, device_id, version, value) VALUES (?, ?, ?, ?, ?)`,
-				documentID, op.ID, op.DeviceID, op.Version, []byte(op.Value),
-			); err != nil {
-				return false, err
-			}
-			results[i] = CRDTResult{ID: op.ID, Created: true}
-		case err != nil:
+		digest := registerOpDigest(op.Version, op.Value)
+		existingDevice, existingDigest, known, err := lookupCRDTOpFingerprint(tx, documentID, op.ID)
+		if err != nil {
 			return false, err
-		default:
-			if existingDevice != op.DeviceID || existingVersion != op.Version || !jsonEqual(existingValue, op.Value) {
+		}
+		if known {
+			if existingDevice != op.DeviceID || !bytes.Equal(existingDigest, digest) {
 				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device, version or value",
 				}
 			}
 			results[i] = CRDTResult{ID: op.ID, Created: false}
+			continue
 		}
+
+		// New id: the device's versions only move strictly forward. The
+		// per-device maximum is derived from the accepted ops, so the
+		// decision is durable across restarts without extra state.
+		var maxVersion sql.NullInt64
+		if scanErr := tx.QueryRow(
+			`SELECT MAX(version) FROM crdt_register_ops WHERE document_id = ? AND device_id = ?`,
+			documentID, op.DeviceID,
+		).Scan(&maxVersion); scanErr != nil {
+			return false, scanErr
+		}
+		if maxVersion.Valid && op.Version <= maxVersion.Int64 {
+			return false, &ErrCRDTConflict{
+				ID:     op.ID,
+				Reason: "register version must be greater than the device's previously accepted version",
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO crdt_register_ops (document_id, id, device_id, version, value) VALUES (?, ?, ?, ?, ?)`,
+			documentID, op.ID, op.DeviceID, op.Version, []byte(op.Value),
+		); err != nil {
+			return false, err
+		}
+		if err := recordCRDTOpFingerprint(tx, documentID, op.ID, op.DeviceID, digest); err != nil {
+			return false, err
+		}
+		results[i] = CRDTResult{ID: op.ID, Created: true}
 	}
 
 	next, nextOK, err := registerWinner(tx, documentID)
@@ -557,13 +569,15 @@ func registerWinner(tx *sql.Tx, documentID string) (json.RawMessage, bool, error
 
 // applyORSetOps resolves and applies every observed-remove-set operation
 // inside tx. A repeated id is idempotent only with the same device, action and
-// element; an idempotent replay applies nothing, so a replayed remove never
-// tombstones adds that landed after its first acceptance. An add tags the
-// element with its own operation id; a remove tombstones exactly the tags
-// already accepted for the element — adds that arrive later carry fresh tags
-// and are unaffected, and removing an element with no live (or no) tags is an
-// accepted no-op. It reports whether the merged state actually changed — only
-// a change in the set of elements with at least one live tag moves it.
+// element — a decision the fingerprint table answers even after compaction
+// trimmed the operation's tags and tombstones; an idempotent replay applies
+// nothing, so a replayed remove never tombstones adds that landed after its
+// first acceptance. An add tags the element with its own operation id; a
+// remove tombstones exactly the tags already accepted for the element — adds
+// that arrive later carry fresh tags and are unaffected, and removing an
+// element with no live (or no) tags is an accepted no-op. It reports whether
+// the merged state actually changed — only a change in the set of elements
+// with at least one live tag moves it.
 func applyORSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
 	// The merged element set before the batch, so a batch that leaves it
 	// untouched (an idempotent replay, an add of an already-present element,
@@ -580,19 +594,13 @@ func applyORSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRe
 			return false, &ErrCRDTConflict{ID: op.ID, Reason: `orset action must be "add" or "remove"`}
 		}
 
-		var existingDevice string
-		var existingContent []byte
-		err := tx.QueryRow(
-			`SELECT device_id, value FROM crdt_ops WHERE document_id = ? AND id = ?`,
-			documentID, op.ID,
-		).Scan(&existingDevice, &existingContent)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			// New id; insert the op and apply its effect below.
-		case err != nil:
+		digest := orsetOpDigest(op.Action, op.Element)
+		existingDevice, existingDigest, known, err := lookupCRDTOpFingerprint(tx, documentID, op.ID)
+		if err != nil {
 			return false, err
-		default:
-			if existingDevice != op.DeviceID || !jsonEqual(existingContent, encodeORSetContent(op.Action, op.Element)) {
+		}
+		if known {
+			if existingDevice != op.DeviceID || !bytes.Equal(existingDigest, digest) {
 				return false, &ErrCRDTConflict{
 					ID:     op.ID,
 					Reason: "operation id already exists with a different device, action or element",
@@ -606,6 +614,9 @@ func applyORSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRe
 			`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
 			documentID, op.ID, op.DeviceID, []byte(encodeORSetContent(op.Action, op.Element)),
 		); err != nil {
+			return false, err
+		}
+		if err := recordCRDTOpFingerprint(tx, documentID, op.ID, op.DeviceID, digest); err != nil {
 			return false, err
 		}
 		if op.Action == CRDTORSetAdd {
@@ -734,27 +745,6 @@ func encodeSetElements(elements []string) json.RawMessage {
 		return json.RawMessage("[]")
 	}
 	return raw
-}
-
-// stringSetEqual reports whether raw (a JSON array of strings stored for a
-// prior gset operation) contains exactly the elements of want, ignoring
-// duplicates and order: the content of a set operation is the set of elements.
-func stringSetEqual(raw json.RawMessage, want []string) bool {
-	var got []string
-	if err := json.Unmarshal(raw, &got); err != nil {
-		return false
-	}
-	set := make(map[string]struct{}, len(got))
-	for _, e := range got {
-		set[e] = struct{}{}
-	}
-	for _, e := range want {
-		if _, ok := set[e]; !ok {
-			return false
-		}
-		delete(set, e)
-	}
-	return len(set) == 0
 }
 
 // GetCRDTState returns the merged CRDT state for documentID. A document with
