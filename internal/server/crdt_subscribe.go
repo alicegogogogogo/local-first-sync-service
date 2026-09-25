@@ -26,11 +26,12 @@ import (
 // document without any CRDT operation yet sends nothing and waits silently
 // until its first state appears. From then on every commit that actually
 // changes the merge — a counter's per-device maximum advancing, the set union
-// growing, the register's winning value changing — is pushed as one text
-// frame in transaction-commit order.
+// growing, the register's winning value changing, or an orset's present
+// elements changing — is pushed as one text frame in transaction-commit order.
 // Idempotent repeats, rejected regressions and wholly invalid batches change
-// no state and produce no frame; re-adding an existing set element pushes
-// nothing either.
+// no state and produce no frame; re-adding an existing set element, removing
+// an element an orset never had (or already lost) and re-adding a present
+// orset element push nothing either.
 //
 // Each message is one text frame whose payload is byte-for-byte the state
 // read endpoint's body: compact single-line JSON with the keys in type, value

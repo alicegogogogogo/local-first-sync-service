@@ -11,12 +11,14 @@ import (
 
 // crdtOpIn is one element of a CRDT submission. Exactly one content shape is
 // meaningful depending on the declared document type: value for a counter,
-// elements for a grow-only set, value plus version for a register.
+// elements for a grow-only set, value plus version for a register, and action
+// plus elements for an observed-remove set.
 type crdtOpIn struct {
 	ID       string          `json:"id"`
 	Value    json.RawMessage `json:"value"`
 	Elements []string        `json:"elements"`
 	Version  json.RawMessage `json:"version"`
+	Action   string          `json:"action"`
 }
 
 // crdtOpsRequest is the body of POST .../crdt/ops.
@@ -29,8 +31,8 @@ type crdtOpsRequest struct {
 // handleCRDTOps accepts a batch of CRDT operations for a document.
 //
 // The batch declares the document's type; the first accepted batch fixes it
-// to counter, gset or register and every later batch must declare the same
-// type. Two batches racing to declare different types serialize in one
+// to counter, gset, register or orset and every later batch must declare the
+// same type. Two batches racing to declare different types serialize in one
 // transaction: exactly one takes effect and the other is a 409 that writes
 // nothing.
 //
@@ -39,7 +41,8 @@ type crdtOpsRequest struct {
 // non-empty ops array of elements with non-empty ids, no in-batch duplicate
 // ids, and type-correct content (counter: an integer value; gset: an elements
 // array; register: any JSON value — null included — plus a non-negative
-// integer version). Any violation is a 400 with zero writes.
+// integer version; orset: an "add"/"remove" action plus an elements array).
+// Any violation is a 400 with zero writes.
 func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
@@ -51,8 +54,9 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
 		return
 	}
-	if req.Type != store.CRDTTypeCounter && req.Type != store.CRDTTypeGSet && req.Type != store.CRDTTypeRegister {
-		writeError(w, http.StatusBadRequest, `type must be "counter", "gset" or "register"`)
+	if req.Type != store.CRDTTypeCounter && req.Type != store.CRDTTypeGSet &&
+		req.Type != store.CRDTTypeRegister && req.Type != store.CRDTTypeORSet {
+		writeError(w, http.StatusBadRequest, `type must be "counter", "gset", "register" or "orset"`)
 		return
 	}
 	if len(req.Ops) == 0 {
@@ -112,6 +116,23 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 			}
 			crdtOp.Value = op.Value
 			crdtOp.Version = v
+		case store.CRDTTypeORSet:
+			if op.Action != store.ORSetActionAdd && op.Action != store.ORSetActionRemove {
+				writeError(w, http.StatusBadRequest, `each orset op must carry an action of "add" or "remove"`)
+				return
+			}
+			if len(op.Elements) == 0 {
+				writeError(w, http.StatusBadRequest, "each orset op must add or remove at least one element")
+				return
+			}
+			for _, element := range op.Elements {
+				if element == "" {
+					writeError(w, http.StatusBadRequest, "orset elements must be non-empty strings")
+					return
+				}
+			}
+			crdtOp.Action = op.Action
+			crdtOp.Elements = op.Elements
 		}
 		ops[i] = crdtOp
 	}
