@@ -24,6 +24,16 @@
 // merge is commutative, associative and idempotent, so every reader converges
 // to the same value regardless of arrival order.
 //
+// An orset (observed-remove set) operation either adds one element or removes
+// one. Every add introduces a fresh tag (its own operation id) for the
+// element; a remove tombstones exactly the tags it observes — the adds
+// accepted before it — and leaves later adds untouched, so a remove concurrent
+// with an add never deletes it. Removing an element that was never added (or
+// is already fully removed) is an accepted no-op. The merged state is the set
+// of elements with at least one live tag, presented in ascending order; the
+// merge is commutative, associative and idempotent, so every reader converges
+// to the same set regardless of arrival order.
+//
 // Every operation carries a stable, client-supplied id, unique per document.
 // Re-posting the same id with the same content and origin is idempotent; the
 // same id with different content or a different device is an
@@ -58,6 +68,18 @@ const (
 	// the value of the operation with the greatest version, ties broken by the
 	// lexicographically smaller operation id.
 	CRDTTypeRegister = "register"
+	// CRDTTypeORSet is the observed-remove set: the merged value is the set of
+	// elements with at least one add not tombstoned by an observed remove.
+	CRDTTypeORSet = "orset"
+)
+
+// OR-Set operation actions.
+const (
+	// CRDTORSetAdd adds the operation's element with a fresh tag.
+	CRDTORSetAdd = "add"
+	// CRDTORSetRemove tombstones every add tag for the element that the
+	// operation observes.
+	CRDTORSetRemove = "remove"
 )
 
 // ErrCRDTNotFound reports that no CRDT operation has ever been committed for
@@ -96,12 +118,18 @@ func (e *ErrCRDTConflict) Error() string {
 // For a register, Value is an arbitrary JSON value stored verbatim and
 // Version is a non-negative integer that must be strictly greater than every
 // version the same device has already had accepted. Elements is unused.
+//
+// For an orset, Action is "add" or "remove" and Element is the non-empty
+// string the operation adds or removes. Value, Elements and Version are
+// unused.
 type CRDTOp struct {
 	ID       string          // client-supplied stable id, unique per document
 	DeviceID string          // originating device (shared by the whole batch)
 	Value    json.RawMessage // counter: accumulated contribution; register: the value
 	Elements []string        // gset: elements to add
 	Version  int64           // register: logical version, per-device strictly increasing
+	Action   string          // orset: CRDTORSetAdd or CRDTORSetRemove
+	Element  string          // orset: the element the action applies to
 }
 
 // CRDTState is a document's merged CRDT state.
@@ -109,7 +137,9 @@ type CRDTOp struct {
 // Value holds the type-specific merged result: for a counter it decodes to the
 // JSON integer sum of per-device maxima; for a gset it decodes to the sorted
 // JSON array of every accepted element (an empty set is []); for a register it
-// is the winning operation's JSON value, exactly as submitted.
+// is the winning operation's JSON value, exactly as submitted; for an orset it
+// decodes to the sorted JSON array of the elements with at least one live add
+// (an empty set is []).
 type CRDTState struct {
 	Type  string          `json:"type"`
 	Value json.RawMessage `json:"value"`
@@ -153,12 +183,25 @@ CREATE TABLE IF NOT EXISTS crdt_register_ops (
 	value       BLOB NOT NULL,
 	PRIMARY KEY (document_id, id)
 );
+CREATE TABLE IF NOT EXISTS crdt_orset_tags (
+	document_id TEXT NOT NULL,
+	element     TEXT NOT NULL,
+	op_id       TEXT NOT NULL,
+	PRIMARY KEY (document_id, element, op_id)
+);
+CREATE TABLE IF NOT EXISTS crdt_orset_tombstones (
+	document_id TEXT NOT NULL,
+	element     TEXT NOT NULL,
+	op_id       TEXT NOT NULL,
+	removed_by  TEXT NOT NULL,
+	PRIMARY KEY (document_id, element, op_id)
+);
 `
 
 // SubmitCRDTOps validates and commits one CRDT batch atomically.
 //
 // declaredType is the type the client asserts for the document
-// ("counter", "gset" or "register"). It fixes the type on the document's
+// ("counter", "gset", "register" or "orset"). It fixes the type on the document's
 // first batch; every later batch must declare the same type. Two batches
 // declaring different types race in one serialized transaction, so exactly
 // one wins and the other gets an *ErrCRDTConflict (409).
@@ -172,10 +215,11 @@ CREATE TABLE IF NOT EXISTS crdt_register_ops (
 // failure rejects the whole batch. Results come back in request order.
 //
 // When the committed batch actually moved the merged state (a counter maximum
-// advanced, the set union grew or the register's winning value changed) the
-// document's CRDT state subscribers are notified with the new merged state
-// after the commit; idempotent repeats, rejected batches and no-op additions
-// change nothing and notify nobody.
+// advanced, the set union grew, the register's winning value changed or the
+// orset's live element set changed) the document's CRDT state subscribers are
+// notified with the new merged state after the commit; idempotent repeats,
+// rejected batches and no-op additions or removals change nothing and notify
+// nobody.
 func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]CRDTResult, error) {
 	// Serialize submissions with each other and with a subscriber's atomic
 	// register+initial-read: notifications then leave in commit order, and a
@@ -261,6 +305,12 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 		stateChanged = changed
 	case CRDTTypeRegister:
 		changed, err := applyRegisterOps(tx, documentID, ops, results)
+		if err != nil {
+			return nil, err
+		}
+		stateChanged = changed
+	case CRDTTypeORSet:
+		changed, err := applyORSetOps(tx, documentID, ops, results)
 		if err != nil {
 			return nil, err
 		}
@@ -505,6 +555,165 @@ func registerWinner(tx *sql.Tx, documentID string) (json.RawMessage, bool, error
 	}
 }
 
+// applyORSetOps resolves and applies every observed-remove-set operation
+// inside tx. A repeated id is idempotent only with the same device, action and
+// element; an idempotent replay applies nothing, so a replayed remove never
+// tombstones adds that landed after its first acceptance. An add tags the
+// element with its own operation id; a remove tombstones exactly the tags
+// already accepted for the element — adds that arrive later carry fresh tags
+// and are unaffected, and removing an element with no live (or no) tags is an
+// accepted no-op. It reports whether the merged state actually changed — only
+// a change in the set of elements with at least one live tag moves it.
+func applyORSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
+	// The merged element set before the batch, so a batch that leaves it
+	// untouched (an idempotent replay, an add of an already-present element,
+	// a remove with nothing observed) reports no change and notifies nobody.
+	prev, err := queryORSetElements(tx, documentID)
+	if err != nil {
+		return false, err
+	}
+
+	for i, op := range ops {
+		if op.Action != CRDTORSetAdd && op.Action != CRDTORSetRemove {
+			// The API boundary rejects unknown actions; one here means the
+			// caller skipped validation.
+			return false, &ErrCRDTConflict{ID: op.ID, Reason: `orset action must be "add" or "remove"`}
+		}
+
+		var existingDevice string
+		var existingContent []byte
+		err := tx.QueryRow(
+			`SELECT device_id, value FROM crdt_ops WHERE document_id = ? AND id = ?`,
+			documentID, op.ID,
+		).Scan(&existingDevice, &existingContent)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// New id; insert the op and apply its effect below.
+		case err != nil:
+			return false, err
+		default:
+			if existingDevice != op.DeviceID || !jsonEqual(existingContent, encodeORSetContent(op.Action, op.Element)) {
+				return false, &ErrCRDTConflict{
+					ID:     op.ID,
+					Reason: "operation id already exists with a different device, action or element",
+				}
+			}
+			results[i] = CRDTResult{ID: op.ID, Created: false}
+			continue
+		}
+
+		if _, err := tx.Exec(
+			`INSERT INTO crdt_ops (document_id, id, device_id, value) VALUES (?, ?, ?, ?)`,
+			documentID, op.ID, op.DeviceID, []byte(encodeORSetContent(op.Action, op.Element)),
+		); err != nil {
+			return false, err
+		}
+		if op.Action == CRDTORSetAdd {
+			// The tag is the operation id itself: unique per document, so the
+			// insert always lands and concurrent adds of the same element
+			// accumulate independent tags.
+			if _, err := tx.Exec(
+				`INSERT OR IGNORE INTO crdt_orset_tags (document_id, element, op_id) VALUES (?, ?, ?)`,
+				documentID, op.Element, op.ID,
+			); err != nil {
+				return false, err
+			}
+		} else {
+			// Tombstone exactly the tags this remove observes: the adds
+			// accepted before it. Tags created later are not in the table yet
+			// and survive; already-tombstoned tags are an identity insert.
+			if _, err := tx.Exec(
+				`INSERT OR IGNORE INTO crdt_orset_tombstones (document_id, element, op_id, removed_by)
+				 SELECT ?, ?, op_id, ? FROM crdt_orset_tags
+				 WHERE document_id = ? AND element = ?`,
+				documentID, op.Element, op.ID, documentID, op.Element,
+			); err != nil {
+				return false, err
+			}
+		}
+		results[i] = CRDTResult{ID: op.ID, Created: true}
+	}
+
+	next, err := queryORSetElements(tx, documentID)
+	if err != nil {
+		return false, err
+	}
+	return !stringSliceEqual(prev, next), nil
+}
+
+// orsetLiveElementsSQL selects the elements with at least one add tag no
+// tombstone covers, in ascending order — the orset merge, derived from the
+// accepted operations rather than cached.
+const orsetLiveElementsSQL = `
+SELECT DISTINCT element FROM crdt_orset_tags t
+WHERE t.document_id = ? AND NOT EXISTS (
+	SELECT 1 FROM crdt_orset_tombstones x
+	WHERE x.document_id = t.document_id
+	  AND x.element = t.element
+	  AND x.op_id = t.op_id
+)
+ORDER BY element ASC`
+
+// orsetQuerier is satisfied by both *sql.Tx (inside a submission) and *sql.DB
+// (a state read), so the merge query exists exactly once.
+type orsetQuerier interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+}
+
+// queryORSetElements returns the document's live orset elements in ascending
+// order. The empty set is an empty slice, never nil, so it marshals as [].
+func queryORSetElements(q orsetQuerier, documentID string) ([]string, error) {
+	rows, err := q.Query(orsetLiveElementsSQL, documentID)
+	if err != nil {
+		return nil, err
+	}
+	elements := make([]string, 0)
+	for rows.Next() {
+		var element string
+		if err := rows.Scan(&element); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		elements = append(elements, element)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+	return elements, nil
+}
+
+// encodeORSetContent renders an orset operation's content (its action and
+// element) as a JSON object for durable storage, so a later submission of the
+// same id can be compared against the original content.
+func encodeORSetContent(action, element string) json.RawMessage {
+	raw, err := json.Marshal(struct {
+		Action  string `json:"action"`
+		Element string `json:"element"`
+	}{Action: action, Element: element})
+	if err != nil {
+		// Strings always marshal.
+		return json.RawMessage(`{"action":"","element":""}`)
+	}
+	return raw
+}
+
+// stringSliceEqual reports whether a and b hold the same strings in the same
+// order. Both orset element lists are ascending, so order-sensitive equality
+// is set equality.
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // decodeCounterValue requires raw to be a non-negative JSON integer with no
 // fraction or exponent. Floats, strings, booleans and null are rejected at the
 // API boundary; a malformed integer here means the caller skipped validation.
@@ -552,9 +761,9 @@ func stringSetEqual(raw json.RawMessage, want []string) bool {
 // no committed operations yields ErrCRDTNotFound (the caller answers 404).
 //
 // The merged value is derived from the per-device maxima (counter), the union
-// table (gset) or the version/id ordering of the accepted operations
-// (register), not cached: it is exactly what any equivalent batch order would
-// converge to.
+// table (gset), the version/id ordering of the accepted operations (register)
+// or the live tags minus tombstones (orset), not cached: it is exactly what
+// any equivalent batch order would converge to.
 func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 	var docType string
 	err := s.db.QueryRow(
@@ -620,6 +829,16 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 			return CRDTState{}, err
 		}
 		return CRDTState{Type: docType, Value: json.RawMessage(value)}, nil
+	case CRDTTypeORSet:
+		elements, err := queryORSetElements(s.db, documentID)
+		if err != nil {
+			return CRDTState{}, err
+		}
+		raw, err := json.Marshal(elements)
+		if err != nil {
+			return CRDTState{}, err
+		}
+		return CRDTState{Type: docType, Value: raw}, nil
 	default:
 		return CRDTState{}, fmt.Errorf("unknown crdt type %q stored for document", docType)
 	}
