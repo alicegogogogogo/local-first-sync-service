@@ -1,8 +1,9 @@
 // CRDT state sits beside the change log as an independent, automatically
 // mergeable state layer. A document's CRDT type is declared with its first
-// operation batch — "counter" or "gset" (a grow-only set) — and never changes
-// afterward; two batches declaring different types concurrently serialize in
-// one transaction and exactly one takes effect.
+// operation batch — "counter", "gset" (a grow-only set) or "register" (a
+// last-writer-wins register) — and never changes afterward; two batches
+// declaring different types concurrently serialize in one transaction and
+// exactly one takes effect.
 //
 // A counter operation carries the originating device's accumulated
 // contribution. Each device's contribution only moves forward (a regressing
@@ -13,6 +14,15 @@
 // A gset operation adds elements; the merged state is the union of every
 // accepted element, presented in ascending order. Re-adding an element does
 // not change the state.
+//
+// A register operation carries an arbitrary JSON value (null, number, string,
+// array or object, stored verbatim) and a non-negative integer version. A
+// device's versions only move strictly forward (a regressing or equal version
+// is an ErrCRDTConflict and changes nothing), and the merged state is the
+// value of the operation with the greatest version, ties broken by the
+// lexicographically smaller operation id — a last-writer-wins register whose
+// merge is commutative, associative and idempotent, so every reader converges
+// to the same value regardless of arrival order.
 //
 // Every operation carries a stable, client-supplied id, unique per document.
 // Re-posting the same id with the same content and origin is idempotent; the
@@ -44,6 +54,10 @@ const (
 	// CRDTTypeGSet is the grow-only set: the merged value is the union of all
 	// added elements.
 	CRDTTypeGSet = "gset"
+	// CRDTTypeRegister is the last-writer-wins register: the merged value is
+	// the value of the operation with the greatest version, ties broken by the
+	// lexicographically smaller operation id.
+	CRDTTypeRegister = "register"
 )
 
 // ErrCRDTNotFound reports that no CRDT operation has ever been committed for
@@ -74,22 +88,28 @@ func (e *ErrCRDTConflict) Error() string {
 //
 // For a counter, Value is the device's accumulated contribution: it must be a
 // JSON number that is a non-negative integer, and it may never decrease for
-// the same device. Elements is unused.
+// the same device. Elements and Version are unused.
 //
 // For a gset, Elements lists the strings the operation adds to the set and
-// must be non-empty; Value is unused.
+// must be non-empty; Value and Version are unused.
+//
+// For a register, Value is an arbitrary JSON value stored verbatim and
+// Version is a non-negative integer that must be strictly greater than every
+// version the same device has already had accepted. Elements is unused.
 type CRDTOp struct {
 	ID       string          // client-supplied stable id, unique per document
 	DeviceID string          // originating device (shared by the whole batch)
-	Value    json.RawMessage // counter: the device's accumulated contribution
+	Value    json.RawMessage // counter: accumulated contribution; register: the value
 	Elements []string        // gset: elements to add
+	Version  int64           // register: logical version, per-device strictly increasing
 }
 
 // CRDTState is a document's merged CRDT state.
 //
 // Value holds the type-specific merged result: for a counter it decodes to the
 // JSON integer sum of per-device maxima; for a gset it decodes to the sorted
-// JSON array of every accepted element (an empty set is []).
+// JSON array of every accepted element (an empty set is []); for a register it
+// is the winning operation's JSON value, exactly as submitted.
 type CRDTState struct {
 	Type  string          `json:"type"`
 	Value json.RawMessage `json:"value"`
@@ -125,27 +145,37 @@ CREATE TABLE IF NOT EXISTS crdt_set_elements (
 	element     TEXT NOT NULL,
 	PRIMARY KEY (document_id, element)
 );
+CREATE TABLE IF NOT EXISTS crdt_register_ops (
+	document_id TEXT NOT NULL,
+	id          TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	version     INTEGER NOT NULL,
+	value       BLOB NOT NULL,
+	PRIMARY KEY (document_id, id)
+);
 `
 
 // SubmitCRDTOps validates and commits one CRDT batch atomically.
 //
 // declaredType is the type the client asserts for the document
-// ("counter" or "gset"). It fixes the type on the document's first batch;
-// every later batch must declare the same type. Two batches declaring
-// different types race in one serialized transaction, so exactly one wins and
-// the other gets an *ErrCRDTConflict (409).
+// ("counter", "gset" or "register"). It fixes the type on the document's
+// first batch; every later batch must declare the same type. Two batches
+// declaring different types race in one serialized transaction, so exactly
+// one wins and the other gets an *ErrCRDTConflict (409).
 //
 // The device is gated first (ErrDeviceNotFound / ErrPermissionDenied) before
 // any CRDT content is read. Every operation is then resolved against the
 // committed history: a repeated id is idempotent only with the same device and
 // content, otherwise it is an *ErrCRDTConflict; a counter contribution below
-// the device's current maximum is likewise an *ErrCRDTConflict. Any failure
-// rejects the whole batch. Results come back in request order.
+// the device's current maximum, or a register version not strictly greater
+// than the device's accepted versions, is likewise an *ErrCRDTConflict. Any
+// failure rejects the whole batch. Results come back in request order.
 //
 // When the committed batch actually moved the merged state (a counter maximum
-// advanced or the set union grew) the document's CRDT state subscribers are
-// notified with the new merged state after the commit; idempotent repeats,
-// rejected batches and no-op additions change nothing and notify nobody.
+// advanced, the set union grew or the register's winning value changed) the
+// document's CRDT state subscribers are notified with the new merged state
+// after the commit; idempotent repeats, rejected batches and no-op additions
+// change nothing and notify nobody.
 func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]CRDTResult, error) {
 	// Serialize submissions with each other and with a subscriber's atomic
 	// register+initial-read: notifications then leave in commit order, and a
@@ -225,6 +255,12 @@ func (s *Store) SubmitCRDTOps(documentID, declaredType string, ops []CRDTOp) ([]
 		stateChanged = changed
 	case CRDTTypeGSet:
 		changed, err := applyGSetOps(tx, documentID, ops, results)
+		if err != nil {
+			return nil, err
+		}
+		stateChanged = changed
+	case CRDTTypeRegister:
+		changed, err := applyRegisterOps(tx, documentID, ops, results)
 		if err != nil {
 			return nil, err
 		}
@@ -371,6 +407,104 @@ func applyGSetOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTRes
 	return changed, nil
 }
 
+// applyRegisterOps resolves and applies every register operation inside tx. A
+// repeated id is idempotent only with the same device, version and value. A
+// new id whose version is not strictly greater than every version already
+// accepted from the same device regresses (or stalls) the device's clock and
+// is rejected. It reports whether the merged state actually changed — only a
+// change of the winning operation's value moves it.
+func applyRegisterOps(tx *sql.Tx, documentID string, ops []CRDTOp, results []CRDTResult) (bool, error) {
+	// The merged value before the batch, so a batch that leaves the winner's
+	// value untouched (an idempotent replay, or a new op that loses the
+	// last-writer-wins comparison) reports no change and notifies nobody.
+	prev, prevOK, err := registerWinner(tx, documentID)
+	if err != nil {
+		return false, err
+	}
+
+	for i, op := range ops {
+		if op.Version < 0 {
+			// The API boundary rejects negative versions; a negative version
+			// here means the caller skipped validation.
+			return false, &ErrCRDTConflict{ID: op.ID, Reason: "register version must be a non-negative integer"}
+		}
+
+		var existingDevice string
+		var existingVersion int64
+		var existingValue []byte
+		err := tx.QueryRow(
+			`SELECT device_id, version, value FROM crdt_register_ops WHERE document_id = ? AND id = ?`,
+			documentID, op.ID,
+		).Scan(&existingDevice, &existingVersion, &existingValue)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// New id: the device's versions only move strictly forward. The
+			// per-device maximum is derived from the accepted ops, so the
+			// decision is durable across restarts without extra state.
+			var maxVersion sql.NullInt64
+			if scanErr := tx.QueryRow(
+				`SELECT MAX(version) FROM crdt_register_ops WHERE document_id = ? AND device_id = ?`,
+				documentID, op.DeviceID,
+			).Scan(&maxVersion); scanErr != nil {
+				return false, scanErr
+			}
+			if maxVersion.Valid && op.Version <= maxVersion.Int64 {
+				return false, &ErrCRDTConflict{
+					ID:     op.ID,
+					Reason: "register version must be greater than the device's previously accepted version",
+				}
+			}
+			if _, err := tx.Exec(
+				`INSERT INTO crdt_register_ops (document_id, id, device_id, version, value) VALUES (?, ?, ?, ?, ?)`,
+				documentID, op.ID, op.DeviceID, op.Version, []byte(op.Value),
+			); err != nil {
+				return false, err
+			}
+			results[i] = CRDTResult{ID: op.ID, Created: true}
+		case err != nil:
+			return false, err
+		default:
+			if existingDevice != op.DeviceID || existingVersion != op.Version || !jsonEqual(existingValue, op.Value) {
+				return false, &ErrCRDTConflict{
+					ID:     op.ID,
+					Reason: "operation id already exists with a different device, version or value",
+				}
+			}
+			results[i] = CRDTResult{ID: op.ID, Created: false}
+		}
+	}
+
+	next, nextOK, err := registerWinner(tx, documentID)
+	if err != nil {
+		return false, err
+	}
+	// The merge is the winner's value; a new winner carrying a JSON-equal
+	// value does not move the state.
+	changed := prevOK != nextOK || (prevOK && nextOK && !jsonEqual(prev, next))
+	return changed, nil
+}
+
+// registerWinner returns the value the register currently merges to: the
+// value of the accepted operation with the greatest version, ties broken by
+// the lexicographically smaller operation id. It reports false when the
+// document has no accepted register operation yet.
+func registerWinner(tx *sql.Tx, documentID string) (json.RawMessage, bool, error) {
+	var value []byte
+	err := tx.QueryRow(
+		`SELECT value FROM crdt_register_ops WHERE document_id = ?
+		 ORDER BY version DESC, id ASC LIMIT 1`,
+		documentID,
+	).Scan(&value)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	default:
+		return json.RawMessage(value), true, nil
+	}
+}
+
 // decodeCounterValue requires raw to be a non-negative JSON integer with no
 // fraction or exponent. Floats, strings, booleans and null are rejected at the
 // API boundary; a malformed integer here means the caller skipped validation.
@@ -417,9 +551,10 @@ func stringSetEqual(raw json.RawMessage, want []string) bool {
 // GetCRDTState returns the merged CRDT state for documentID. A document with
 // no committed operations yields ErrCRDTNotFound (the caller answers 404).
 //
-// The merged value is derived from the per-device maxima (counter) or the
-// union table (gset), not cached: it is exactly what any equivalent batch
-// order would converge to.
+// The merged value is derived from the per-device maxima (counter), the union
+// table (gset) or the version/id ordering of the accepted operations
+// (register), not cached: it is exactly what any equivalent batch order would
+// converge to.
 func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 	var docType string
 	err := s.db.QueryRow(
@@ -473,6 +608,18 @@ func (s *Store) GetCRDTState(documentID string) (CRDTState, error) {
 			return CRDTState{}, err
 		}
 		return CRDTState{Type: docType, Value: raw}, nil
+	case CRDTTypeRegister:
+		// A document's type row commits together with its first batch, so a
+		// register document always has at least one accepted operation.
+		var value []byte
+		if err := s.db.QueryRow(
+			`SELECT value FROM crdt_register_ops WHERE document_id = ?
+			 ORDER BY version DESC, id ASC LIMIT 1`,
+			documentID,
+		).Scan(&value); err != nil {
+			return CRDTState{}, err
+		}
+		return CRDTState{Type: docType, Value: json.RawMessage(value)}, nil
 	default:
 		return CRDTState{}, fmt.Errorf("unknown crdt type %q stored for document", docType)
 	}

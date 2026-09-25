@@ -9,13 +9,14 @@ import (
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
-// crdtOpIn is one element of a CRDT submission. Exactly one content field is
+// crdtOpIn is one element of a CRDT submission. Exactly one content shape is
 // meaningful depending on the declared document type: value for a counter,
-// elements for a grow-only set.
+// elements for a grow-only set, value plus version for a register.
 type crdtOpIn struct {
 	ID       string          `json:"id"`
 	Value    json.RawMessage `json:"value"`
 	Elements []string        `json:"elements"`
+	Version  json.RawMessage `json:"version"`
 }
 
 // crdtOpsRequest is the body of POST .../crdt/ops.
@@ -27,16 +28,18 @@ type crdtOpsRequest struct {
 
 // handleCRDTOps accepts a batch of CRDT operations for a document.
 //
-// The batch declares the document's type; the first accepted batch fixes it to
-// counter or gset and every later batch must declare the same type. Two
-// batches racing to declare different types serialize in one transaction:
-// exactly one takes effect and the other is a 409 that writes nothing.
+// The batch declares the document's type; the first accepted batch fixes it
+// to counter, gset or register and every later batch must declare the same
+// type. Two batches racing to declare different types serialize in one
+// transaction: exactly one takes effect and the other is a 409 that writes
+// nothing.
 //
 // The strict body contract matches the other JSON endpoints: application/json,
 // one JSON value, no trailing content, a non-empty deviceId, a valid type, a
 // non-empty ops array of elements with non-empty ids, no in-batch duplicate
 // ids, and type-correct content (counter: an integer value; gset: an elements
-// array). Any violation is a 400 with zero writes.
+// array; register: any JSON value — null included — plus a non-negative
+// integer version). Any violation is a 400 with zero writes.
 func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
@@ -48,8 +51,8 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
 		return
 	}
-	if req.Type != store.CRDTTypeCounter && req.Type != store.CRDTTypeGSet {
-		writeError(w, http.StatusBadRequest, `type must be "counter" or "gset"`)
+	if req.Type != store.CRDTTypeCounter && req.Type != store.CRDTTypeGSet && req.Type != store.CRDTTypeRegister {
+		writeError(w, http.StatusBadRequest, `type must be "counter", "gset" or "register"`)
 		return
 	}
 	if len(req.Ops) == 0 {
@@ -94,6 +97,21 @@ func handleCRDTOps(s *store.Store, w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			crdtOp.Elements = op.Elements
+		case store.CRDTTypeRegister:
+			// The value may be any JSON, null included; only an absent field
+			// (a nil RawMessage — an explicit null decodes to the bytes
+			// "null") is a missing field. The value is stored verbatim.
+			if op.Value == nil {
+				writeError(w, http.StatusBadRequest, "each register op must carry a value")
+				return
+			}
+			v, ok := parseNonNegativeInt(op.Version)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "each register op must carry an integer version >= 0")
+				return
+			}
+			crdtOp.Value = op.Value
+			crdtOp.Version = v
 		}
 		ops[i] = crdtOp
 	}
@@ -207,8 +225,8 @@ func writeCRDTState(w http.ResponseWriter, state store.CRDTState) {
 
 // marshalCRDTState encodes a CRDT state the single way every surface emits it:
 // compact single-line JSON with the keys in type, value order and one trailing
-// newline. The value is a native JSON number or array rather than an escaped
-// blob.
+// newline. The value is embedded as native JSON (a number, an array, or a
+// register's arbitrary JSON value) rather than an escaped blob.
 func marshalCRDTState(state store.CRDTState) []byte {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)

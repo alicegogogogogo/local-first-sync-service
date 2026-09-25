@@ -213,6 +213,12 @@ func TestCRDTOpsValidation400(t *testing.T) {
 		{"gset missing elements", `{"deviceId":"dev-1","type":"gset","ops":[{"id":"a"}]}`},
 		{"gset empty elements", `{"deviceId":"dev-1","type":"gset","ops":[{"id":"a","elements":[]}]}`},
 		{"gset empty element string", `{"deviceId":"dev-1","type":"gset","ops":[{"id":"a","elements":["x",""]}]}`},
+		{"register missing value", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":1}]}`},
+		{"register missing version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1}]}`},
+		{"register null version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1,"version":null}]}`},
+		{"register fractional version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1,"version":1.5}]}`},
+		{"register negative version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1,"version":-1}]}`},
+		{"register string version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1,"version":"1"}]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -468,5 +474,147 @@ func TestSubscribeMalformedPathsStill400WithSubscribeId(t *testing.T) {
 		"/v1/sessions/subscribe/documents/subscribe/changes/subscribe/extra")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("extra segment = %d, want 400", w.Code)
+	}
+}
+
+func crdtRegisterBody(device string, ops ...map[string]any) map[string]any {
+	return map[string]any{"deviceId": device, "type": "register", "ops": ops}
+}
+
+func TestCRDTRegisterEndToEnd(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+
+	post := func(device, id string, version int, value any) *httptest.ResponseRecorder {
+		t.Helper()
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody(device,
+			map[string]any{"id": id, "version": version, "value": value}))
+		return w
+	}
+
+	if w := post("dev-1", "a1", 1, "first"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := post("dev-2", "b1", 4, map[string]any{"winner": true}); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// A lower version from dev-1 loses the merge but is still accepted.
+	if w := post("dev-1", "a2", 2, "loser"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if w.Code != http.StatusOK {
+		t.Fatalf("state = %d %s", w.Code, w.Body.String())
+	}
+	if body["type"] != "register" {
+		t.Fatalf("type = %v", body["type"])
+	}
+	value, ok := body["value"].(map[string]any)
+	if !ok || value["winner"] != true {
+		t.Fatalf("value = %v, want the v4 object", body["value"])
+	}
+	// The body is compact single-line JSON with one trailing newline.
+	if got := w.Body.String(); got != `{"type":"register","value":{"winner":true}}`+"\n" {
+		t.Fatalf("raw body = %q", got)
+	}
+}
+
+func TestCRDTRegisterNullAndScalarValues(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	// An explicit null value is a legal register value.
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops",
+		`{"deviceId":"dev-1","type":"register","ops":[{"id":"a1","version":1,"value":null}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("null value = %d %s", w.Code, w.Body.String())
+	}
+	w, _ = doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if got := w.Body.String(); got != `{"type":"register","value":null}`+"\n" {
+		t.Fatalf("null state body = %q", got)
+	}
+
+	// An array value overtakes it with a greater version.
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops",
+		`{"deviceId":"dev-1","type":"register","ops":[{"id":"a2","version":2,"value":[1,"two",null]}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, _ = doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if got := w.Body.String(); got != `{"type":"register","value":[1,"two",null]}`+"\n" {
+		t.Fatalf("array state body = %q", got)
+	}
+}
+
+func TestCRDTRegisterVersionConflictIs409(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	post := func(id string, version int, value string) *httptest.ResponseRecorder {
+		t.Helper()
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+			map[string]any{"id": id, "version": version, "value": value}))
+		return w
+	}
+	if w := post("a1", 5, "five"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// A regressing version is a 409.
+	if w := post("a2", 4, "four"); w.Code != http.StatusConflict {
+		t.Fatalf("regression = %d, want 409", w.Code)
+	}
+	// An equal version with a fresh id is a 409 too.
+	if w := post("a3", 5, "five-again"); w.Code != http.StatusConflict {
+		t.Fatalf("stall = %d, want 409", w.Code)
+	}
+	// The identical repeat is idempotent, not a conflict.
+	w, body := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+		map[string]any{"id": "a1", "version": 5, "value": "five"}))
+	if w.Code != http.StatusOK {
+		t.Fatalf("idempotent repeat = %d %s", w.Code, w.Body.String())
+	}
+	if body["results"].([]any)[0].(map[string]any)["created"].(bool) {
+		t.Fatal("identical repeat must be created=false")
+	}
+	// Same id with a different value or version is a 409.
+	if w := post("a1", 5, "different"); w.Code != http.StatusConflict {
+		t.Fatalf("different value = %d, want 409", w.Code)
+	}
+	if w := post("a1", 6, "five"); w.Code != http.StatusConflict {
+		t.Fatalf("different version = %d, want 409", w.Code)
+	}
+
+	// The rejections moved nothing.
+	w, state := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if w.Code != http.StatusOK || state["value"] != "five" {
+		t.Fatalf("state = %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCRDTRegisterTypeFixation409(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+		map[string]any{"id": "r1", "version": 1, "value": 1}))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// Counter and gset batches are now 409; the register state is unchanged.
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtCounterBody("dev-1",
+		map[string]any{"id": "c1", "value": 1}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("counter after register = %d, want 409", w.Code)
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtGSetBody("dev-1",
+		map[string]any{"id": "g1", "elements": []string{"x"}}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("gset after register = %d, want 409", w.Code)
+	}
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if w.Code != http.StatusOK || body["type"] != "register" {
+		t.Fatalf("state = %d %s", w.Code, w.Body.String())
 	}
 }

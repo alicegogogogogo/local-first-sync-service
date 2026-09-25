@@ -746,3 +746,74 @@ func registerDeviceViaHTTP(t *testing.T, srv *httptest.Server, device string) {
 		t.Fatalf("register %s = %d", device, code)
 	}
 }
+
+func crdtRegisterOp(id string, version int, value any) map[string]any {
+	return map[string]any{"id": id, "version": version, "value": value}
+}
+
+// Register commits that move the winning value push immediately; idempotent
+// repeats, losing (lower-version) ops carrying an already-winning value, and
+// rejected stalls change no state and push nothing.
+func TestCRDTSubscribeRegisterPushesOnlyRealChanges(t *testing.T) {
+	srv, _ := newWSTestServer(t)
+	setupSession(t, srv, "dev-1", "sess", "doc", 0)
+
+	conn, hs := dialWS(t, crdtSubscribeURL(srv, "sess", "doc"))
+	if conn == nil {
+		t.Fatalf("status = %d, want 101", hs.StatusCode)
+	}
+	defer conn.close()
+
+	// First ever state: the v1 string.
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-1", crdtRegisterOp("a1", 1, "one"))); code != http.StatusOK {
+		t.Fatalf("submit = %d", code)
+	}
+	state := conn.readCRDTState()
+	if state.Type != "register" || string(state.Value) != `"one"` {
+		t.Fatalf("frame = %s %s, want register \"one\"", state.Type, state.Value)
+	}
+
+	// Idempotent repeat of the same op pushes nothing.
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-1", crdtRegisterOp("a1", 1, "one"))); code != http.StatusOK {
+		t.Fatalf("idempotent resubmit = %d", code)
+	}
+	// A stalled version is a 409 and pushes nothing.
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-1", crdtRegisterOp("a2", 1, "stall"))); code != http.StatusConflict {
+		t.Fatalf("stall = %d, want 409", code)
+	}
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("an idempotent/rejected commit pushed a frame")
+	}
+	conn.clearReadDeadline()
+
+	// A greater version pushes the new winning value.
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-1", crdtRegisterOp("a3", 2, "two"))); code != http.StatusOK {
+		t.Fatalf("advance = %d", code)
+	}
+	state = conn.readCRDTState()
+	if string(state.Value) != `"two"` {
+		t.Fatalf("frame = %s, want \"two\"", state.Value)
+	}
+
+	// A new op that loses the merge (lower version from another device) is
+	// accepted but pushes nothing.
+	registerDeviceViaHTTP(t, srv, "dev-2")
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-2", crdtRegisterOp("b1", 1, "loser"))); code != http.StatusOK {
+		t.Fatalf("losing submit = %d", code)
+	}
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("a losing op pushed a frame")
+	}
+	conn.clearReadDeadline()
+
+	// A version tie goes to the smaller op id and pushes the new winner.
+	if code := postCRDTOps(t, srv, "doc", crdtRegisterBody("dev-2", crdtRegisterOp("a0", 2, "tie-winner"))); code != http.StatusOK {
+		t.Fatalf("tie submit = %d", code)
+	}
+	state = conn.readCRDTState()
+	if string(state.Value) != `"tie-winner"` {
+		t.Fatalf("frame = %s, want \"tie-winner\"", state.Value)
+	}
+}
