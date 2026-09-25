@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -468,5 +469,193 @@ func TestSubscribeMalformedPathsStill400WithSubscribeId(t *testing.T) {
 		"/v1/sessions/subscribe/documents/subscribe/changes/subscribe/extra")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("extra segment = %d, want 400", w.Code)
+	}
+}
+
+func crdtRegisterBody(device string, ops ...map[string]any) map[string]any {
+	return map[string]any{"deviceId": device, "type": "register", "ops": ops}
+}
+
+func TestCRDTRegisterEndToEnd(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+
+	post := func(device, id string, version int, value any) *httptest.ResponseRecorder {
+		t.Helper()
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody(device,
+			map[string]any{"id": id, "version": version, "value": value}))
+		return w
+	}
+	if w := post("dev-1", "a1", 2, "low"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := post("dev-2", "b1", 5, map[string]any{"k": 1}); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := post("dev-1", "a2", 3, "mid"); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+
+	w, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if w.Code != http.StatusOK {
+		t.Fatalf("state = %d %s", w.Code, w.Body.String())
+	}
+	if body["type"] != "register" {
+		t.Fatalf("type = %v", body["type"])
+	}
+	// The winning value is the raw JSON content, not an escaped blob.
+	value, ok := body["value"].(map[string]any)
+	if !ok || value["k"].(float64) != 1 {
+		t.Fatalf("value = %v, want {\"k\":1}", body["value"])
+	}
+	// The body is the exact compact single-line form with a trailing newline.
+	if got := w.Body.String(); got != "{\"type\":\"register\",\"value\":{\"k\":1}}\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestCRDTRegisterValueShapesEndToEnd(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	// Every legal JSON value is accepted as-is, null included.
+	values := []string{`null`, `0`, `-3.5`, `"text"`, `true`, `[1,"a",null]`, `{"a":[1,2],"b":{"c":null}}`}
+	for i, v := range values {
+		raw := fmt.Sprintf(`{"deviceId":"dev-1","type":"register","ops":[{"id":"r%d","version":%d,"value":%s}]}`, i, i, v)
+		w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", raw)
+		if w.Code != http.StatusOK {
+			t.Fatalf("value %s: %d %s", v, w.Code, w.Body.String())
+		}
+		w2, _ := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+		want := "{\"type\":\"register\",\"value\":" + v + "}\n"
+		if w2.Body.String() != want {
+			t.Fatalf("state body = %q, want %q", w2.Body.String(), want)
+		}
+	}
+}
+
+func TestCRDTRegisterVersionConflictIs409(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+		map[string]any{"id": "a1", "version": 5, "value": "v5"}))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// Regression and equal versions are both 409 and change nothing.
+	for _, version := range []int{4, 5} {
+		w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+			map[string]any{"id": "a2", "version": version, "value": "nope"}))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("version %d status = %d, want 409", version, w.Code)
+		}
+	}
+	_, body := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if body["value"].(string) != "v5" {
+		t.Fatalf("value after conflicts = %v, want v5", body["value"])
+	}
+}
+
+func TestCRDTRegisterIdempotentRepeatAndConflict(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	registerDevice(t, h, "dev-2")
+
+	body := crdtRegisterBody("dev-1", map[string]any{"id": "r1", "version": 2, "value": []any{1, 2}})
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", body)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// Identical repeat: created=false, still 200.
+	w, resp := postJSON(t, h, "/v1/documents/doc/crdt/ops", body)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if resp["results"].([]any)[0].(map[string]any)["created"].(bool) {
+		t.Fatal("identical repeat must be created=false")
+	}
+	// Same id with a different value, version or device: 409.
+	clashes := []map[string]any{
+		{"id": "r1", "version": 2, "value": []any{1, 3}},
+		{"id": "r1", "version": 3, "value": []any{1, 2}},
+	}
+	for _, op := range clashes {
+		w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1", op))
+		if w.Code != http.StatusConflict {
+			t.Fatalf("clash %v = %d, want 409", op, w.Code)
+		}
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-2",
+		map[string]any{"id": "r1", "version": 2, "value": []any{1, 2}}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("cross-device repeat = %d, want 409", w.Code)
+	}
+}
+
+func TestCRDTRegisterValidation400(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	url := "/v1/documents/doc/crdt/ops"
+
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"missing version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","value":1}]}`},
+		{"negative version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":-1,"value":1}]}`},
+		{"fractional version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":1.5,"value":1}]}`},
+		{"string version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":"1","value":1}]}`},
+		{"null version", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":null,"value":1}]}`},
+		{"missing value", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":1}]}`},
+		{"dup op ids", `{"deviceId":"dev-1","type":"register","ops":[{"id":"a","version":1,"value":1},{"id":"a","version":2,"value":2}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, _ := postJSON(t, h, url, tc.raw)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d %s, want 400", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// A rejected batch writes nothing: the document still has no state.
+	w, _ := doRequest(t, h, http.MethodGet, "/v1/documents/doc/crdt/state")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("state after only-bad batches = %d, want 404", w.Code)
+	}
+}
+
+func TestCRDTRegisterTypeFixation(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	w, _ := postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtRegisterBody("dev-1",
+		map[string]any{"id": "r1", "version": 0, "value": "x"}))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	// Counter and gset declarations on a register document are 409.
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtCounterBody("dev-1",
+		map[string]any{"id": "c1", "value": 1}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("register->counter = %d, want 409", w.Code)
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc/crdt/ops", crdtGSetBody("dev-1",
+		map[string]any{"id": "g1", "elements": []string{"x"}}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("register->gset = %d, want 409", w.Code)
+	}
+	// And the reverse: register on a counter document is 409 too.
+	w, _ = postJSON(t, h, "/v1/documents/doc2/crdt/ops", crdtCounterBody("dev-1",
+		map[string]any{"id": "c1", "value": 1}))
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc2/crdt/ops", crdtRegisterBody("dev-1",
+		map[string]any{"id": "r1", "version": 0, "value": "x"}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("counter->register = %d, want 409", w.Code)
 	}
 }

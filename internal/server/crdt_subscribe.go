@@ -26,7 +26,8 @@ import (
 // document without any CRDT operation yet sends nothing and waits silently
 // until its first state appears. From then on every commit that actually
 // changes the merge — a counter's per-device maximum advancing, the set union
-// growing — is pushed as one text frame in transaction-commit order.
+// growing, the register's winning operation changing — is pushed as one text
+// frame in transaction-commit order.
 // Idempotent repeats, rejected regressions and wholly invalid batches change
 // no state and produce no frame; re-adding an existing set element pushes
 // nothing either.

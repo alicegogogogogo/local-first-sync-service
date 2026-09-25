@@ -746,3 +746,73 @@ func registerDeviceViaHTTP(t *testing.T, srv *httptest.Server, device string) {
 		t.Fatalf("register %s = %d", device, code)
 	}
 }
+
+// A register commit that changes the winning operation pushes the new value;
+// idempotent repeats, losing operations and rejected versions push nothing.
+func TestCRDTSubscribeRegisterPushesOnlyRealChanges(t *testing.T) {
+	srv, _ := newWSTestServer(t)
+	setupSession(t, srv, "dev-1", "sess", "doc", 0)
+
+	registerOp := func(id string, version int, value any) map[string]any {
+		return map[string]any{"deviceId": "dev-1", "type": "register",
+			"ops": []any{map[string]any{"id": id, "version": version, "value": value}}}
+	}
+
+	conn, hs := dialWS(t, crdtSubscribeURL(srv, "sess", "doc"))
+	if conn == nil {
+		t.Fatalf("status = %d", hs.StatusCode)
+	}
+	defer conn.close()
+
+	// First ever state: the winning value, byte-identical to the state read.
+	if code := postCRDTOps(t, srv, "doc", registerOp("r1", 1, "one")); code != http.StatusOK {
+		t.Fatalf("submit = %d", code)
+	}
+	raw := conn.readCRDTRaw()
+	if string(raw) != "{\"type\":\"register\",\"value\":\"one\"}\n" {
+		t.Fatalf("frame = %q", raw)
+	}
+
+	// Idempotent repeat of the same id/value/version pushes nothing.
+	if code := postCRDTOps(t, srv, "doc", registerOp("r1", 1, "one")); code != http.StatusOK {
+		t.Fatalf("idempotent resubmit = %d", code)
+	}
+	// A rejected regression (equal or lower version) is a 409 and pushes nothing.
+	if code := postCRDTOps(t, srv, "doc", registerOp("r2", 1, "other")); code != http.StatusConflict {
+		t.Fatalf("equal version = %d, want 409", code)
+	}
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("an idempotent or rejected commit pushed a frame")
+	}
+	conn.clearReadDeadline()
+
+	// An accepted operation that does not overtake the winner pushes nothing:
+	// dev-2's version-2 object loses to dev-1's later version-3 value.
+	registerDeviceViaHTTP(t, srv, "dev-2")
+	if code := postCRDTOps(t, srv, "doc", map[string]any{"deviceId": "dev-1", "type": "register",
+		"ops": []any{map[string]any{"id": "r3", "version": 3, "value": "three"}}}); code != http.StatusOK {
+		t.Fatalf("advance = %d", code)
+	}
+	if state := conn.readCRDTState(); string(state.Value) != `"three"` {
+		t.Fatalf("frame = %s, want \"three\"", state.Value)
+	}
+	if code := postCRDTOps(t, srv, "doc", map[string]any{"deviceId": "dev-2", "type": "register",
+		"ops": []any{map[string]any{"id": "r4", "version": 2, "value": "loser"}}}); code != http.StatusOK {
+		t.Fatalf("losing submit = %d", code)
+	}
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("a losing register op pushed a frame")
+	}
+	conn.clearReadDeadline()
+
+	// A larger version from dev-2 overtakes and pushes the new winner.
+	if code := postCRDTOps(t, srv, "doc", map[string]any{"deviceId": "dev-2", "type": "register",
+		"ops": []any{map[string]any{"id": "r5", "version": 4, "value": map[string]any{"k": 1}}}}); code != http.StatusOK {
+		t.Fatalf("dev-2 advance = %d", code)
+	}
+	if raw := conn.readCRDTRaw(); string(raw) != "{\"type\":\"register\",\"value\":{\"k\":1}}\n" {
+		t.Fatalf("frame = %q", raw)
+	}
+}
