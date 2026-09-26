@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strings"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
@@ -287,6 +288,70 @@ func handleSetAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Reques
 		"authorized": authorized,
 		"changed":    changed,
 	})
+}
+
+// handleDeleteAttachment removes the calling device's own attachment: the
+// metadata row, every received chunk (including a partial unfinished
+// upload's), the sealed content's claim and every granted reader are removed
+// together. Only the creator may delete it — a non-creator gets a 403, an
+// unknown or already-deleted attachment a 404, neither changing anything.
+// The digest-addressed bytes are reclaimed only when no completed attachment
+// references them anymore, so other attachments keep reading their bytes.
+// After the commit the id reads as not-found for everyone, including granted
+// devices, and can be created again as a brand-new upload; a repeat delete is
+// a 404 that changes nothing.
+func handleDeleteAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	if err := s.DeleteAttachment(deviceID, attachmentID); err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to delete attachment")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"attachmentId": attachmentID, "deleted": true})
+}
+
+// malformedAttachmentDeletePath reports whether a DELETE targets the
+// attachment namespace but is not at the exact delete location
+// (/v1/devices/{deviceId}/attachments/{attachmentId}): the collection path
+// (a missing attachment id), a sub-resource such as chunks/complete/access
+// (an extra segment), a trailing slash, or an "attachments" keyword reached
+// in the wrong shape. ServeMux would answer those with a plain-text
+// 404/405; every failure of the delete endpoint must be a JSON 400 instead.
+// Empty segments are already rejected by the guard itself, and non-DELETE
+// verbs are out of scope: the registered GET/POST/PUT routes and the
+// method-less 400 pattern on the exact member path already cover them.
+//
+// "attachments" is treated as the keyword only in the second segment (index
+// 1, right after the device identifier); a device identifier literally named
+// "attachments" occupies the identifier position and keeps its ordinary
+// routes.
+func malformedAttachmentDeletePath(method, p string) bool {
+	if method != http.MethodDelete {
+		return false
+	}
+	rest, ok := strings.CutPrefix(p, "/v1/devices/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	for i, seg := range segs {
+		if seg != "attachments" || i == 0 {
+			continue
+		}
+		// Keyword position: exactly one non-empty attachment identifier must
+		// follow, with no segment (chunks, complete, access, ...) after it.
+		return !(i == 1 && len(segs) == 3 && segs[0] != "" && segs[2] != "")
+	}
+	return false
 }
 
 // isLowerHexSHA256 reports whether s is exactly 64 lowercase hex characters.

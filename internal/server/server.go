@@ -139,6 +139,15 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteAttachment(s, w, r)
+	})
+	// Other verbs on the exact attachment member path get a JSON 400 rather
+	// than ServeMux's plain-text 405: the member read is GET-only and its
+	// removal DELETE-only.
+	mux.HandleFunc("/v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetChunk(s, w, r)
 	})
@@ -284,7 +293,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedAttachmentDeletePath(r.Method, p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}

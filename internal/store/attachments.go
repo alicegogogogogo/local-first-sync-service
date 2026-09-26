@@ -583,6 +583,78 @@ func (s *Store) SetAttachmentAccess(callerDeviceID, attachmentID, targetDeviceID
 	return true, nil
 }
 
+// DeleteAttachment removes the attachment created by deviceID together with
+// everything that belongs to it: every received chunk, every granted reader
+// row and, for a sealed upload, its claim on the digest-addressed content.
+//
+//   - Unknown attachment (never created, or already removed):
+//     ErrAttachmentNotFound; nothing changes.
+//   - A device other than the creator: ErrAttachmentForbidden; nothing
+//     changes. A granted reader cannot delete; only the creator can.
+//
+// An unfinished upload is removable just like a sealed one: its partial
+// chunks and its progress disappear and the chunk range is free. Sealed
+// content is reference counted by digest: the stored bytes are deleted only
+// when this was the last completed attachment referencing them; another
+// completed attachment with the same digest keeps reading the same bytes and
+// a later identical upload reuses them as before. After the commit the id is
+// gone for good and creating it again starts a brand-new upload.
+//
+// The ownership check and every removal run in one serialized transaction,
+// so concurrent deletes of the same attachment take effect at most once: the
+// first commits the deletion and the rest miss with ErrAttachmentNotFound.
+// The commit is durable before the call returns.
+func (s *Store) DeleteAttachment(deviceID, attachmentID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	a, err := getAttachmentTx(tx, attachmentID, deviceID)
+	if err != nil {
+		return err
+	}
+
+	// Drop the per-attachment state first; the foreign keys require the child
+	// rows to go before the attachment row itself.
+	if _, err := tx.Exec(
+		`DELETE FROM attachment_access WHERE attachment_id = ?`, attachmentID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM attachment_chunks WHERE attachment_id = ?`, attachmentID,
+	); err != nil {
+		return err
+	}
+
+	// Sealed content is shared by digest: reclaim the bytes only when no other
+	// completed attachment still references them. An unfinished upload never
+	// contributed a content row, so there is nothing to reclaim for one.
+	if a.Complete {
+		var others int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM attachments WHERE sha256 = ? AND complete = 1 AND id <> ?`,
+			a.SHA256, attachmentID,
+		).Scan(&others); err != nil {
+			return err
+		}
+		if others == 0 {
+			if _, err := tx.Exec(
+				`DELETE FROM attachment_contents WHERE sha256 = ?`, a.SHA256,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := tx.Exec(`DELETE FROM attachments WHERE id = ?`, attachmentID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

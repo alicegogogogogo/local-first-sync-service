@@ -29,7 +29,13 @@
 // reuses the stored bytes instead of copying them. The creator may grant
 // other registered devices read-only access per attachment; every
 // (attachment, device) pair starts unauthorized, grants and revokes commit in
-// the same serialized way, and access never widens the write paths.
+// the same serialized way, and access never widens the write paths. The
+// creator may also delete its own attachment: the record, every received
+// chunk and every granted reader disappear in one serialized transaction,
+// and the digest-addressed bytes are reclaimed only when no completed
+// attachment references them anymore. A deleted id reads as not-found for
+// everyone — the creator and granted readers alike — and is free to be
+// created again as a brand-new upload.
 package store
 
 import (

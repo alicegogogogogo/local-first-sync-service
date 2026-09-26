@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -408,5 +409,297 @@ func TestGetAttachmentChunkRange(t *testing.T) {
 	}
 	if _, err := s.GetAttachmentChunk("dev-1", "nope", 0); !errors.Is(err, ErrAttachmentNotFound) {
 		t.Fatalf("unknown attachment = %v, want ErrAttachmentNotFound", err)
+	}
+}
+
+// seedCompletedAttachment creates an attachment for device, uploads content
+// in one chunk and seals it, failing the test on any error.
+func seedCompletedAttachment(t *testing.T, s *Store, device, id string, content []byte) {
+	t.Helper()
+	if _, err := s.CreateAttachment(device, toAttachment(id, int64(len(content)), int64(len(content)), content)); err != nil {
+		t.Fatalf("create %q: %v", id, err)
+	}
+	if _, err := s.PutChunk(device, id, 0, content); err != nil {
+		t.Fatalf("put chunk %q: %v", id, err)
+	}
+	if _, err := s.CompleteAttachment(device, id); err != nil {
+		t.Fatalf("complete %q: %v", id, err)
+	}
+}
+
+func contentRowExists(t *testing.T, s *Store, digest string) bool {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM attachment_contents WHERE sha256 = ?`, digest,
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n == 1
+}
+
+// TestDeleteAttachmentSealed covers the hard removal of a finished upload:
+// only the creator deletes it, the metadata, chunks, seal and grants all go,
+// the digest bytes are reclaimed, every later operation misses and the id is
+// free for a brand-new upload.
+func TestDeleteAttachmentSealed(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+	mustRegisterDevice(t, s, "dev-2")
+
+	content := []byte("hello world")
+	seedCompletedAttachment(t, s, "dev-1", "att-1", content)
+	if _, err := s.SetAttachmentAccess("dev-1", "att-1", "dev-2", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Neither a granted reader nor a stranger may delete it.
+	if err := s.DeleteAttachment("dev-2", "att-1"); !errors.Is(err, ErrAttachmentForbidden) {
+		t.Fatalf("granted-reader delete = %v, want ErrAttachmentForbidden", err)
+	}
+	// The forbidden delete changes nothing: the grant and content survive.
+	if _, _, err := s.GetAttachment("dev-2", "att-1"); err != nil {
+		t.Fatalf("attachment changed by forbidden delete: %v", err)
+	}
+	if err := s.DeleteAttachment("dev-1", "nope"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("unknown delete = %v, want ErrAttachmentNotFound", err)
+	}
+
+	if err := s.DeleteAttachment("dev-1", "att-1"); err != nil {
+		t.Fatalf("creator delete: %v", err)
+	}
+
+	// The record, chunks and grants are gone: everyone now gets not-found.
+	for _, dev := range []string{"dev-1", "dev-2"} {
+		if _, _, err := s.GetAttachment(dev, "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+			t.Fatalf("get after delete as %s = %v, want ErrAttachmentNotFound", dev, err)
+		}
+		if _, err := s.GetAttachmentChunk(dev, "att-1", 0); !errors.Is(err, ErrAttachmentNotFound) {
+			t.Fatalf("get chunk after delete as %s = %v, want ErrAttachmentNotFound", dev, err)
+		}
+	}
+	// Further writes, finishes and access changes all miss with a 404 and zero
+	// writes.
+	if _, err := s.PutChunk("dev-1", "att-1", 0, content); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("chunk after delete = %v, want ErrAttachmentNotFound", err)
+	}
+	if _, err := s.CompleteAttachment("dev-1", "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("complete after delete = %v, want ErrAttachmentNotFound", err)
+	}
+	if _, err := s.SetAttachmentAccess("dev-1", "att-1", "dev-2", true); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("grant after delete = %v, want ErrAttachmentNotFound", err)
+	}
+	// A repeat delete misses and changes nothing.
+	if err := s.DeleteAttachment("dev-1", "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("repeat delete = %v, want ErrAttachmentNotFound", err)
+	}
+	// The last reference is gone, so the digest-addressed bytes were reclaimed.
+	if contentRowExists(t, s, digestOf(content)) {
+		t.Fatal("sealed content row survived the last referencing delete")
+	}
+
+	// The id starts a brand-new upload: created=true, no chunks carried over.
+	created, err := s.CreateAttachment("dev-1", toAttachment("att-1", int64(len(content)), int64(len(content)), content))
+	if err != nil || !created {
+		t.Fatalf("recreate = %v %v, want created=true", created, err)
+	}
+	if _, indices, err := s.GetAttachment("dev-1", "att-1"); err != nil || len(indices) != 0 {
+		t.Fatalf("recreated attachment carries old state: %v %v", indices, err)
+	}
+}
+
+// TestDeleteAttachmentIncomplete removes a partial upload: its received
+// chunks and progress disappear even though it never sealed content.
+func TestDeleteAttachmentIncomplete(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+
+	content := []byte("hello world") // 11 bytes, chunks of 4
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 0, []byte("hell")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutChunk("dev-1", "att-1", 2, []byte("rld")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteAttachment("dev-1", "att-1"); err != nil {
+		t.Fatalf("delete incomplete: %v", err)
+	}
+	if _, _, err := s.GetAttachment("dev-1", "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("get after delete = %v, want ErrAttachmentNotFound", err)
+	}
+	// No content row ever existed for an unfinished upload.
+	if contentRowExists(t, s, digestOf(content)) {
+		t.Fatal("unfinished upload left a content row")
+	}
+
+	// A fresh upload under the same id starts from zero and the chunk range is
+	// free again.
+	if _, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil {
+		t.Fatalf("recreate: %v", err)
+	}
+	created, err := s.PutChunk("dev-1", "att-1", 0, []byte("hell"))
+	if err != nil || !created {
+		t.Fatalf("chunk after recreate = %v %v, want created=true", created, err)
+	}
+}
+
+// TestDeleteAttachmentContentReferenceCounting verifies that the digest bytes
+// survive while any completed attachment references them and are reclaimed
+// only when the last reference is deleted; a reusing attachment's removal
+// leaves the first attachment's bytes readable.
+func TestDeleteAttachmentContentReferenceCounting(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+	mustRegisterDevice(t, s, "dev-2")
+
+	content := []byte("shared content")
+	digest := digestOf(content)
+	seedCompletedAttachment(t, s, "dev-1", "att-1", content)
+	seedCompletedAttachment(t, s, "dev-2", "att-2", content) // reuses the bytes
+	if !contentRowExists(t, s, digest) {
+		t.Fatal("content row missing after two completed attachments")
+	}
+
+	// Deleting the reusing attachment must not reclaim the bytes: the first
+	// attachment still reads its chunks and a new identical upload reuses.
+	if err := s.DeleteAttachment("dev-2", "att-2"); err != nil {
+		t.Fatalf("delete reuser: %v", err)
+	}
+	if !contentRowExists(t, s, digest) {
+		t.Fatal("content reclaimed while another attachment still references it")
+	}
+	data, err := s.GetAttachmentChunk("dev-1", "att-1", 0)
+	if err != nil || string(data) != string(content) {
+		t.Fatalf("remaining attachment chunk = %q %v", data, err)
+	}
+	seedCompletedAttachment(t, s, "dev-2", "att-3", content)
+	res, err := s.CompleteAttachment("dev-2", "att-3")
+	if err != nil || !res.Reused {
+		t.Fatalf("complete after one reference deleted = %+v %v, want reused", res, err)
+	}
+
+	// Delete the two remaining references; only the last delete reclaims.
+	if err := s.DeleteAttachment("dev-2", "att-3"); err != nil {
+		t.Fatalf("delete att-3: %v", err)
+	}
+	if !contentRowExists(t, s, digest) {
+		t.Fatal("content reclaimed before the last referencing attachment was deleted")
+	}
+	if err := s.DeleteAttachment("dev-1", "att-1"); err != nil {
+		t.Fatalf("delete att-1: %v", err)
+	}
+	if contentRowExists(t, s, digest) {
+		t.Fatal("content row survived the last referencing delete")
+	}
+	// A fresh identical upload now stores the bytes again: not reused.
+	seedCompletedAttachment(t, s, "dev-1", "att-4", content)
+	if res, err := s.CompleteAttachment("dev-1", "att-4"); err != nil || res.Reused {
+		t.Fatalf("complete after GC = %+v %v, want reused=false", res, err)
+	}
+}
+
+// TestDeleteAttachmentPersistsAcrossRestart verifies the removal is durable:
+// after a reopen the attachment, its chunks and grants stay gone and a repeat
+// delete still misses.
+func TestDeleteAttachmentPersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegisterDevice(t, s, "dev-1")
+	mustRegisterDevice(t, s, "dev-2")
+	content := []byte("hello world")
+	seedCompletedAttachment(t, s, "dev-1", "att-1", content)
+	if _, err := s.SetAttachmentAccess("dev-1", "att-1", "dev-2", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAttachment("dev-1", "att-1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	for _, dev := range []string{"dev-1", "dev-2"} {
+		if _, _, err := s.GetAttachment(dev, "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+			t.Fatalf("get after restart as %s = %v, want ErrAttachmentNotFound", dev, err)
+		}
+	}
+	if contentRowExists(t, s, digestOf(content)) {
+		t.Fatal("content row survived a restart after deletion")
+	}
+	if err := s.DeleteAttachment("dev-1", "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("repeat delete after restart = %v, want ErrAttachmentNotFound", err)
+	}
+	// The id is free for a brand-new upload after the restart.
+	if created, err := s.CreateAttachment("dev-1", toAttachment("att-1", 11, 4, content)); err != nil || !created {
+		t.Fatalf("recreate after restart = %v %v, want created=true", created, err)
+	}
+}
+
+// TestDeleteAttachmentConcurrent verifies that concurrent deletes of the same
+// attachment take effect at most once.
+func TestDeleteAttachmentConcurrent(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	mustRegisterDevice(t, s, "dev-1")
+	seedCompletedAttachment(t, s, "dev-1", "att-1", []byte("data"))
+
+	const n = 40
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	succeeded := 0
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := s.DeleteAttachment("dev-1", "att-1")
+			switch {
+			case err == nil:
+				mu.Lock()
+				succeeded++
+				mu.Unlock()
+			case errors.Is(err, ErrAttachmentNotFound):
+			default:
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful deletes = %d, want exactly 1", succeeded)
+	}
+	if _, _, err := s.GetAttachment("dev-1", "att-1"); !errors.Is(err, ErrAttachmentNotFound) {
+		t.Fatalf("attachment after concurrent delete = %v, want ErrAttachmentNotFound", err)
 	}
 }
