@@ -5,13 +5,15 @@ import (
 	"time"
 )
 
-// DocumentExists reports whether documentID has any change row and is
-// therefore a known document rather than an empty namespace.
+// DocumentExists reports whether documentID is a known document rather than
+// an empty namespace: it has any online change row, or a compaction state row
+// (a fully compacted document stays known even with an empty online log).
 func (s *Service) DocumentExists(documentID string) (bool, error) {
 	var known bool
 	if err := s.db.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ?)`,
-		documentID,
+		`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ?)
+		 OR EXISTS(SELECT 1 FROM change_log_state WHERE document_id = ?)`,
+		documentID, documentID,
 	).Scan(&known); err != nil {
 		return false, err
 	}
@@ -19,9 +21,11 @@ func (s *Service) DocumentExists(documentID string) (bool, error) {
 }
 
 // ListChanges returns at most limit changes for documentID whose cursor is
-// greater than after, in cursor order, together with the cursor to pass as
-// the next after value. An unknown document yields an empty list and cursor 0;
-// a known document with no rows past after yields nextCursor == after.
+// greater than after and still online, in cursor order, together with the
+// cursor to pass as the next after value. An unknown document yields an empty
+// list and cursor 0; a known document with no rows past after yields
+// nextCursor == max(after, compaction boundary), so a caller resuming inside
+// the trimmed range lands past the boundary instead of below it.
 func (s *Service) ListChanges(documentID string, after, limit int64) ([]ListedChange, int64, error) {
 	rows, err := s.db.Query(
 		`SELECT id, device_id, payload, cursor FROM changes
@@ -50,17 +54,23 @@ func (s *Service) ListChanges(documentID string, after, limit int64) ([]ListedCh
 	}
 
 	// Distinguish an unknown document from a known one with nothing new:
-	// unknown documents must report nextCursor 0.
+	// unknown documents must report nextCursor 0. A known document reports
+	// the larger of the requested cursor and the compaction boundary, since
+	// everything at or below the boundary left the online log for good.
 	if len(out) == 0 {
-		var known bool
-		if err := s.db.QueryRow(
-			`SELECT EXISTS(SELECT 1 FROM changes WHERE document_id = ?)`,
-			documentID,
-		).Scan(&known); err != nil {
+		known, err := s.DocumentExists(documentID)
+		if err != nil {
 			return nil, 0, err
 		}
 		if !known {
 			return out, 0, nil
+		}
+		boundary, err := s.compactionBoundary(documentID)
+		if err != nil {
+			return nil, 0, err
+		}
+		if boundary > maxCursor {
+			maxCursor = boundary
 		}
 	}
 	return out, maxCursor, nil

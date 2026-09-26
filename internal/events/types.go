@@ -121,6 +121,15 @@ type ExportedSnapshot struct {
 	State  json.RawMessage `json:"state"`
 }
 
+// CompactResult reports the outcome of an accepted Compact: the compaction
+// boundary (the greatest snapshot cursor of the document, 0 when it has no
+// snapshot) and the number of change rows this call moved out of the online
+// log. A repeat compaction reports the same boundary and zero removed.
+type CompactResult struct {
+	Boundary int64 `json:"boundary"`
+	Removed  int64 `json:"removed"`
+}
+
 // RestoreResult reports the outcome of an accepted RestoreSnapshot.
 type RestoreResult struct {
 	ID           string `json:"id"`
@@ -160,4 +169,17 @@ CREATE TABLE IF NOT EXISTS restores (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS restores_doc_cursor_idx
 	ON restores(document_id, change_cursor);
+CREATE TABLE IF NOT EXISTS change_identities (
+	document_id TEXT NOT NULL,
+	id          TEXT NOT NULL,
+	device_id   TEXT NOT NULL,
+	digest      BLOB NOT NULL,
+	cursor      INTEGER NOT NULL,
+	PRIMARY KEY (document_id, id)
+);
+CREATE TABLE IF NOT EXISTS change_log_state (
+	document_id TEXT NOT NULL PRIMARY KEY,
+	boundary    INTEGER NOT NULL,
+	high_water  INTEGER NOT NULL
+);
 `

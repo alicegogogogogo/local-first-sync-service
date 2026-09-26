@@ -162,6 +162,11 @@ func (a *App) RestoreSnapshot(documentID, deviceID, changeID string, snapshotCur
 	return a.events.RestoreSnapshot(documentID, deviceID, changeID, snapshotCursor)
 }
 
+// CompactChanges delegates to the change event service.
+func (a *App) CompactChanges(documentID, deviceID string) (events.CompactResult, error) {
+	return a.events.Compact(documentID, deviceID)
+}
+
 // ListChanges delegates to the change event service.
 func (a *App) ListChanges(documentID string, after, limit int64) ([]events.ListedChange, int64, error) {
 	return a.events.ListChanges(documentID, after, limit)

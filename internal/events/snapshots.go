@@ -26,10 +26,7 @@ func (s *Service) PutSnapshot(documentID string, cursor int64, state json.RawMes
 	defer func() { _ = tx.Rollback() }()
 
 	var current int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&current); err != nil {
+	if current, err = currentCursorTx(tx, documentID); err != nil {
 		return false, err
 	}
 	if current == 0 || cursor < 1 || cursor > current {
@@ -142,6 +139,8 @@ func (s *Service) ExportSnapshots(documentID string, from int64, to *int64) ([]E
 //   - If changeID already belongs to a prior restore, the call is idempotent
 //     only when deviceId, snapshotCursor and the decoded source state all
 //     match; the first result (created=false, original cursor) is returned.
+//     A restore trimmed by compaction answers the same question from its
+//     retained identity.
 //   - If changeID is taken by an ordinary change, or a restore whose provenance
 //     differs, the call returns *ErrRestoreConflict; nothing is written.
 //
@@ -178,6 +177,29 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 	).Scan(&existingCursor, &existingDevice, &existingPayload)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		// No online row: the id may belong to a restore trimmed by
+		// compaction, in which case its retained identity (device, state and
+		// snapshot cursor) decides idempotency/conflict. A trimmed ordinary
+		// change's identity carries restore source 0, so it never matches a
+		// restore and conflicts exactly like an online ordinary change.
+		cursor, trimmed, err := resolveTrimmedIdentity(tx, documentID, changeID, deviceID, state, snapshotCursor)
+		if err != nil {
+			var conflict *ErrConflict
+			if errors.As(err, &conflict) {
+				// A retained identity with different device, state or
+				// restore source conflicts exactly like an online row.
+				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			return RestoreResult{}, err
+		}
+		if trimmed {
+			return RestoreResult{
+				ID:           changeID,
+				Created:      false,
+				Cursor:       cursor,
+				RestoredFrom: snapshotCursor,
+			}, nil
+		}
 		// New id; fall through to append below.
 	case err != nil:
 		return RestoreResult{}, err
@@ -209,13 +231,11 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 		}
 	}
 
-	var nextCursor int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&nextCursor); err != nil {
+	nextCursor, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return RestoreResult{}, err
 	}
+	nextCursor++
 	if _, err := tx.Exec(
 		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
 		documentID, nextCursor, changeID, deviceID, state,

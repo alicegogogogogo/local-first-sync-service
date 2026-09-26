@@ -270,6 +270,15 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
 		handlePollChanges(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
+		handleCompactChanges(s, w, r)
+	})
+	// Non-POST verbs on the compaction path: the exact POST pattern above is
+	// more specific, so only other verbs reach this method-less pattern and
+	// get a JSON 400 instead of ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Non-GET verbs on the poll path: the exact GET pattern above is more
 	// specific, so only other verbs reach this method-less pattern and get a
 	// JSON 400 instead of ServeMux's plain-text 405.
@@ -369,7 +378,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedChangesCompactPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}

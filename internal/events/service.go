@@ -127,7 +127,8 @@ func (s *Service) ReplayChanges(documentID string, changes []Change) ([]Result, 
 	return results, nil
 }
 
-// resolveChanges resolves every change id against existing rows inside tx. A
+// resolveChanges resolves every change id against existing rows inside tx,
+// falling back to the identities compaction retained for trimmed ids. A
 // single device/payload mismatch aborts the whole batch before any cursor is
 // allocated. It returns the per-id results and the indices of genuinely new
 // changes that still need a cursor.
@@ -144,6 +145,16 @@ func resolveChanges(tx *sql.Tx, documentID string, changes []Change) ([]Result, 
 		).Scan(&existingCursor, &existingDevice, &existingPayload)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
+			// No online row: the id may have been trimmed by compaction, in
+			// which case its retained identity decides idempotency/conflict.
+			cursor, trimmed, err := resolveTrimmedIdentity(tx, documentID, c.ID, c.DeviceID, c.Payload, 0)
+			if err != nil {
+				return nil, nil, err
+			}
+			if trimmed {
+				results[i] = Result{ID: c.ID, Created: false, Cursor: cursor}
+				continue
+			}
 			pending = append(pending, i)
 		case err != nil:
 			return nil, nil, err
@@ -162,15 +173,15 @@ func resolveChanges(tx *sql.Tx, documentID string, changes []Change) ([]Result, 
 }
 
 // appendPending allocates contiguous cursors to the new change indices and
-// inserts them in input order. It runs inside the caller's transaction.
+// inserts them in input order. It runs inside the caller's transaction. The
+// allocation starts past the document's high-water mark, so a compaction that
+// trimmed the newest online row never lets a cursor be reused.
 func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []int, results []Result) error {
-	var nextCursor int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&nextCursor); err != nil {
+	current, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return err
 	}
+	nextCursor := current + 1
 	for _, i := range pending {
 		c := changes[i]
 		if _, err := tx.Exec(
@@ -194,7 +205,8 @@ func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []in
 //
 //   - An existing id is idempotent only when deviceId and the decoded payload
 //     match (Outcome "idempotent", with the original Result); a mismatch is an
-//     *ErrConflict and nothing is written.
+//     *ErrConflict and nothing is written. An id trimmed by compaction answers
+//     the same way from its retained identity.
 //   - A new id with baseCursor equal to the current cursor is appended as
 //     "applied".
 //   - A new id with a base cursor behind the current one is appended as
@@ -203,7 +215,9 @@ func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []in
 //     non-object later payload or shared key is an *ErrConflict.
 //
 // A non-zero baseCursor for an unknown document, or a baseCursor greater than
-// the current cursor, returns ErrStaleCursor. An unknown document with
+// the current cursor, returns ErrStaleCursor. A baseCursor below the
+// compaction boundary returns ErrStaleCursor as well: the changes it would
+// have to be checked against are no longer online. An unknown document with
 // baseCursor 0 accepts the first change as "applied".
 func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (MergeResult, error) {
 	tx, err := s.db.Begin()
@@ -212,15 +226,22 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Current cursor is the document's high-water mark, 0 when unknown.
-	var current int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&current); err != nil {
+	// Current cursor is the document's high-water mark, 0 when unknown; it
+	// survives a compaction that trimmed the newest online row.
+	current, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return MergeResult{}, err
 	}
 	if baseCursor > current || (baseCursor != 0 && current == 0) {
+		return MergeResult{}, ErrStaleCursor
+	}
+	// A base cursor below the compaction boundary can no longer be checked
+	// for conflicts: the changes it refers to left the online log.
+	boundary, err := compactionBoundaryTx(tx, documentID)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if baseCursor < boundary {
 		return MergeResult{}, ErrStaleCursor
 	}
 
@@ -234,7 +255,24 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 	).Scan(&existingCursor, &existingDevice, &existingPayload)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// New id; fall through to append logic below.
+		// No online row: a trimmed identity decides idempotency/conflict;
+		// otherwise the id is genuinely new and falls through to append.
+		cursor, trimmed, err := resolveTrimmedIdentity(tx, documentID, c.ID, c.DeviceID, c.Payload, 0)
+		if err != nil {
+			return MergeResult{}, err
+		}
+		if trimmed {
+			return MergeResult{
+				ID:      c.ID,
+				Outcome: "idempotent",
+				Cursor:  cursor,
+				Result: &Result{
+					ID:      c.ID,
+					Created: false,
+					Cursor:  cursor,
+				},
+			}, nil
+		}
 	case err != nil:
 		return MergeResult{}, err
 	default:
