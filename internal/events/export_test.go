@@ -234,3 +234,223 @@ func TestExportSnapshotsPersistenceAcrossRestart(t *testing.T) {
 		}
 	}
 }
+
+func TestExportChangesRange(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	doc := "doc-export-changes"
+	if _, err := s.PostChanges(doc, changes("c1", "c2", "c3", "c4")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Whole range, no bounds: ascending cursors with verbatim rows.
+	got, err := s.ExportChanges(doc, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("export len = %d, want 4: %+v", len(got), got)
+	}
+	for i, c := range got {
+		if c.Cursor != int64(i+1) || c.ID != fmt.Sprintf("c%d", i+1) || c.DeviceID != "dev-1" {
+			t.Fatalf("row %d = %+v", i, c)
+		}
+		if string(c.Payload) != fmt.Sprintf(`{"n":%d}`, i+1) {
+			t.Fatalf("row %d payload = %s", i, c.Payload)
+		}
+	}
+
+	// Closed interval: both endpoints included.
+	got, err = s.ExportChanges(doc, 2, ptrInt64(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Cursor != 2 || got[1].Cursor != 3 {
+		t.Fatalf("closed interval = %+v", got)
+	}
+
+	// Degenerate interval matches the single cursor; lower bound only runs to
+	// the end of the log.
+	got, err = s.ExportChanges(doc, 3, ptrInt64(3))
+	if err != nil || len(got) != 1 || got[0].Cursor != 3 {
+		t.Fatalf("point interval = %+v err=%v", got, err)
+	}
+	got, err = s.ExportChanges(doc, 3, nil)
+	if err != nil || len(got) != 2 || got[0].Cursor != 3 || got[1].Cursor != 4 {
+		t.Fatalf("from-only = %+v err=%v", got, err)
+	}
+
+	// A range past the end, and an unknown document, both export empty.
+	got, err = s.ExportChanges(doc, 99, nil)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("past-end = %+v err=%v", got, err)
+	}
+	got, err = s.ExportChanges("doc-unknown", 0, nil)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("unknown doc = %+v, want empty non-nil", got)
+	}
+}
+
+func TestExportChangesIsReadOnly(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	doc := "doc-export-ro"
+	if _, err := s.PostChanges(doc, changes("c1", "c2")); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := s.ExportChanges(doc, 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The change log and its cursor are untouched by the exports.
+	rows, next, err := s.ListChanges(doc, 0, 100)
+	if err != nil || len(rows) != 2 || next != 2 {
+		t.Fatalf("changes after export = %+v next=%d err=%v", rows, next, err)
+	}
+}
+
+func TestExportChangesExcludesCompacted(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	doc := "doc-export-compact"
+	if _, err := s.RegisterDevice("dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PostChanges(doc, changes("c1", "c2", "c3", "c4")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot(doc, 2, json.RawMessage(`{"s":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	boundary, removed, err := s.CompactChanges(doc, "dev-1")
+	if err != nil || boundary != 2 || removed != 2 {
+		t.Fatalf("compact = boundary %d removed %d err=%v", boundary, removed, err)
+	}
+
+	// Trimmed cursors are absent; the online rows export in order.
+	got, err := s.ExportChanges(doc, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Cursor != 3 || got[1].Cursor != 4 {
+		t.Fatalf("post-compact export = %+v", got)
+	}
+
+	// An interval fully inside the trimmed range exports empty.
+	got, err = s.ExportChanges(doc, 1, ptrInt64(2))
+	if err != nil || len(got) != 0 {
+		t.Fatalf("trimmed interval = %+v err=%v", got, err)
+	}
+}
+
+func TestExportChangesConcurrentCommit(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	doc := "doc-export-conc"
+
+	const writers = 8
+	var wg sync.WaitGroup
+	wg.Add(writers)
+	for w := 0; w < writers; w++ {
+		go func(base int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				id := fmt.Sprintf("c%d", base+i) // writers claim disjoint id windows
+				if _, err := s.PostChanges(doc, changes(id)); err != nil {
+					t.Errorf("post %s: %v", id, err)
+					return
+				}
+			}
+		}(w * 50)
+	}
+
+	// Concurrently export the whole range repeatedly. Every result must be a
+	// self-consistent set: ascending, unique cursors, and each present record
+	// complete — a committed batch appears whole or not at all.
+	for i := 0; i < 200; i++ {
+		got, err := s.ExportChanges(doc, 0, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var prev int64
+		for _, c := range got {
+			if c.Cursor <= prev {
+				t.Fatalf("non-ascending/duplicate cursor %d after %d", c.Cursor, prev)
+			}
+			prev = c.Cursor
+			if c.ID == "" || c.DeviceID == "" || len(c.Payload) == 0 {
+				t.Fatalf("half/corrupt record at cursor %d: %+v", c.Cursor, c)
+			}
+		}
+	}
+	wg.Wait()
+
+	// After every writer committed, the full export is exactly 400 rows.
+	got, err := s.ExportChanges(doc, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 400 {
+		t.Fatalf("final export len = %d, want 400", len(got))
+	}
+}
+
+func TestExportChangesPersistenceAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "export-changes.db")
+
+	s, err := app.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := "doc-export-restart"
+	if _, err := s.PostChanges(doc, changes("c1", "c2", "c3")); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := s.ExportChanges(doc, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := app.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	after, err := s2.ExportChanges(doc, 1, ptrInt64(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("after restart len = %d, want %d", len(after), len(before))
+	}
+	for i := range before {
+		if before[i].Cursor != after[i].Cursor || before[i].ID != after[i].ID ||
+			before[i].DeviceID != after[i].DeviceID || string(before[i].Payload) != string(after[i].Payload) {
+			t.Fatalf("row %d changed across restart: %+v vs %+v", i, before[i], after[i])
+		}
+	}
+}

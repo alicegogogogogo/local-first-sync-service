@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
@@ -73,6 +74,58 @@ func (s *Service) ListChanges(documentID string, after, limit int64) ([]ListedCh
 		}
 	}
 	return out, maxCursor, nil
+}
+
+// ExportChanges returns every online change of documentID whose cursor lies in
+// the closed interval [from, to], in ascending cursor order. When to is nil no
+// upper bound is applied. Changes that compaction trimmed out of the online
+// log are simply absent — an interval falling entirely inside the trimmed
+// range yields an empty list, exactly like an unknown document or a range
+// without rows: the export is a read that misses like any other. The unique
+// (document_id, cursor) index guarantees a cursor appears at most once.
+//
+// The single SELECT runs as one SQLite statement over the serialized
+// connection, so a batch committed concurrently is observed either with all of
+// its rows or not at all — never half of it. The read starts no transaction,
+// writes nothing and notifies no waiters, so it cannot move a cursor or
+// produce a change record.
+func (s *Service) ExportChanges(documentID string, from int64, to *int64) ([]ListedChange, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if to == nil {
+		rows, err = s.db.Query(
+			`SELECT id, device_id, payload, cursor FROM changes
+			 WHERE document_id = ? AND cursor >= ?
+			 ORDER BY cursor ASC`,
+			documentID, from,
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT id, device_id, payload, cursor FROM changes
+			 WHERE document_id = ? AND cursor >= ? AND cursor <= ?
+			 ORDER BY cursor ASC`,
+			documentID, from, *to,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ListedChange, 0)
+	for rows.Next() {
+		var c ListedChange
+		if err := rows.Scan(&c.ID, &c.DeviceID, &c.Payload, &c.Cursor); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // WaitForChanges blocks until documentID has a change with cursor greater than

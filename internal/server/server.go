@@ -299,6 +299,15 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/changes/export", func(w http.ResponseWriter, r *http.Request) {
+		handleExportChanges(s, w, r)
+	})
+	// Non-GET verbs on the export path: the exact GET pattern above is more
+	// specific, so only other verbs reach this method-less pattern and get a
+	// JSON 400 instead of ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/export", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
 		handleReplay(s, w, r)
 	})
@@ -410,16 +419,16 @@ func emptyIDGuard(next http.Handler) http.Handler {
 }
 
 // malformedNewDocumentPath reports whether p targets one of the new
-// long-poll/replay/compaction endpoints but is not that endpoint's exact
-// location: a missing/empty segment, a trailing slash, extra segments, or a
-// "poll"/"replay"/"compact" segment in a position short of the registered
-// shape. ServeMux would answer those with a 301 redirect or a plain-text
-// 404/405; the new endpoints promise a JSON error and never a redirect, so
-// every such path is a malformed 400.
+// long-poll/export/replay/compaction endpoints but is not that endpoint's
+// exact location: a missing/empty segment, a trailing slash, extra segments,
+// or a "poll"/"export"/"replay"/"compact" segment in a position short of the
+// registered shape. ServeMux would answer those with a 301 redirect or a
+// plain-text 404/405; the new endpoints promise a JSON error and never a
+// redirect, so every such path is a malformed 400.
 //
 // Keywords are matched only past the documentID position, so documents that
-// happen to be named "poll", "replay" or "compact" keep their ordinary
-// merge/snapshot/changes routes.
+// happen to be named "poll", "export", "replay" or "compact" keep their
+// ordinary merge/snapshot/changes routes.
 func malformedNewDocumentPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -431,6 +440,13 @@ func malformedNewDocumentPath(p string) bool {
 	// non-empty documentID and "changes".
 	for i, seg := range segs {
 		if seg == "poll" && i > 0 {
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// Export endpoint: "export" must be exactly the third segment, after a
+	// non-empty documentID and "changes".
+	for i, seg := range segs {
+		if seg == "export" && i > 0 {
 			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
 		}
 	}

@@ -323,6 +323,47 @@ func TestListPermissionsShapeContract(t *testing.T) {
 	}
 }
 
+// Under a document literally named "permissions" the malformed permission
+// shapes are judged by the same rule as under any other document id: a
+// trailing slash or an extra segment past the resource is a 400 JSON error,
+// never the unknown-path 404.
+func TestListPermissionsShapeUnderDocumentNamedPermissions(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/documents/permissions/permissions/"},
+		{http.MethodGet, "/v1/documents/permissions/permissions/extra"},
+		{http.MethodGet, "/v1/documents/permissions/permissions/extra/more"},
+		{http.MethodPost, "/v1/documents/permissions/permissions/extra"},
+		{http.MethodDelete, "/v1/documents/permissions/permissions/extra"},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(tc.method, tc.path, nil)
+		w := serveRecorder(h, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s %s = %d, want 400", tc.method, tc.path, w.Code)
+		}
+		assertJSONError(t, w)
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("%s %s content-type = %q, want application/json", tc.method, tc.path, ct)
+		}
+	}
+
+	// The exact ledger path under that document id still works, and the
+	// rejected shapes wrote nothing.
+	w, entries := getPermissionLedger(t, h, "/v1/documents/permissions/permissions")
+	if w.Code != http.StatusOK {
+		t.Fatalf("ledger under document named permissions = %d %s", w.Code, w.Body.String())
+	}
+	if got := ledgerPairs(entries); !equalStrings(got, []string{"dev-1:true"}) {
+		t.Fatalf("ledger under document named permissions = %v", got)
+	}
+}
+
 // A deregistered device vanishes from the ledger at once, and the same id
 // registering again starts fresh with the default authorized verdict.
 func TestListPermissionsDeregisteredDevice(t *testing.T) {

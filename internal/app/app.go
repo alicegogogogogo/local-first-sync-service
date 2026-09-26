@@ -167,6 +167,12 @@ func (a *App) ListChanges(documentID string, after, limit int64) ([]events.Liste
 	return a.events.ListChanges(documentID, after, limit)
 }
 
+// ExportChanges delegates to the change event service. A nil to means the
+// interval has no upper bound.
+func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.ListedChange, error) {
+	return a.events.ExportChanges(documentID, from, to)
+}
+
 // WaitForChanges delegates to the change event service.
 func (a *App) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) ([]events.ListedChange, int64, bool, error) {
 	return a.events.WaitForChanges(ctx, documentID, after, limit, wait)
