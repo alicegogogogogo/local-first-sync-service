@@ -16,7 +16,12 @@
 // repeat does not. A session id already owned by another device is a
 // conflict, never silently re-homed. Deletes are owner-scoped and hard: a
 // repeat delete, another device, and a cross-device path all miss with 404,
-// after which the id is free to be created again.
+// after which the id is free to be created again. A device itself can
+// deregister: the device row and everything it owns — its sessions and the
+// attachments it created, chunks and grants included — vanish in one
+// serialized transaction, a repeat or never-registered deregistration misses
+// with 404 and writes nothing, and the freed id registers again as a
+// brand-new device.
 //
 // Attachments are resumable chunked uploads owned by the registered device
 // that created them. Creation pins the declared total size, chunk size and
@@ -403,6 +408,130 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// DeleteDeviceTx deregisters deviceID and removes every record it owns, all
+// inside the caller's serialized transaction:
+//
+//   - the device's sessions are hard-deleted, so their session-scoped reads
+//     and subscriptions miss from then on;
+//   - every attachment it created is removed together with its chunks, its
+//     sealed/unfinished state and the access rows other devices held on it;
+//   - the read grants the device itself held on other devices' attachments
+//     are withdrawn;
+//   - the device row is removed last (every child row goes first).
+//
+// Digest-addressed content is shared across attachments and is reclaimed only
+// when no completed attachment still references a digest — exactly the rule
+// of a single attachment delete — so another device's attachment with the same
+// digest keeps its bytes and one deregistration by itself never reclaims
+// shared content. The document permission ledger lives in the authz package
+// and clears its own rows against the same transaction through
+// DeleteDevicePermissionsTx.
+//
+// An unknown (never registered or already deregistered) device yields
+// ErrDeviceNotFound and writes nothing. Because the whole judgment runs in one
+// immediate transaction on the single shared connection, concurrent
+// deregistrations of the same device commit at most once and any concurrent
+// chunk upload or finish either committed entirely before it or is rejected
+// entirely afterward — no half-written record survives.
+func DeleteDeviceTx(q DBTX, deviceID string) error {
+	exists, err := DeviceExistsTx(q, deviceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrDeviceNotFound
+	}
+
+	// Remember the digests of the device's completed attachments before their
+	// rows vanish: each is a candidate for content reclamation once every
+	// owned attachment is gone. DISTINCT because several of the device's
+	// attachments may share the same digest-addressed content.
+	rows, err := q.Query(
+		`SELECT DISTINCT sha256 FROM attachments WHERE device_id = ? AND complete = 1`,
+		deviceID,
+	)
+	if err != nil {
+		return err
+	}
+	var digests []string
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		digests = append(digests, digest)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	// Withdraw the read grants this device held on other devices'
+	// attachments (rows naming it as the grantee), then remove the access
+	// rosters of the attachments it created before the attachment rows those
+	// rosters reference are deleted.
+	if _, err := q.Exec(
+		`DELETE FROM attachment_access WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(
+		`DELETE FROM attachment_access
+		 WHERE attachment_id IN (SELECT id FROM attachments WHERE device_id = ?)`,
+		deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(
+		`DELETE FROM attachment_chunks
+		 WHERE attachment_id IN (SELECT id FROM attachments WHERE device_id = ?)`,
+		deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(
+		`DELETE FROM attachments WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return err
+	}
+
+	// Reclaim each digest-addressed content only when no surviving completed
+	// attachment — owned by another device, or by the deregistered device in
+	// an impossible re-read — still references it.
+	for _, digest := range digests {
+		var stillReferenced bool
+		if err := q.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM attachments WHERE sha256 = ? AND complete = 1)`,
+			digest,
+		).Scan(&stillReferenced); err != nil {
+			return err
+		}
+		if !stillReferenced {
+			if _, err := q.Exec(
+				`DELETE FROM attachment_contents WHERE sha256 = ?`, digest,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := q.Exec(
+		`DELETE FROM sessions WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(
+		`DELETE FROM devices WHERE id = ?`, deviceID,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SessionExists reports whether a live session with sessionID exists.

@@ -109,9 +109,24 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices", func(w http.ResponseWriter, r *http.Request) {
 		handleRegisterDevice(s, w, r)
 	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeregisterDevice(s, w, r)
+	})
+	// The device item path accepts only DELETE (deregistration); every other
+	// verb gets a JSON 400 rather than the subtree's unknown-path JSON 404.
+	mux.HandleFunc("/v1/devices/{deviceId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// A DELETE short of the device id misses the segment that names the
+	// deregistering device; answer a JSON 400 instead of the collection's
+	// unknown-path JSON 404.
+	mux.HandleFunc("DELETE /v1/devices", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "device deregistration path is malformed")
+	})
 	// Non-POST verbs on the exact collection path: the method-less pattern is
 	// less specific than POST above, so it only catches the rest and answers a
-	// JSON 404 instead of ServeMux's slash redirect.
+	// JSON 404 instead of ServeMux's slash redirect. The explicit DELETE
+	// pattern above wins for a bodyless deregistration missing its id segment.
 	mux.HandleFunc("/v1/devices", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown device path")
 	})
@@ -223,7 +238,23 @@ func NewHandler(s *app.App) http.Handler {
 	// Any other path under the new namespaces is a JSON 404 rather than
 	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
 	// Exact method-patterns above take precedence over these subtree patterns.
-	mux.HandleFunc("/v1/devices/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+	// A DELETE whose extra segments are outside the sessions/attachments
+	// subtrees is a malformed deregistration of /v1/devices/{deviceId} and
+	// answers a JSON 400 instead of the subtree 404.
+	mux.HandleFunc("/v1/devices/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			// rest begins with the device id; the segments past it decide
+			// whether the DELETE belongs to the sessions/attachments
+			// subtrees (unknown-path 404) or is a malformed deregistration
+			// of the device item path (400).
+			_, after, _ := strings.Cut(r.PathValue("rest"), "/")
+			if after != "" &&
+				after != "sessions" && !strings.HasPrefix(after, "sessions/") &&
+				after != "attachments" && !strings.HasPrefix(after, "attachments/") {
+				writeError(w, http.StatusBadRequest, "device deregistration path is malformed")
+				return
+			}
+		}
 		writeError(w, http.StatusNotFound, "unknown device/session path")
 	})
 	mux.HandleFunc("/v1/sessions/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
@@ -523,6 +554,29 @@ func handleRegisterDevice(s *app.App, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"deviceId": req.DeviceID, "created": created})
+}
+
+// handleDeregisterDevice removes a registered device and everything it owns
+// in one serialized, synchronously committed cascade. The path device id is
+// the caller's only identity and the call carries no body: a present body is
+// accepted without being read (deregistration never interprets one), but the
+// path must be exact. Success answers a single JSON line naming the device id
+// and the deletion marker and nothing else. A device that was never
+// registered, or one that is deregistered a second time, is a 404 JSON error
+// and writes nothing; concurrent calls take effect at most once.
+func handleDeregisterDevice(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
+
+	if err := s.DeregisterDevice(deviceID); err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to deregister device")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"deviceId": deviceID, "deleted": true})
 }
 
 func handleCreateSession(s *app.App, w http.ResponseWriter, r *http.Request) {

@@ -65,7 +65,15 @@ func TestNewFamiliesAlwaysJSON(t *testing.T) {
 		{http.MethodPut, "/v1/devices", http.StatusNotFound},
 		{http.MethodGet, "/v1/sessions", http.StatusNotFound},
 		{http.MethodGet, "/v1/devices/dev1/sessions", http.StatusNotFound},
-		{http.MethodPost, "/v1/devices/dev1", http.StatusNotFound},
+		// The device item path exists for DELETE (deregistration); a method
+		// mismatch is a JSON 400, not the subtree 404.
+		{http.MethodPost, "/v1/devices/dev1", http.StatusBadRequest},
+		{http.MethodGet, "/v1/devices/dev1", http.StatusBadRequest},
+		{http.MethodPut, "/v1/devices/dev1", http.StatusBadRequest},
+		// A deregistration missing its id segment or carrying extra segments is
+		// a malformed path: JSON 400, never a redirect or HTML.
+		{http.MethodDelete, "/v1/devices", http.StatusBadRequest},
+		{http.MethodDelete, "/v1/devices/dev1/extra", http.StatusBadRequest},
 		{http.MethodDelete, "/v1/devices/dev1/sessions/s1/extra", http.StatusNotFound},
 		{http.MethodPost, "/v1/sessions/s1/documents/d/changes", http.StatusNotFound},
 	}

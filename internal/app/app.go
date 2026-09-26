@@ -182,6 +182,46 @@ func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-c
 	return a.events.AddSubscription(documentID, deviceID)
 }
 
+// DeregisterDevice removes a registered device together with every record it
+// owns — its sessions, the attachments it created (chunks, sealed state and
+// unfinished uploads included), the access grants it held, and its
+// document-permission rows — all in one serialized transaction that commits
+// synchronously. An unknown or already deregistered device yields
+// store.ErrDeviceNotFound and writes nothing, so a repeat deregistration
+// misses exactly the way a never-registered id does and concurrent calls take
+// effect at most once. Shared digest-addressed content is reclaimed only when
+// the last completed attachment referencing it is gone; other devices'
+// changes, snapshots and document content are untouched.
+//
+// After the commit the same id may register again as a brand-new device — no
+// session, permission or attachment is inherited — and every live
+// subscription the device held across both push channels is ended
+// immediately, stickily.
+func (a *App) DeregisterDevice(deviceID string) error {
+	tx, err := a.Store.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := store.DeleteDeviceTx(tx, deviceID); err != nil {
+		return err
+	}
+	if err := a.Authz.DeleteDevicePermissionsTx(tx, deviceID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// End the device's live subscriptions only after the cascade is durable:
+	// a reconnect attempt after the close finds the backing session gone
+	// (404), so the connection cannot immediately re-establish itself.
+	a.events.SignalDeviceDeregistered(deviceID)
+	a.crdt.SignalDeviceDeregistered(deviceID)
+	return nil
+}
+
 // ---- Permission service boundary. ----
 
 // SetDocumentPermission delegates to the permission service.

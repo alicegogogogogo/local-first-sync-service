@@ -193,6 +193,32 @@ func (s *Service) PermissionRevoked(documentID, deviceID string) {
 	}
 }
 
+// SignalDeviceDeregistered ends every live CRDT subscription belonging to
+// deviceID across every document, after the device's deregistration
+// transaction committed: the session that backed such a connection is already
+// hard-deleted, so it closes immediately with the same permission-closed code
+// a revoke uses, stickily. Other devices' subscriptions are untouched.
+func (s *Service) SignalDeviceDeregistered(deviceID string) {
+	s.subMu.Lock()
+	var targets []*Subscription
+	for key, set := range s.subs {
+		if key.device != deviceID {
+			continue
+		}
+		for _, sub := range set {
+			if !sub.revokedClosed {
+				sub.revokedClosed = true
+				targets = append(targets, sub)
+			}
+		}
+	}
+	s.subMu.Unlock()
+
+	for _, sub := range targets {
+		close(sub.revoked)
+	}
+}
+
 // Closing reports whether the service has begun stopping. A woken subscription
 // uses it to distinguish a termination signal from a state change.
 func (s *Service) Closing() bool {

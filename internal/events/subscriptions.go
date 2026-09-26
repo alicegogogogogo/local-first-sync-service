@@ -130,6 +130,33 @@ func (s *Service) SignalRevoked(documentID, deviceID string) {
 	}
 }
 
+// SignalDeviceDeregistered ends every live subscription belonging to
+// deviceID across every document, after the device's deregistration
+// transaction committed: the session backing such a connection is already
+// hard-deleted, so the connection closes immediately with the same
+// permission-closed code a revoke uses — stickily, nothing can reopen it.
+// Other devices' subscriptions are untouched.
+func (s *Service) SignalDeviceDeregistered(deviceID string) {
+	s.mu.Lock()
+	var targets []*subscription
+	for key, set := range s.subs {
+		if key.device != deviceID {
+			continue
+		}
+		for _, sub := range set {
+			if !sub.revokedClosed {
+				sub.revokedClosed = true
+				targets = append(targets, sub)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, sub := range targets {
+		close(sub.revoked)
+	}
+}
+
 // Closing reports whether the service has begun stopping. A woken subscription
 // uses it to distinguish a termination signal from a commit.
 func (s *Service) Closing() bool {
