@@ -229,6 +229,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
+	// Non-GET verbs on the session change collection path: the exact GET
+	// pattern above is more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of the subtree's
+	// unknown-path JSON 404. The collection is read-only — the paged read and
+	// the interval export share its exact GET path.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleSubscribe(s, w, r)
 	})
@@ -409,7 +417,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1058,12 +1066,7 @@ func handleListChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	// over the same collection path; anything else is the ordinary paged
 	// read. The two never mix: the export parses only from/to, the paged read
 	// only after/limit, exactly as before.
-	q := r.URL.Query()
-	_, isExport := q["from"]
-	if _, hasTo := q["to"]; hasTo {
-		isExport = true
-	}
-	if isExport {
+	if exportRequested(r.URL.Query()) {
 		handleExportChanges(s, w, r)
 		return
 	}
@@ -1088,10 +1091,19 @@ func handleListChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 // query behaves exactly like GET /v1/documents/{documentID}/changes — unless
 // the session's device has been revoked permission for the document, which is
 // a 403 JSON error with no changes or nextCursor. Revocation only gates this
-// read; the change log itself is untouched.
+// read; the change log itself is untouched. A request carrying the export's
+// from/to parameters is the interval batch export over the same collection
+// path and is handed to the export handler with the same check ordering.
 func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	// Like the document-level collection, from/to mark the batch export; the
+	// two reads never mix.
+	if exportRequested(r.URL.Query()) {
+		handleSessionExportChanges(s, w, r)
+		return
+	}
 
 	// Malformed query parameters are a request-shape error (400) checked
 	// before the resource lookup (404), matching the snapshot GET ordering.

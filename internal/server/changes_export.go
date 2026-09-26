@@ -1,11 +1,14 @@
 package server
 
 import (
+	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
 // changeExportResponse is the export body with the top-level key order fixed
@@ -16,6 +19,58 @@ import (
 type changeExportResponse struct {
 	Changes []events.ListedChange `json:"changes"`
 	Count   int                   `json:"count"`
+}
+
+// exportRequested reports whether the query carries the export's from/to
+// parameters. A present key counts even with an empty value (?from= is the
+// export with the default bound), matching the document-level collection.
+func exportRequested(q url.Values) bool {
+	if _, ok := q["from"]; ok {
+		return true
+	}
+	_, ok := q["to"]
+	return ok
+}
+
+// parseExportInterval parses the shared from/to export parameters, writing
+// the documented 400 on an illegal value. from defaults to 0; a nil to means
+// the interval has no upper bound; to below from is rejected. It is shared by
+// the document-scoped and session-scoped exports so their query semantics
+// cannot drift apart.
+func parseExportInterval(w http.ResponseWriter, q url.Values) (from int64, to *int64, ok bool) {
+	from = 0
+	if raw := q.Get("from"); raw != "" {
+		v, valid := parseCursorPath(raw)
+		if !valid {
+			writeError(w, http.StatusBadRequest, "from must be a non-negative integer")
+			return 0, nil, false
+		}
+		from = v
+	}
+
+	if raw := q.Get("to"); raw != "" {
+		v, valid := parseCursorPath(raw)
+		if !valid {
+			writeError(w, http.StatusBadRequest, "to must be a non-negative integer")
+			return 0, nil, false
+		}
+		to = &v
+	}
+	if to != nil && *to < from {
+		writeError(w, http.StatusBadRequest, "to must not be less than from")
+		return 0, nil, false
+	}
+	return from, to, true
+}
+
+// writeChangeExport renders an export result in the shared response shape: a
+// single compact JSON line with the changes,count key order, an empty export
+// serializing as [] with count 0.
+func writeChangeExport(w http.ResponseWriter, rows []events.ListedChange) {
+	if rows == nil {
+		rows = make([]events.ListedChange, 0)
+	}
+	writeJSON(w, http.StatusOK, changeExportResponse{Changes: rows, Count: len(rows)})
 }
 
 // handleExportChanges is the read-only batch export over a document's change
@@ -34,29 +89,8 @@ type changeExportResponse struct {
 func handleExportChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
-	q := r.URL.Query()
-
-	from := int64(0)
-	if raw := q.Get("from"); raw != "" {
-		v, ok := parseCursorPath(raw)
-		if !ok {
-			writeError(w, http.StatusBadRequest, "from must be a non-negative integer")
-			return
-		}
-		from = v
-	}
-
-	var to *int64
-	if raw := q.Get("to"); raw != "" {
-		v, ok := parseCursorPath(raw)
-		if !ok {
-			writeError(w, http.StatusBadRequest, "to must be a non-negative integer")
-			return
-		}
-		to = &v
-	}
-	if to != nil && *to < from {
-		writeError(w, http.StatusBadRequest, "to must not be less than from")
+	from, to, ok := parseExportInterval(w, r.URL.Query())
+	if !ok {
 		return
 	}
 
@@ -65,10 +99,56 @@ func handleExportChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to export changes")
 		return
 	}
-	if rows == nil {
-		rows = make([]events.ListedChange, 0)
+	writeChangeExport(w, rows)
+}
+
+// handleSessionExportChanges is the session-scoped view of the change-log
+// batch export, sharing the session change read's exact collection path:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/changes?from=0&to=N
+//
+// The interval semantics and the response body are identical to the
+// document-level export; around them sit the session view's checks in their
+// fixed order — request shape and parameters (400), session existence (404),
+// the session device's document permission (403) — so a rejected export
+// exposes no change content and writes nothing.
+func handleSessionExportChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	// Malformed interval parameters are a request-shape error (400) checked
+	// before the resource lookup (404), matching the paged read's ordering.
+	from, to, ok := parseExportInterval(w, r.URL.Query())
+	if !ok {
+		return
 	}
-	writeJSON(w, http.StatusOK, changeExportResponse{Changes: rows, Count: len(rows)})
+
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return
+	}
+
+	rows, err := s.ExportChanges(documentID, from, to)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to export changes")
+		return
+	}
+	writeChangeExport(w, rows)
 }
 
 // malformedChangeExportPath reports whether p targets the change-log
@@ -105,4 +185,42 @@ func malformedChangeExportPath(p string) bool {
 		return false
 	}
 	return false
+}
+
+// malformedSessionChangesPath reports whether p targets the session-scoped
+// change collection's shape but is not the collection's exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/changes): extra path
+// segments past the collection. The paged read and the interval export share
+// that exact collection path; the subscribe subresource has its own endpoint
+// and keyword guard, so only a genuinely unrecognized suffix reaches this
+// check. ServeMux would answer it with a plain-text 404; the change surface
+// promises a JSON 400 and never a redirect. Empty segments (doubled slashes,
+// a trailing slash) are already rejected by the guard itself.
+//
+// "changes" is treated as the collection keyword only in the fourth segment,
+// right after the document identifier; a session or document identifier
+// literally named "changes" occupies an identifier position and keeps its
+// ordinary routes.
+func malformedSessionChangesPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	// The CRDT namespace ("crdt" immediately past the document identifier)
+	// has its own guard; "changes" there is an ordinary identifier, not this
+	// collection's keyword.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "changes" {
+		return false
+	}
+	// Keyword position reached. The collection is exactly
+	// {sessionId}/documents/{documentId}/changes; the subscribe subresource
+	// adds one trailing "subscribe" segment and keeps its own guard. Anything
+	// else past the keyword is a malformed 400.
+	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
+	subscribe := len(segs) == 5 && segs[4] == "subscribe"
+	return !(collection || subscribe)
 }
