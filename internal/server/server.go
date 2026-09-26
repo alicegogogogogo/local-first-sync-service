@@ -189,6 +189,21 @@ func NewHandler(s *app.App) http.Handler {
 		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/access",
 			accessBad("method is not allowed on this path"))
 	}
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/content", func(w http.ResponseWriter, r *http.Request) {
+		handleGetAttachmentContent(s, w, r)
+	})
+	// The content subresource accepts only GET: every other verb on the exact
+	// path gets a JSON 400, and extra segments past it are a malformed path
+	// that also answers a JSON 400. Like the access subresource, the rejected
+	// verbs are named explicitly — a method-less pattern would conflict with
+	// the GET extra-segment wildcard above, which already answers
+	// GET .../content/{extra}.
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
+		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/content",
+			accessBad("method is not allowed on this path"))
+		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/content/{rest...}",
+			accessBad("attachment content path is malformed"))
+	}
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})

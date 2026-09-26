@@ -316,6 +316,45 @@ func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleGetAttachmentContent returns the whole content of a sealed upload in
+// one read: the stored chunks concatenated in ascending index order, byte for
+// byte what the per-chunk reads return one piece at a time. The path device
+// id is the caller identity — there is no other authentication — and the
+// creator and any granted device see the same bytes. The judgments run in a
+// fixed order: the path shape first (an empty identifier, a missing or extra
+// segment and any non-GET method are a 400 JSON error enforced by the routing
+// layer, all with zero writes), then an unknown or deleted attachment is a
+// 404 JSON error, a caller that is neither the creator nor a granted reader
+// is a 403 JSON error that leaks not a single byte, and an upload that is not
+// sealed yet is a 409 JSON error that leaves the upload resumable. The
+// content is assembled inside one serialized transaction, so a delete racing
+// the read yields either the complete bytes or a 404, never half of the
+// content. The endpoint is read-only: it writes nothing, allocates no cursor
+// and notifies no subscriber, and repeated reads return the same bytes.
+func handleGetAttachmentContent(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	data, err := s.GetAttachmentContent(deviceID, attachmentID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		case errors.Is(err, store.ErrAttachmentNotSealed):
+			writeError(w, http.StatusConflict, "attachment is not sealed yet")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to load attachment content")
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 // handleListAttachmentAccess is the read-only roster over an attachment's
 // access subresource: the device ids the attachment is currently open to for
 // reading — every device the creator granted through the access endpoint and

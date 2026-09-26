@@ -72,6 +72,12 @@ func (e *ErrChunkConflict) Error() string {
 // caller maps it to 404.
 var ErrChunkNotFound = errors.New("chunk not found")
 
+// ErrAttachmentNotSealed reports a whole-content read against an upload that
+// has not been finished yet: the assembled content exists only once the
+// upload is sealed, so the read is rejected and the upload stays resumable.
+// The caller maps it to 409.
+var ErrAttachmentNotSealed = errors.New("attachment is not sealed yet")
+
 // Attachment is the stored metadata of one resumable upload.
 type Attachment struct {
 	ID         string
@@ -527,6 +533,57 @@ func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) (
 		return nil, err
 	}
 	return data, tx.Commit()
+}
+
+// GetAttachmentContent returns the whole content of a sealed upload in one
+// read: the stored chunks concatenated in ascending index order, exactly the
+// bytes the per-chunk read returns one piece at a time. An unknown or deleted
+// attachment yields ErrAttachmentNotFound, a device that is neither the
+// creator nor a granted reader yields ErrAttachmentForbidden, and an upload
+// that is not sealed yet yields ErrAttachmentNotSealed — judged in that
+// order, and none of them writes anything. The read runs in one serialized
+// transaction, so a delete racing it is observed either before the read
+// starts (the read misses with ErrAttachmentNotFound) or after the read
+// committed (the complete bytes are returned) — never half of the content.
+// The read itself writes nothing and leaves no record behind.
+func (s *Store) GetAttachmentContent(deviceID, attachmentID string) ([]byte, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	a, err := getAttachmentReadTx(tx, attachmentID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !a.Complete {
+		return nil, ErrAttachmentNotSealed
+	}
+
+	rows, err := tx.Query(
+		`SELECT data FROM attachment_chunks WHERE attachment_id = ? ORDER BY idx ASC`,
+		attachmentID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var content []byte
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		content = append(content, data...)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	return content, tx.Commit()
 }
 
 // DeleteAttachment removes the attachment owned by deviceID together with

@@ -14,7 +14,11 @@ import (
 //
 // Only cursors of existing changes are valid snapshot points: an unknown
 // document, a cursor below 1 or a cursor ahead of the document's current
-// cursor yields ErrSnapshotBase and nothing is written. Re-posting a state
+// cursor yields ErrSnapshotBase and nothing is written. The current cursor is
+// the document's high-water mark in the never-reset cursor space — the
+// greater of the online maximum and the compaction boundary — so a cursor
+// whose change has been trimmed by compaction is still a valid snapshot
+// point, even after a full trim emptied the online log. Re-posting a state
 // that decodes equal to the stored one is idempotent (created=false); a
 // different state is an *ErrSnapshotConflict and the stored snapshot is left
 // unchanged. Snapshots are independent of the change log: they neither move
@@ -26,11 +30,8 @@ func (s *Service) PutSnapshot(documentID string, cursor int64, state json.RawMes
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var current int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&current); err != nil {
+	current, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return false, err
 	}
 	if current == 0 || cursor < 1 || cursor > current {

@@ -553,3 +553,161 @@ func TestChangesCompactRestart(t *testing.T) {
 		t.Fatalf("new cursor after restart = %v, want 4", result)
 	}
 }
+
+// After a full trim the snapshot cursor judgment follows the never-reset
+// cursor space: creating a snapshot for a trimmed cursor still succeeds, a
+// repeat reports created=false, and a restore of that snapshot keeps its
+// idempotency — all unchanged across a restart.
+func TestSnapshotAfterFullTrimHTTP(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "sync.db")
+	open := func(t *testing.T) (http.Handler, *app.App) {
+		t.Helper()
+		s, err := app.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return NewHandler(s), s
+	}
+
+	h, s := open(t)
+	registerDevice(t, h, "dev-1")
+	postDocChanges(t, h, "doc", "dev-1", 2)
+	w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": nil})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := compactChanges(t, h, "doc", "dev-1"); w.Code != http.StatusOK || w.Body.String() != "{\"boundary\":2,\"removed\":2}\n" {
+		t.Fatalf("full compact = %d %q", w.Code, w.Body.String())
+	}
+
+	// A trimmed cursor is still an existing cursor: the snapshot is created;
+	// the identical repeat is idempotent.
+	snapshotAtOne := func(h http.Handler) {
+		t.Helper()
+		w, body := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 1, "state": map[string]any{"s": 1}})
+		if w.Code != http.StatusOK || body["created"] != true {
+			t.Fatalf("snapshot at trimmed cursor = %d %v body=%s", w.Code, body, w.Body.String())
+		}
+		w, body = postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 1, "state": map[string]any{"s": 1}})
+		if w.Code != http.StatusOK || body["created"] != false {
+			t.Fatalf("repeat snapshot = %d %v body=%s", w.Code, body, w.Body.String())
+		}
+		// A cursor beyond the high-water mark is still a 400.
+		w, _ = postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 3, "state": nil})
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("snapshot beyond boundary = %d, want 400", w.Code)
+		}
+	}
+	snapshotAtOne(h)
+
+	// The new snapshot restores; the repeat restore is idempotent with the
+	// first cursor.
+	restore := func(h http.Handler) {
+		t.Helper()
+		w, body := postJSON(t, h, "/v1/documents/doc/restore", map[string]any{
+			"deviceId": "dev-1", "changeId": "r1", "snapshotCursor": 1,
+		})
+		if w.Code != http.StatusOK || body["created"] != true ||
+			int64(body["cursor"].(float64)) != 3 || int64(body["restoredFrom"].(float64)) != 1 {
+			t.Fatalf("restore = %d %v body=%s", w.Code, body, w.Body.String())
+		}
+		w, body = postJSON(t, h, "/v1/documents/doc/restore", map[string]any{
+			"deviceId": "dev-1", "changeId": "r1", "snapshotCursor": 1,
+		})
+		if w.Code != http.StatusOK || body["created"] != false || int64(body["cursor"].(float64)) != 3 {
+			t.Fatalf("repeat restore = %d %v body=%s", w.Code, body, w.Body.String())
+		}
+	}
+	restore(h)
+	_ = s.Close()
+
+	// After a restart the snapshot, the restore idempotency and the cursor
+	// judgment are unchanged.
+	h, s = open(t)
+	defer func() { _ = s.Close() }()
+	w, body := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 1, "state": map[string]any{"s": 1}})
+	if w.Code != http.StatusOK || body["created"] != false {
+		t.Fatalf("snapshot after restart = %d %v body=%s", w.Code, body, w.Body.String())
+	}
+	w, body = postJSON(t, h, "/v1/documents/doc/restore", map[string]any{
+		"deviceId": "dev-1", "changeId": "r1", "snapshotCursor": 1,
+	})
+	if w.Code != http.StatusOK || body["created"] != false || int64(body["cursor"].(float64)) != 3 {
+		t.Fatalf("restore after restart = %d %v body=%s", w.Code, body, w.Body.String())
+	}
+}
+
+// A trimmed change id that belongs to a restore compares only the source
+// device and the payload at the ordinary-commit, replay and merge entries —
+// the restore provenance plays no role there, so re-submitting the id with
+// the matching device and payload is idempotent, never a 409.
+func TestTrimmedRestoreIdIgnoresProvenanceOutsideRestore(t *testing.T) {
+	h, _ := newTestHandler(t)
+	registerDevice(t, h, "dev-1")
+	postDocChanges(t, h, "doc", "dev-1", 2)
+	w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": map[string]any{"snap": 2}})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc/restore", map[string]any{
+		"deviceId": "dev-1", "changeId": "r1", "snapshotCursor": 2,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore: %d %s", w.Code, w.Body.String())
+	}
+	w, _ = postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 3, "state": nil})
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := compactChanges(t, h, "doc", "dev-1"); w.Code != http.StatusOK || w.Body.String() != "{\"boundary\":3,\"removed\":3}\n" {
+		t.Fatalf("compact = %d %q", w.Code, w.Body.String())
+	}
+
+	// Ordinary commit: same device and payload as the trimmed restore is
+	// idempotent with the first cursor, not a 409.
+	w, body := postJSON(t, h, "/v1/documents/doc/changes", map[string]any{
+		"deviceId": "dev-1",
+		"changes":  []any{map[string]any{"id": "r1", "payload": map[string]any{"snap": 2}}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("post trimmed restore id = %d %s", w.Code, w.Body.String())
+	}
+	result := body["results"].([]any)[0].(map[string]any)
+	if result["created"] != false || int64(result["cursor"].(float64)) != 3 {
+		t.Fatalf("post result = %v, want created=false cursor 3", result)
+	}
+
+	// Offline replay: same verdict.
+	w, body = postJSON(t, h, "/v1/documents/doc/replay", map[string]any{
+		"deviceId":   "dev-1",
+		"operations": []any{map[string]any{"id": "r1", "payload": map[string]any{"snap": 2}}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay trimmed restore id = %d %s", w.Code, w.Body.String())
+	}
+	result = body["results"].([]any)[0].(map[string]any)
+	if result["created"] != false || int64(result["cursor"].(float64)) != 3 {
+		t.Fatalf("replay result = %v, want created=false cursor 3", result)
+	}
+
+	// Merge: same verdict.
+	w, body = postJSON(t, h, "/v1/documents/doc/merge", map[string]any{
+		"deviceId": "dev-1", "baseCursor": 3,
+		"change": map[string]any{"id": "r1", "payload": map[string]any{"snap": 2}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("merge trimmed restore id = %d %s", w.Code, w.Body.String())
+	}
+	if body["outcome"] != "idempotent" || int64(body["cursor"].(float64)) != 3 {
+		t.Fatalf("merge result = %v, want idempotent cursor 3", body)
+	}
+
+	// A different device or payload at those entries is still a 409.
+	w, _ = postJSON(t, h, "/v1/documents/doc/changes", map[string]any{
+		"deviceId": "dev-1",
+		"changes":  []any{map[string]any{"id": "r1", "payload": map[string]any{"snap": 99}}},
+	})
+	if w.Code != http.StatusConflict {
+		t.Fatalf("payload mismatch = %d, want 409", w.Code)
+	}
+}
