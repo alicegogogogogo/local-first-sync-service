@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
@@ -392,4 +393,60 @@ func TestAttachmentContentMatchesPerChunkReads(t *testing.T) {
 	if w := serveRecorder(h, r); w.Code != http.StatusOK || w.Body.String() != "the" {
 		t.Fatalf("chunk 0 after content read = %d %q", w.Code, w.Body.String())
 	}
+}
+
+// The whole-content read is a read-only view over a real connection: it
+// consumes no change cursor (the document log's high-water mark is unmoved and
+// the next commit takes the immediately following cursor) and pushes nothing to
+// a live subscription. These regression assertions mirror the read-only
+// contract stated for the entry; a later commit is still delivered exactly
+// once.
+func TestAttachmentContentDoesNotConsumeCursorOrPush(t *testing.T) {
+	srv, st := newWSTestServer(t)
+	h := NewHandler(st)
+	setupSession(t, srv, "dev-1", "sess", "doc", 1)
+	content := []byte("hello world")
+	mustCreateAttachment(t, h, "dev-1", "att-1", content, 4)
+	putChunk(t, h, "dev-1", "att-1", 0, []byte("hell"))
+	putChunk(t, h, "dev-1", "att-1", 1, []byte("o wo"))
+	putChunk(t, h, "dev-1", "att-1", 2, []byte("rld"))
+	if w, body := completeAttachment(t, h, "dev-1", "att-1"); w.Code != http.StatusOK || body["complete"] != true {
+		t.Fatalf("complete = %d %v", w.Code, body)
+	}
+
+	conn, resp := dialWS(t, subscribeURL(srv, "sess", "doc", "0"))
+	if conn == nil {
+		t.Fatalf("upgrade = %d", resp.StatusCode)
+	}
+	defer conn.close()
+	if c := conn.readChange(); c.Cursor != 1 {
+		t.Fatalf("seed frame = %+v", c)
+	}
+
+	// Several whole-content reads while the subscription is parked.
+	for i := 0; i < 3; i++ {
+		w := getAttachmentContent(t, h, "dev-1", "att-1")
+		if w.Code != http.StatusOK || w.Body.String() != string(content) {
+			t.Fatalf("content read %d = %d %q", i, w.Code, w.Body.String())
+		}
+	}
+
+	// No push frame is produced by the reads.
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("the whole-content read pushed a frame to the subscription")
+	}
+	conn.clearReadDeadline()
+
+	// The change cursor is untouched: the next post takes cursor 2 and that is
+	// the only frame that arrives.
+	postDocChange(t, srv, "dev-1", "doc", "after-content", map[string]any{"x": 1})
+	if c := conn.readChange(); c.Cursor != 2 || c.ID != "after-content" {
+		t.Fatalf("post-content frame = %+v, want after-content/2", c)
+	}
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("a second frame arrived after the single post")
+	}
+	conn.clearReadDeadline()
 }

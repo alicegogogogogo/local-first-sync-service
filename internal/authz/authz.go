@@ -217,3 +217,58 @@ func (s *Service) DocumentAuthorized(documentID, deviceID string) (bool, error) 
 		return stored != 0, nil
 	}
 }
+
+// PermissionEntry is one row of a document's permission ledger: a currently
+// registered device id together with its authorization for the document.
+type PermissionEntry struct {
+	DeviceID   string
+	Authorized bool
+}
+
+// ListDocumentPermissions is the read-only ledger view of one document: one
+// entry per currently registered device, in ascending lexicographic device-id
+// order, paged by limit/offset against that same order.
+//
+// A device with no ledger row starts authorized, so its entry reports
+// Authorized=true; a device whose latest committed action was a revoke reports
+// false. Deregistered devices carry no device row and their ledger rows were
+// removed by the deregistration cascade, so they never appear. An unknown
+// document is indistinguishable from one on which every device keeps the
+// default: every registered device lists authorized. The read runs in one
+// serialized transaction, creates no row, moves no cursor and notifies no sink.
+func (s *Service) ListDocumentPermissions(documentID string, limit, offset int64) ([]PermissionEntry, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(
+		`SELECT d.id, COALESCE(p.authorized, 1) AS authorized
+		 FROM devices d
+		 LEFT JOIN document_permissions p
+		   ON p.document_id = ? AND p.device_id = d.id
+		 ORDER BY d.id ASC
+		 LIMIT ? OFFSET ?`,
+		documentID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	entries := make([]PermissionEntry, 0)
+	for rows.Next() {
+		var entry PermissionEntry
+		var stored int
+		if err := rows.Scan(&entry.DeviceID, &stored); err != nil {
+			return nil, err
+		}
+		entry.Authorized = stored != 0
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, tx.Commit()
+}
