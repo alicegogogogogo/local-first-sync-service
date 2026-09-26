@@ -120,6 +120,60 @@ func TestCompactBoundaryAndCursorSpaceSurviveFullTrim(t *testing.T) {
 	}
 }
 
+// A full compaction trims every online row, but the cursor space does not
+// reset: a snapshot can still be created at an existing cursor (at or below
+// the boundary), a repeat create reports created=false, and a cursor ahead of
+// the high-water mark is still rejected.
+func TestSnapshotAfterFullCompaction(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if _, err := s.RegisterDevice("dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PostChanges("doc", changes("c1", "c2", "c3")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PutSnapshot("doc", 3, json.RawMessage(`{"s":3}`)); err != nil {
+		t.Fatal(err)
+	}
+	boundary, removed, err := s.CompactChanges("doc", "dev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary != 3 || removed != 3 {
+		t.Fatalf("compact = boundary %d removed %d, want 3/3", boundary, removed)
+	}
+
+	// The online log is empty, yet cursor 2 is an existing cursor of the
+	// document: the snapshot is created.
+	created, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"s":2}`))
+	if err != nil || !created {
+		t.Fatalf("snapshot at trimmed cursor: created=%v err=%v", created, err)
+	}
+	// A repeat create with the same state is idempotent; a different state is
+	// a conflict that keeps the stored snapshot.
+	created, err = s.PutSnapshot("doc", 2, json.RawMessage(`{"s":2}`))
+	if err != nil || created {
+		t.Fatalf("repeat snapshot: created=%v err=%v", created, err)
+	}
+	if _, err := s.PutSnapshot("doc", 2, json.RawMessage(`{"s":99}`)); err == nil {
+		t.Fatal("conflicting snapshot at trimmed cursor succeeded")
+	}
+	// A cursor ahead of the high-water mark is still not an existing cursor.
+	if _, err := s.PutSnapshot("doc", 4, json.RawMessage(`{"s":4}`)); err == nil {
+		t.Fatal("snapshot past the boundary succeeded")
+	}
+	// The stored snapshots read back unchanged.
+	state, err := s.GetSnapshot("doc", 2)
+	if err != nil || string(state) != `{"s":2}` {
+		t.Fatalf("snapshot 2 = %s err=%v", state, err)
+	}
+}
+
 func TestCompactGateAndUnknownDocument(t *testing.T) {
 	s, err := app.Open("")
 	if err != nil {

@@ -268,7 +268,7 @@ Sec-WebSocket-Version: 13
 ```
 
 - `cursor` 为非负整数（不接受小数、字符串、布尔或 `null`）；`state` 必填，为任意合法 JSON 值。
-- 仅已知文档的现有 cursor（`1..当前cursor`）可创建快照；未知文档、cursor 为 0 或超过当前 cursor 均返回 `400` JSON 错误且零写入。
+- 仅已知文档的现有 cursor（`1..当前cursor`）可创建快照；未知文档、cursor 为 0 或超过当前 cursor 均返回 `400` JSON 错误且零写入。当前 cursor 按未重置的游标空间计算：全量裁剪后既有游标（不超过压缩边界）仍可创建快照。
 - 同一文档同一 cursor 唯一：首次创建返回 `200` `{"cursor":N,"created":true}`；重试时 `state` 解码相同则幂等返回 `200` `{"cursor":N,"created":false}`，不同则返回 `409` JSON 错误且原快照不变。
 - 快照同步落盘，重启后可读，幂等与冲突判定不变；快照不影响 changes 或 merge。
 
@@ -403,6 +403,15 @@ Sec-WebSocket-Version: 13
 ### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
 
 创建者或被授权设备读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识（设备或附件）返回 `400` JSON 错误；已知附件的序号为负数、非十进制或超出声明分块范围（`>= ceil(totalBytes/chunkSize)`）也统一返回 `400` JSON 错误而非重定向或 HTML；未知附件返回 `404`，序号合法但该分块尚未到达也返回 `404` JSON 错误；其他设备返回 `403` JSON 错误。
+
+### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/content`
+
+创建者或被授权设备一次取回附件的完整字节。仅接受 `GET`，路径设备标识即调用者身份，无其他认证机制。
+
+- 命中返回 `200`，`Content-Type: application/octet-stream`，正文为各分块按序号升序拼接的原始字节，与逐块读取拼接的结果逐字一致；重复读取结果稳定。
+- 判定顺序固定为形状、存在性、授权、封存状态，前序失败优先返回：标识为空、路径段缺失或多余、方法不是 `GET` 一律返回 `400` JSON 错误且零写入；附件不存在或已删除返回 `404` JSON 错误；调用设备既非创建者也未被授权返回 `403` JSON 错误，一个字节也不泄露；上传尚未封存返回 `409` JSON 错误，上传保持可继续，封存后仍可整读。
+- 整内容读取是只读入口：不产生变更、不占用游标，也不触发订阅推送通知；读取进行中附件被删除时，要么读到完整字节，要么得到 `404`，不会读到半截内容。
+- 读取结果同步落盘，进程重启后正文与判定保持一致。
 
 附件的创建、分块、完成、读取与删除均同步落盘；进程重启后上传状态、内容去重、幂等判定、封存后的拒写判定与删除结果保持一致。
 

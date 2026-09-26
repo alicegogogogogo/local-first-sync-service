@@ -316,6 +316,43 @@ func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleGetAttachmentContent streams the whole content of a sealed upload
+// back to the creator or a granted reader: the stored chunks concatenated in
+// ascending index order, byte-for-byte what reading every chunk individually
+// would yield, as application/octet-stream. The judgments run in a fixed
+// order — the path shape first (the route patterns and the empty-segment
+// guard answer a 400 for empty identifiers, missing or extra segments and
+// non-GET verbs), then existence (an unknown or deleted id is a 404 JSON
+// error), then authorization (a device that is neither the creator nor a
+// granted reader is a 403 JSON error and not one byte leaks), then the seal
+// (an unfinished upload is a 409 JSON error and stays resumable). The read is
+// pure: it writes nothing, allocates no cursor and notifies no subscriber,
+// and a delete racing it yields either the complete bytes or a 404, never
+// half the content.
+func handleGetAttachmentContent(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	content, err := s.GetAttachmentContent(deviceID, attachmentID)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		case errors.Is(err, store.ErrAttachmentNotSealed):
+			writeError(w, http.StatusConflict, "attachment upload is not complete")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to load attachment content")
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+}
+
 // handleListAttachmentAccess is the read-only roster over an attachment's
 // access subresource: the device ids the attachment is currently open to for
 // reading — every device the creator granted through the access endpoint and
