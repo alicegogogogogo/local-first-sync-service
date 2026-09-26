@@ -127,8 +127,9 @@ func (s *Service) ReplayChanges(documentID string, changes []Change) ([]Result, 
 	return results, nil
 }
 
-// resolveChanges resolves every change id against existing rows inside tx. A
-// single device/payload mismatch aborts the whole batch before any cursor is
+// resolveChanges resolves every change id against existing rows inside tx,
+// falling back to the retained summaries of compacted-away ids. A single
+// device/payload mismatch aborts the whole batch before any cursor is
 // allocated. It returns the per-id results and the indices of genuinely new
 // changes that still need a cursor.
 func resolveChanges(tx *sql.Tx, documentID string, changes []Change) ([]Result, []int, error) {
@@ -144,7 +145,21 @@ func resolveChanges(tx *sql.Tx, documentID string, changes []Change) ([]Result, 
 		).Scan(&existingCursor, &existingDevice, &existingPayload)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			pending = append(pending, i)
+			// No online row: the id may belong to a change compaction
+			// trimmed, whose retained summary still decides idempotency.
+			found, cursor, err := resolveTrimmedIdentity(tx, documentID, c)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !found {
+				pending = append(pending, i)
+				continue
+			}
+			results[i] = Result{
+				ID:      c.ID,
+				Created: false,
+				Cursor:  cursor,
+			}
 		case err != nil:
 			return nil, nil, err
 		default:
@@ -162,15 +177,15 @@ func resolveChanges(tx *sql.Tx, documentID string, changes []Change) ([]Result, 
 }
 
 // appendPending allocates contiguous cursors to the new change indices and
-// inserts them in input order. It runs inside the caller's transaction.
+// inserts them in input order. It runs inside the caller's transaction. The
+// allocation continues past the compaction boundary, so trimming the online
+// log never makes the cursor space restart.
 func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []int, results []Result) error {
-	var nextCursor int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&nextCursor); err != nil {
+	nextCursor, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return err
 	}
+	nextCursor++
 	for _, i := range pending {
 		c := changes[i]
 		if _, err := tx.Exec(
@@ -203,8 +218,11 @@ func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []in
 //     non-object later payload or shared key is an *ErrConflict.
 //
 // A non-zero baseCursor for an unknown document, or a baseCursor greater than
-// the current cursor, returns ErrStaleCursor. An unknown document with
-// baseCursor 0 accepts the first change as "applied".
+// the current cursor, returns ErrStaleCursor. A baseCursor below the
+// compaction boundary returns ErrCompactedBase: the changes the merge would be
+// checked against have left the online log, so the conflict check cannot be
+// completed. An unknown document with baseCursor 0 accepts the first change as
+// "applied".
 func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (MergeResult, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -212,16 +230,21 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Current cursor is the document's high-water mark, 0 when unknown.
-	var current int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&current); err != nil {
+	// Current cursor is the document's high-water mark (0 when unknown); it
+	// never drops below the compaction boundary.
+	current, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return MergeResult{}, err
 	}
 	if baseCursor > current || (baseCursor != 0 && current == 0) {
 		return MergeResult{}, ErrStaleCursor
+	}
+	boundary, err := boundaryOfTx(tx, documentID)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if baseCursor < boundary {
+		return MergeResult{}, ErrCompactedBase
 	}
 
 	// An existing id keeps the original idempotency/conflict rules.
@@ -234,7 +257,25 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 	).Scan(&existingCursor, &existingDevice, &existingPayload)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// New id; fall through to append logic below.
+		// No online row: a compacted-away id still answers from its retained
+		// summary; anything else is a new id and falls through to the append
+		// logic below.
+		found, cursor, err := resolveTrimmedIdentity(tx, documentID, c)
+		if err != nil {
+			return MergeResult{}, err
+		}
+		if found {
+			return MergeResult{
+				ID:      c.ID,
+				Outcome: "idempotent",
+				Cursor:  cursor,
+				Result: &Result{
+					ID:      c.ID,
+					Created: false,
+					Cursor:  cursor,
+				},
+			}, nil
+		}
 	case err != nil:
 		return MergeResult{}, err
 	default:

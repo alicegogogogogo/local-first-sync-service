@@ -89,6 +89,12 @@ var ErrStaleCursor = errors.New("baseCursor is unknown or ahead of the current c
 // maps it to 400; nothing is written.
 var ErrSnapshotBase = errors.New("snapshot cursor is not an existing cursor of the document")
 
+// ErrCompactedBase reports that a merge targets a base cursor below the
+// document's compaction boundary: the changes it would be checked against
+// have left the online log, so the conflict check cannot be completed. The
+// caller maps it to 400; nothing is written.
+var ErrCompactedBase = errors.New("baseCursor is below the compaction boundary")
+
 // ErrSnapshotNotFound reports that no snapshot exists for the document and
 // cursor. The caller maps it to 404.
 var ErrSnapshotNotFound = errors.New("snapshot not found")
@@ -160,4 +166,17 @@ CREATE TABLE IF NOT EXISTS restores (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS restores_doc_cursor_idx
 	ON restores(document_id, change_cursor);
+CREATE TABLE IF NOT EXISTS change_boundaries (
+	document_id TEXT NOT NULL PRIMARY KEY,
+	boundary    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS change_identities (
+	document_id   TEXT NOT NULL,
+	id            TEXT NOT NULL,
+	device_id     TEXT NOT NULL,
+	digest        BLOB NOT NULL,
+	cursor        INTEGER NOT NULL,
+	restored_from INTEGER,
+	PRIMARY KEY (document_id, id)
+);
 `

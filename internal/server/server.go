@@ -276,6 +276,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
+		handleCompactChanges(s, w, r)
+	})
+	// Non-POST verbs on the compaction path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the endpoint only accepts POST.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
 		handleReplay(s, w, r)
 	})
@@ -378,15 +386,16 @@ func emptyIDGuard(next http.Handler) http.Handler {
 }
 
 // malformedNewDocumentPath reports whether p targets one of the new
-// long-poll/replay endpoints but is not that endpoint's exact location: a
-// missing/empty segment, a trailing slash, extra segments, or a "poll"/"replay"
-// segment in a position short of the registered shape. ServeMux would answer
-// those with a 301 redirect or a plain-text 404/405; the new endpoints promise
-// a JSON error and never a redirect, so every such path is a malformed 400.
+// long-poll/replay/compaction endpoints but is not that endpoint's exact
+// location: a missing/empty segment, a trailing slash, extra segments, or a
+// "poll"/"replay"/"compact" segment in a position short of the registered
+// shape. ServeMux would answer those with a 301 redirect or a plain-text
+// 404/405; the new endpoints promise a JSON error and never a redirect, so
+// every such path is a malformed 400.
 //
 // Keywords are matched only past the documentID position, so documents that
-// happen to be named "poll" or "replay" keep their ordinary merge/snapshot/
-// changes routes.
+// happen to be named "poll", "replay" or "compact" keep their ordinary
+// merge/snapshot/changes routes.
 func malformedNewDocumentPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -406,6 +415,18 @@ func malformedNewDocumentPath(p string) bool {
 	for i, seg := range segs {
 		if seg == "replay" && i > 0 {
 			return !(len(segs) == 2 && segs[0] != "")
+		}
+	}
+	// Compaction endpoint: "compact" must be exactly the third segment, after
+	// a non-empty documentID and "changes". The CRDT namespace has its own
+	// guard; "compact" there is the CRDT compaction keyword, not the
+	// change-log one.
+	for i, seg := range segs {
+		if seg == "compact" && i > 0 {
+			if len(segs) >= 2 && segs[1] == "crdt" {
+				return false
+			}
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
 		}
 	}
 	return false
@@ -747,6 +768,9 @@ func handleMergeChange(s *app.App, w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, events.ErrStaleCursor):
 			writeError(w, http.StatusBadRequest, "baseCursor is unknown or greater than the current cursor")
+			return
+		case errors.Is(err, events.ErrCompactedBase):
+			writeError(w, http.StatusBadRequest, "baseCursor is below the compaction boundary")
 			return
 		case errors.As(err, &conflict):
 			writeError(w, http.StatusConflict, "merge conflicts with existing changes: "+conflict.ID)

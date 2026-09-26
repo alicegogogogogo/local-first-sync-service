@@ -1,6 +1,7 @@
 package events
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -167,8 +168,9 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 		return RestoreResult{}, err
 	}
 
-	// Resolve the change id: an ordinary row and a prior restore are handled
-	// differently, so consult both tables.
+	// Resolve the change id: an ordinary row, a prior restore and a
+	// compacted-away id's retained summary are handled differently, so consult
+	// all three.
 	var existingCursor int64
 	var existingDevice string
 	var existingPayload []byte
@@ -178,7 +180,40 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 	).Scan(&existingCursor, &existingDevice, &existingPayload)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// New id; fall through to append below.
+		// No online row: the id may belong to a change compaction trimmed.
+		// Its retained summary still decides — an idempotent restore needs the
+		// same device, snapshot cursor and source state; an id left by an
+		// ordinary trimmed change is a conflict, as is any mismatch.
+		var summaryDevice string
+		var summaryDigest []byte
+		var summaryCursor int64
+		var restoredFrom sql.NullInt64
+		err := tx.QueryRow(
+			`SELECT device_id, digest, cursor, restored_from FROM change_identities
+			 WHERE document_id = ? AND id = ?`,
+			documentID, changeID,
+		).Scan(&summaryDevice, &summaryDigest, &summaryCursor, &restoredFrom)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			// Genuinely new id; fall through to append below.
+		case err != nil:
+			return RestoreResult{}, err
+		default:
+			stateDigest, err := payloadDigest(state)
+			if err != nil {
+				return RestoreResult{}, err
+			}
+			if !restoredFrom.Valid || restoredFrom.Int64 != snapshotCursor ||
+				summaryDevice != deviceID || !bytes.Equal(summaryDigest, stateDigest) {
+				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			return RestoreResult{
+				ID:           changeID,
+				Created:      false,
+				Cursor:       summaryCursor,
+				RestoredFrom: snapshotCursor,
+			}, nil
+		}
 	case err != nil:
 		return RestoreResult{}, err
 	default:
@@ -209,13 +244,11 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 		}
 	}
 
-	var nextCursor int64
-	if err := tx.QueryRow(
-		`SELECT COALESCE(MAX(cursor), 0) + 1 FROM changes WHERE document_id = ?`,
-		documentID,
-	).Scan(&nextCursor); err != nil {
+	nextCursor, err := currentCursorTx(tx, documentID)
+	if err != nil {
 		return RestoreResult{}, err
 	}
+	nextCursor++
 	if _, err := tx.Exec(
 		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
 		documentID, nextCursor, changeID, deviceID, state,

@@ -177,6 +177,11 @@ func (a *App) DocumentExists(documentID string) (bool, error) {
 	return a.events.DocumentExists(documentID)
 }
 
+// CompactChanges delegates to the change event service.
+func (a *App) CompactChanges(documentID, deviceID string) (boundary, removed int64, err error) {
+	return a.events.CompactChanges(documentID, deviceID)
+}
+
 // AddSubscription delegates to the change event service.
 func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-chan struct{}, func()) {
 	return a.events.AddSubscription(documentID, deviceID)
