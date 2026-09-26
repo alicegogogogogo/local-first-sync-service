@@ -16,7 +16,12 @@
 // repeat does not. A session id already owned by another device is a
 // conflict, never silently re-homed. Deletes are owner-scoped and hard: a
 // repeat delete, another device, and a cross-device path all miss with 404,
-// after which the id is free to be created again.
+// after which the id is free to be created again. A device itself can be
+// deregistered: its sessions, attachments (chunks, completion state and
+// grants, both given and received) and device row vanish in one serialized
+// transaction, shared content bytes are reclaimed only when the last
+// completed reference is gone, and the id may then register again as a
+// brand-new device.
 //
 // Attachments are resumable chunked uploads owned by the registered device
 // that created them. Creation pins the declared total size, chunk size and
@@ -403,6 +408,99 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// DeleteDeviceTx removes deviceID and every trace the registration layer owns
+// for it, inside the caller's transaction: the device's sessions, its
+// attachments together with their chunks and access grants, every read grant
+// other devices' attachments extended to it, and finally the device row
+// itself. Digest-addressed content bytes are reclaimed only when no completed
+// attachment references them any longer, so other devices' deduplicated
+// content is untouched. An unknown (or already removed) device yields
+// ErrDeviceNotFound and nothing is written. The document permission ledger is
+// the permission service's own table; the composition root clears it in the
+// same transaction, so the whole deregistration commits as one judgment.
+func DeleteDeviceTx(q DBTX, deviceID string) error {
+	exists, err := DeviceExistsTx(q, deviceID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrDeviceNotFound
+	}
+
+	// Collect the digests of the device's completed uploads before removing
+	// anything, so shared content can be reclaimed once the last completed
+	// reference disappears.
+	rows, err := q.Query(
+		`SELECT sha256 FROM attachments WHERE device_id = ? AND complete = 1`, deviceID,
+	)
+	if err != nil {
+		return err
+	}
+	digests := make([]string, 0)
+	for rows.Next() {
+		var digest string
+		if err := rows.Scan(&digest); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		digests = append(digests, digest)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	// Children first: chunks and grants reference the attachment rows, and the
+	// attachment and session rows reference the device row.
+	if _, err := q.Exec(
+		`DELETE FROM attachment_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE device_id = ?)`,
+		deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(
+		`DELETE FROM attachment_access WHERE attachment_id IN (SELECT id FROM attachments WHERE device_id = ?)`,
+		deviceID,
+	); err != nil {
+		return err
+	}
+	// Read grants other devices extended to this device lapse with it.
+	if _, err := q.Exec(
+		`DELETE FROM attachment_access WHERE device_id = ?`, deviceID,
+	); err != nil {
+		return err
+	}
+	if _, err := q.Exec(`DELETE FROM attachments WHERE device_id = ?`, deviceID); err != nil {
+		return err
+	}
+	if _, err := q.Exec(`DELETE FROM sessions WHERE device_id = ?`, deviceID); err != nil {
+		return err
+	}
+	if _, err := q.Exec(`DELETE FROM devices WHERE id = ?`, deviceID); err != nil {
+		return err
+	}
+
+	// Reclaim digest-addressed content only when no completed attachment
+	// references it any longer; other devices' finished uploads keep their
+	// bytes.
+	for _, digest := range digests {
+		var stillReferenced bool
+		if err := q.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM attachments WHERE sha256 = ? AND complete = 1)`,
+			digest,
+		).Scan(&stillReferenced); err != nil {
+			return err
+		}
+		if !stillReferenced {
+			if _, err := q.Exec(`DELETE FROM attachment_contents WHERE sha256 = ?`, digest); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // SessionExists reports whether a live session with sessionID exists.

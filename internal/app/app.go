@@ -184,6 +184,39 @@ func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-c
 
 // ---- Permission service boundary. ----
 
+// DeleteDevice deregisters deviceID and cascades the removal through every
+// table the services own for it: its sessions, its document permission rows,
+// its attachments (chunks, completion state and grants, both given and
+// received) and finally the device row itself — all in one serialized
+// transaction on the shared connection that commits synchronously. An unknown
+// or already removed device yields store.ErrDeviceNotFound and nothing is
+// written, so concurrent deletes of the same device commit at most once. Once
+// the removal commits, the device's live subscriptions in both push channels
+// are ended. Document change history, snapshots and CRDT state are not the
+// device's to take: they stay, and so do other devices' permissions and
+// attachments. The id may register again afterwards as a brand-new device.
+func (a *App) DeleteDevice(deviceID string) error {
+	tx, err := a.Store.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := store.DeleteDeviceTx(tx, deviceID); err != nil {
+		return err
+	}
+	if err := a.Authz.RemoveDeviceTx(tx, deviceID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	a.events.SignalDeviceGone(deviceID)
+	a.crdt.SignalDeviceGone(deviceID)
+	return nil
+}
+
 // SetDocumentPermission delegates to the permission service.
 func (a *App) SetDocumentPermission(documentID, deviceID string, authorized bool) (bool, error) {
 	return a.Authz.SetDocumentPermission(documentID, deviceID, authorized)

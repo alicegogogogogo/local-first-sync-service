@@ -115,6 +115,22 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/devices", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown device path")
 	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteDevice(s, w, r)
+	})
+	// The device item path accepts only DELETE; every other verb gets a JSON
+	// 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/devices/{deviceId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// A DELETE short of the device id is a malformed deregistration and
+	// answers a JSON 400 instead of the collection 404. Extra segments past
+	// the device id are handled by the subtree catch-all further below (a
+	// JSON 400 for DELETE outside the session subtree); the more specific
+	// session and attachment delete routes still win for their exact shapes.
+	mux.HandleFunc("DELETE /v1/devices", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "device delete path is malformed")
+	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown session path")
 	})
@@ -223,7 +239,21 @@ func NewHandler(s *app.App) http.Handler {
 	// Any other path under the new namespaces is a JSON 404 rather than
 	// ServeMux's plain-text one: every failure of a new endpoint answers JSON.
 	// Exact method-patterns above take precedence over these subtree patterns.
-	mux.HandleFunc("/v1/devices/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+	// A DELETE that fell through to the device catch-all is a deregistration
+	// carrying extra segments past the device id — a malformed delete, which
+	// the delete entries answer with a JSON 400 (matching the attachment
+	// delete shapes) — unless it targets the session subtree, whose malformed
+	// delete shapes keep their JSON 404.
+	mux.HandleFunc("/v1/devices/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			rest := r.PathValue("rest")
+			if segs := strings.SplitN(rest, "/", 3); len(segs) >= 2 && segs[1] == "sessions" {
+				writeError(w, http.StatusNotFound, "unknown device/session path")
+				return
+			}
+			writeError(w, http.StatusBadRequest, "device delete path is malformed")
+			return
+		}
 		writeError(w, http.StatusNotFound, "unknown device/session path")
 	})
 	mux.HandleFunc("/v1/sessions/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
@@ -523,6 +553,35 @@ func handleRegisterDevice(s *app.App, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"deviceId": req.DeviceID, "created": created})
+}
+
+// deviceDeleteResponse is the success body of the deregistration endpoint:
+// the device id and the deletion marker, in that key order, and nothing else.
+type deviceDeleteResponse struct {
+	DeviceID string `json:"deviceId"`
+	Deleted  bool   `json:"deleted"`
+}
+
+// handleDeleteDevice deregisters the device named in the path. There is no
+// request body and no new authentication: the path device id is the caller's
+// identity. The removal cascades through the device's sessions, document
+// permissions, attachments (chunks, completion state and grants, both given
+// and received) and live subscriptions in one serialized transaction that
+// commits synchronously; an unknown or already removed device is a 404 JSON
+// error and writes nothing, so a repeat deregistration misses the same way.
+func handleDeleteDevice(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
+
+	if err := s.DeleteDevice(deviceID); err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to delete device")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, deviceDeleteResponse{DeviceID: deviceID, Deleted: true})
 }
 
 func handleCreateSession(s *app.App, w http.ResponseWriter, r *http.Request) {

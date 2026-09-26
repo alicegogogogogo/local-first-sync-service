@@ -184,6 +184,17 @@ func (s *Service) SetDocumentPermission(documentID, deviceID string, authorized 
 	return true, nil
 }
 
+// RemoveDeviceTx forgets every permission row naming deviceID, inside the
+// caller's transaction. It is the permission service's share of device
+// deregistration: a device that later registers again under the same id
+// starts from the default (authorized) state, inheriting none of its
+// predecessor's grants or revocations. Other devices' rows are untouched, so
+// their session-scoped reads keep their existing verdicts.
+func (s *Service) RemoveDeviceTx(q store.DBTX, deviceID string) error {
+	_, err := q.Exec(`DELETE FROM document_permissions WHERE device_id = ?`, deviceID)
+	return err
+}
+
 // DocumentAuthorized reports whether deviceID currently holds permission for
 // documentID. Devices start authorized, so an absent row means authorized.
 func (s *Service) DocumentAuthorized(documentID, deviceID string) (bool, error) {

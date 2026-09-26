@@ -65,7 +65,9 @@ func TestNewFamiliesAlwaysJSON(t *testing.T) {
 		{http.MethodPut, "/v1/devices", http.StatusNotFound},
 		{http.MethodGet, "/v1/sessions", http.StatusNotFound},
 		{http.MethodGet, "/v1/devices/dev1/sessions", http.StatusNotFound},
-		{http.MethodPost, "/v1/devices/dev1", http.StatusNotFound},
+		// A non-DELETE verb on the device item path is a method mismatch on
+		// the deregistration endpoint: a JSON 400, not the subtree 404.
+		{http.MethodPost, "/v1/devices/dev1", http.StatusBadRequest},
 		{http.MethodDelete, "/v1/devices/dev1/sessions/s1/extra", http.StatusNotFound},
 		{http.MethodPost, "/v1/sessions/s1/documents/d/changes", http.StatusNotFound},
 	}
