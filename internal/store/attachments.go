@@ -487,6 +487,104 @@ func (s *Store) GetAttachment(deviceID, attachmentID string) (Attachment, []int6
 	return a, indices, tx.Commit()
 }
 
+// ListedAttachment is one entry of a device's attachment listing: the stored
+// metadata, the sorted indices received so far, and whether the listing
+// device created the attachment (Owned) or reads it through a grant.
+type ListedAttachment struct {
+	ID             string  `json:"attachmentId"`
+	TotalBytes     int64   `json:"totalBytes"`
+	ChunkSize      int64   `json:"chunkSize"`
+	SHA256         string  `json:"sha256"`
+	Complete       bool    `json:"complete"`
+	Owned          bool    `json:"owned"`
+	ReceivedChunks []int64 `json:"receivedChunks"`
+}
+
+// ListAttachments returns the page of attachments visible to deviceID: every
+// attachment the device created plus every attachment another device created
+// and granted it read access to, each appearing at most once. The page is
+// ordered by creation (the attachments rowid, which persists across restarts
+// and only ever moves a re-created id to the end), skipping offset entries
+// and returning at most limit. ReceivedChunks are ascending. An unregistered
+// device yields ErrDeviceNotFound; the listing is read-only and writes
+// nothing.
+func (s *Store) ListAttachments(deviceID string, limit, offset int64) ([]ListedAttachment, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	exists, err := DeviceExistsTx(tx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrDeviceNotFound
+	}
+
+	rows, err := tx.Query(
+		`SELECT a.id, a.total_bytes, a.chunk_size, a.sha256, a.complete,
+			a.device_id = ? AS owned
+		 FROM attachments a
+		 WHERE a.device_id = ?
+		    OR EXISTS (
+				SELECT 1 FROM attachment_access ac
+				WHERE ac.attachment_id = a.id AND ac.device_id = ? AND ac.authorized <> 0
+			)
+		 ORDER BY a.rowid ASC
+		 LIMIT ? OFFSET ?`,
+		deviceID, deviceID, deviceID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ListedAttachment, 0)
+	for rows.Next() {
+		var it ListedAttachment
+		var complete, owned int
+		if err := rows.Scan(&it.ID, &it.TotalBytes, &it.ChunkSize, &it.SHA256, &complete, &owned); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		it.Complete = complete != 0
+		it.Owned = owned != 0
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	for i := range items {
+		chunkRows, err := tx.Query(
+			`SELECT idx FROM attachment_chunks WHERE attachment_id = ? ORDER BY idx ASC`,
+			items[i].ID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		indices := make([]int64, 0)
+		for chunkRows.Next() {
+			var idx int64
+			if err := chunkRows.Scan(&idx); err != nil {
+				_ = chunkRows.Close()
+				return nil, err
+			}
+			indices = append(indices, idx)
+		}
+		if err := chunkRows.Err(); err != nil {
+			_ = chunkRows.Close()
+			return nil, err
+		}
+		_ = chunkRows.Close()
+		items[i].ReceivedChunks = indices
+	}
+
+	return items, tx.Commit()
+}
+
 // GetAttachmentChunk returns the bytes stored at index. An unknown attachment
 // yields ErrAttachmentNotFound and a device that is neither the creator nor a
 // granted reader yields ErrAttachmentForbidden.

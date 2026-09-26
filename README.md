@@ -295,6 +295,33 @@ Sec-WebSocket-Version: 13
 - 首次创建返回 `200` `{"attachmentId":"att-1","created":true}`；同一设备以完全相同元数据重试幂等返回 `created=false`。
 - `attachmentId` 已被占用时返回 `409` JSON 错误且原记录不变：无论占用者是其他设备（即使元数据相同）还是本设备但元数据不同。
 
+### `GET /v1/devices/{deviceId}/attachments`
+
+设备的附件清单查询入口（只读）：路径上的设备标识即调用者身份，返回该设备自己创建的与被授权读取的全部附件。无请求体。返回 `200`：
+
+```json
+{
+  "attachments": [
+    {
+      "attachmentId": "att-1",
+      "totalBytes": 11,
+      "chunkSize": 4,
+      "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+      "complete": false,
+      "owned": true,
+      "receivedChunks": [0, 1]
+    }
+  ]
+}
+```
+
+- 每条清单项给出附件标识、总字节数、分块大小、摘要、封存状态与已收分块进度（`receivedChunks` 按序号升序）；`owned` 标出该附件是否为本设备创建，被授权读到的附件（`owned=false`）与自建附件并列出现，同一附件在一次结果里最多出现一次。
+- 清单按创建先后升序稳定排列；删除后以同一标识重新创建的附件按新记录排在既有记录之后，分块进度从零重新累计。
+- 分页由查询参数 `limit` 与 `offset` 决定：`limit` 只接受 1 到 1000 的整数（默认 100），`offset` 只接受非负整数（默认 0，先跳过前面若干条）；非法取值返回 `400` JSON 错误。同一设备两次读取之间没有增删时，翻页得到的条目不重不漏。
+- 设备未注册返回 `404` JSON 错误，不返回任何清单内容；路径标识为空、路径段缺失或多余、方法不是 `GET`（`POST` 仍是上面的创建入口）均返回 `400` JSON 错误。这些失败都不重定向、不输出 HTML，也不改动任何附件或授权状态。
+- 清单是只读入口：查询不创建、修改或删除任何附件，也不改变授权状态。附件被删除后立即从所有设备的清单消失；撤回某设备的读取授权后，该附件立刻从它的清单里消失，创建者的清单不受影响。
+- 清单内容随数据同步落盘：进程重启后同一请求返回的清单内容、顺序与分页结果与重启前逐字不变。
+
 ### `PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
 
 上传一个分块，请求体为二进制，仅接受 `Content-Type: application/octet-stream`。序号 `index` 从零开始，分块可乱序到达，断线后可重复提交。

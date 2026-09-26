@@ -127,6 +127,15 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateAttachment(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
+		handleListAttachments(s, w, r)
+	})
+	// Verbs other than GET (the listing) and POST (the create) on the
+	// attachment collection path get a JSON 400 rather than ServeMux's
+	// plain-text 405; the DELETE pattern below keeps its own message.
+	mux.HandleFunc("/v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
 		handlePutChunk(s, w, r)
 	})

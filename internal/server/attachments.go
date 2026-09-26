@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
@@ -74,6 +75,49 @@ func handleCreateAttachment(s *app.App, w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"attachmentId": req.ID, "created": created})
+}
+
+// handleListAttachments is the read-only listing entry over the attachment
+// collection: the device in the path sees every attachment it created and
+// every attachment another device granted it read access to, each at most
+// once, ordered by creation ascending. limit (1..1000, default 100) and
+// offset (non-negative, default 0) page the result; an illegal value is a
+// 400 JSON error and an unregistered device a 404 JSON error — neither
+// touches any attachment or access state.
+func handleListAttachments(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
+
+	q := r.URL.Query()
+	limit := int64(defaultListLimit)
+	if raw := q.Get("limit"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 1 || v > maxListLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+			return
+		}
+		limit = v
+	}
+	var offset int64
+	if raw := q.Get("offset"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return
+		}
+		offset = v
+	}
+
+	items, err := s.ListAttachments(deviceID, limit, offset)
+	if err != nil {
+		if errors.Is(err, store.ErrDeviceNotFound) {
+			writeError(w, http.StatusNotFound, "device not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to list attachments")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"attachments": items})
 }
 
 // handlePutChunk stores one binary chunk of an upload. The request must be
