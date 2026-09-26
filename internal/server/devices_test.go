@@ -75,7 +75,9 @@ func TestNewFamiliesAlwaysJSON(t *testing.T) {
 		{http.MethodDelete, "/v1/devices", http.StatusBadRequest},
 		{http.MethodDelete, "/v1/devices/dev1/extra", http.StatusBadRequest},
 		{http.MethodDelete, "/v1/devices/dev1/sessions/s1/extra", http.StatusNotFound},
-		{http.MethodPost, "/v1/sessions/s1/documents/d/changes", http.StatusNotFound},
+		// The session change collection path exists for GET (paged read and
+		// export); a method mismatch is a JSON 400, not the subtree 404.
+		{http.MethodPost, "/v1/sessions/s1/documents/d/changes", http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		r := newJSONRequest(tc.method, tc.path, `{"deviceId":"x"}`, "application/json")

@@ -97,6 +97,27 @@ go test ./...
 - `after`、`limit` 非法返回 `400` JSON 错误（参数校验先于会话存在性检查）。
 - 会话不存在或已删除返回 `404` JSON 错误；会话所属设备已被撤回该文档权限时返回 `403` JSON 错误，且不返回 `changes` 或 `nextCursor`；其余情况读取结果与既有 changes 查询逐字相同。
 
+### `GET /v1/sessions/{sessionId}/documents/{documentId}/changes`（区间批量导出）
+
+会话变更读取路径在携带 `from`/`to` 查询参数时即成为会话视角的批量导出入口，让客户端按游标闭区间一次取走历史变更。仍为 `GET`、无请求体；与分页读取互斥——带 `from` 或 `to` 走导出，两者都不带时走上面的 `after`/`limit` 分页读取。查询参数：
+
+- `from`：闭区间起点，十进制非负整数，缺省为 `0`。
+- `to`：闭区间终点，十进制非负整数；缺省时不设上界。终点小于起点返回 `400` JSON 错误。
+
+行为：
+
+- 只导出 cursor 落在闭区间 `[from, to]` 内**且仍在在线日志里**的变更，按游标升序排列，同一游标最多出现一次；每条记录与分页读取同游标上的记录逐字一致，正文与文档级导出同一区间的正文逐字一致。
+- 会话所属文档未知或区间内没有变更时照样成功：返回 `200`，正文为空数组与零计数，而不是错误。已被压缩移出在线日志的变更不在导出结果里；区间整体落进被裁区间时按空结果返回。
+- 正文是一行紧凑 JSON、末尾一个换行，顶层键按 `changes`、`count` 的顺序固定；每条记录只有 `id`、`deviceId`、`payload`、`cursor` 四个键且键序固定，`payload` 原样呈现提交时保存的 JSON 内容（可以是 `null`、数字、字符串、数组或对象）。`count` 为本次导出的条数，与数组长度一致。例如：
+
+```
+{"changes":[{"id":"change-1","deviceId":"device-1","payload":{"any":"json"},"cursor":1}],"count":1}
+```
+
+- 导出是只读动作：不创建变更、不占用游标，也不产生变更记录或推送通知（不唤醒长轮询、不推送订阅）。导出期间并发提交的批次要么整体出现在结果里，要么整体缺席，不会读到半个批次。
+- 判定顺序固定为请求形状与参数、会话存在性、文档权限，前序失败优先返回：`from`/`to` 不是十进制非负整数、终点小于起点、`sessionId`/`documentId` 为空、路径段缺失或多余（如尾斜杠、额外段）、方法不是 `GET`，均返回 `400` JSON 错误且零写入；会话不存在或已删除返回 `404` JSON 错误，不返回任何变更内容；会话所属设备对该文档的权限被撤回时返回 `403` JSON 错误，同样不暴露变更内容。
+- 变更同步落盘，进程重启后同一区间导出的正文逐字不变。
+
 ### `POST /v1/documents/{documentID}/permissions`
 
 按文档和设备持久化访问权限。仅接受 `Content-Type: application/json`。请求体：
@@ -580,4 +601,4 @@ Sec-WebSocket-Version: 13
 
 ### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//changes/compact`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/documents//crdt/compact`、`/v1/documents//crdt/snapshot`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/压缩/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/changes/compact/`、`/v1/documents/{id}/changes/compact/x`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/documents/{id}/crdt/compact/x`、`/v1/documents/{id}/crdt/snapshot/`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`compact`、`subscribe`、`state` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、CRDT 状态读取与订阅行为与其它标识完全一致。设备注销同样只在精确路径 `DELETE /v1/devices/{deviceId}` 上成立：`DELETE /v1/devices/`（空标识）、`/v1/devices/{id}/`、缺段（`DELETE /v1/devices`）或多段（`/v1/devices/{id}/x`）以及在该路径上使用 GET/POST/PUT/PATCH 等其它方法，均返回 `400` JSON 错误，不重定向也不输出 HTML。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//changes/compact`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/documents//crdt/compact`、`/v1/documents//crdt/snapshot`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/压缩/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/changes/compact/`、`/v1/documents/{id}/changes/compact/x`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/documents/{id}/crdt/compact/x`、`/v1/documents/{id}/crdt/snapshot/`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/changes/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`compact`、`subscribe`、`state` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、CRDT 状态读取与订阅行为与其它标识完全一致。设备注销同样只在精确路径 `DELETE /v1/devices/{deviceId}` 上成立：`DELETE /v1/devices/`（空标识）、`/v1/devices/{id}/`、缺段（`DELETE /v1/devices`）或多段（`/v1/devices/{id}/x`）以及在该路径上使用 GET/POST/PUT/PATCH 等其它方法，均返回 `400` JSON 错误，不重定向也不输出 HTML。非空路径的语义保持不变。

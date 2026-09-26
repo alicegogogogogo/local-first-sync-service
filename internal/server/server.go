@@ -229,6 +229,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
+	// Non-GET verbs on the session change collection path: the exact GET
+	// pattern above is more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of the session subtree's
+	// JSON 404. The collection's export shares the GET read's exact path, so
+	// it needs no route of its own.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleSubscribe(s, w, r)
 	})
@@ -409,7 +417,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1093,6 +1101,20 @@ func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
 	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
 
+	// A request carrying the export's from/to parameters is the session-scoped
+	// batch export over the same collection path; anything else is the
+	// ordinary paged read. The two never mix: the export parses only from/to,
+	// the paged read only after/limit, exactly as before.
+	q := r.URL.Query()
+	_, isExport := q["from"]
+	if _, hasTo := q["to"]; hasTo {
+		isExport = true
+	}
+	if isExport {
+		handleSessionExportChanges(s, w, r)
+		return
+	}
+
 	// Malformed query parameters are a request-shape error (400) checked
 	// before the resource lookup (404), matching the snapshot GET ordering.
 	after, limit, ok := parseChangesQuery(w, r)
@@ -1100,23 +1122,7 @@ func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	deviceID, err := s.SessionDevice(sessionID)
-	if err != nil {
-		if errors.Is(err, store.ErrSessionNotFound) {
-			writeError(w, http.StatusNotFound, "session not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to look up session")
-		return
-	}
-
-	authorized, err := s.DocumentAuthorized(documentID, deviceID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to look up permission")
-		return
-	}
-	if !authorized {
-		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+	if !authorizeSessionRead(s, w, sessionID, documentID) {
 		return
 	}
 
@@ -1127,6 +1133,34 @@ func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeChangesPage(w, changes, nextCursor)
+}
+
+// authorizeSessionRead resolves the session's owning device and checks its
+// permission for the document, writing the session layer's 404/403 JSON
+// errors on failure. It is shared by the session-scoped paged read and export
+// so their judgment order — session existence (404) before permission (403),
+// neither exposing change content — cannot drift apart.
+func authorizeSessionRead(s *app.App, w http.ResponseWriter, sessionID, documentID string) bool {
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return false
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return false
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return false
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return false
+	}
+	return true
 }
 
 // parseChangesQuery parses the shared after/limit pagination parameters,
