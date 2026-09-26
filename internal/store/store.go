@@ -26,7 +26,10 @@
 // chunks, verifies the digest and seals the upload; a sealed upload is
 // immutable and rejects every further chunk write. Finished content is
 // addressed by digest, so a second attachment with the same digest and size
-// reuses the stored bytes instead of copying them.
+// reuses the stored bytes instead of copying them. The creator may grant
+// other registered devices read-only access per attachment; every
+// (attachment, device) pair starts unauthorized, grants and revokes commit in
+// the same serialized way, and access never widens the write paths.
 package store
 
 import (
@@ -148,6 +151,12 @@ CREATE TABLE IF NOT EXISTS attachment_contents (
 	sha256 TEXT NOT NULL PRIMARY KEY,
 	size   INTEGER NOT NULL,
 	data   BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachment_access (
+	attachment_id TEXT NOT NULL REFERENCES attachments(id),
+	device_id     TEXT NOT NULL,
+	authorized    INTEGER NOT NULL,
+	PRIMARY KEY (attachment_id, device_id)
 );
 `)
 	return err

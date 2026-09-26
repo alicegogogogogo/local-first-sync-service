@@ -313,13 +313,27 @@ Sec-WebSocket-Version: 13
 - 成功返回 `200`：`{"attachmentId","size","sha256","complete":true,"reused":...}`；重复完成返回相同结果。
 - 已有其他已完成附件拥有相同摘要和大小时复用其内容（`reused=true`），不复制字节；摘要相同但大小不同不得复用，返回 `409` JSON 错误且当前上传仍可恢复。
 
+### `POST /v1/devices/{deviceId}/attachments/{attachmentId}/access`
+
+为指定设备授予或撤回该附件的只读访问授权。仅创建者可调用。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-2", "action": "grant"}
+```
+
+- `deviceId` 为非空字符串，`action` 为 `"grant"` 或 `"revoke"`；类型头不符、JSON 非法、尾随内容、字段缺失或类型错误、`action` 取值非法均返回 `400` JSON 错误且零写入。
+- 未知附件返回 `404` JSON 错误；路径设备不是创建者返回 `403` JSON 错误；目标设备未注册返回 `404` JSON 错误；均零写入。
+- 每个（附件， 设备）对初始为未授权。成功返回 `200` `{"deviceId":"device-2","authorized":true,"changed":true}`：`grant` 首次置为已授权（`changed=true`），重试幂等（`changed=false`）；`revoke` 恢复未授权，未授权时重试不改（`changed=false`）。
+- 授权变更在序列化事务内完成并同步落盘：并发 grant/revoke 各自完整提交，重启后状态与幂等判定不变。
+- 授权只影响读取面：被授权设备读取元数据与分块返回与创建者逐字一致的 `200`；撤回后读取立即回到 `403`，已封存内容不删除，去重复用判定不受影响；分块写入与封存仍仅创建者可调用，被授权设备写入一律 `403` 且零写入。授权与文档权限互不牵连。
+
 ### `GET /v1/devices/{deviceId}/attachments/{attachmentId}`
 
-创建者读取附件元数据，返回 `200`：`{"attachmentId","totalBytes","chunkSize","sha256","complete","receivedChunks":[...]}`，其中 `receivedChunks` 为已收到序号的升序列表。非创建设备返回 `403` JSON 错误，未知附件返回 `404` JSON 错误。
+创建者或被授权设备读取附件元数据，返回 `200`：`{"attachmentId","totalBytes","chunkSize","sha256","complete","receivedChunks":[...]}`，其中 `receivedChunks` 为已收到序号的升序列表；被授权设备所见正文与创建者逐字一致。其他设备返回 `403` JSON 错误，未知附件返回 `404` JSON 错误。
 
 ### `GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}`
 
-创建者读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识（设备或附件）返回 `400` JSON 错误；已知附件的序号为负数、非十进制或超出声明分块范围（`>= ceil(totalBytes/chunkSize)`）也统一返回 `400` JSON 错误而非重定向或 HTML；未知附件返回 `404`，序号合法但该分块尚未到达也返回 `404` JSON 错误；非创建设备返回 `403` JSON 错误。
+创建者或被授权设备读取指定分块，命中返回 `200`，`Content-Type: application/octet-stream`，正文为对应字节。空标识（设备或附件）返回 `400` JSON 错误；已知附件的序号为负数、非十进制或超出声明分块范围（`>= ceil(totalBytes/chunkSize)`）也统一返回 `400` JSON 错误而非重定向或 HTML；未知附件返回 `404`，序号合法但该分块尚未到达也返回 `404` JSON 错误；其他设备返回 `403` JSON 错误。
 
 附件的创建、分块、完成与读取均同步落盘；进程重启后上传状态、内容去重、幂等判定与封存后的拒写判定保持一致。
 
