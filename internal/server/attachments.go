@@ -165,9 +165,11 @@ func handleCompleteAttachment(s *app.App, w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, result)
 }
 
-// handleGetAttachment returns the creator's view of an upload: the original
-// metadata, the sorted indices received so far and the completion status. A
-// non-creator device gets a 403, an unknown attachment a 404.
+// handleGetAttachment returns the reader's view of an upload: the original
+// metadata, the sorted indices received so far and the completion status. The
+// creator and any device with a committed access grant get a 200 with the
+// same body; any other non-creator device gets a 403, an unknown attachment a
+// 404.
 func handleGetAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
@@ -195,10 +197,10 @@ func handleGetAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGetChunk streams one stored chunk back to the creator. An empty
-// identifier is rejected by the path guard; an illegal index is a 400; an
-// unknown attachment or a chunk that never arrived is a 404; a non-creator
-// device is a 403.
+// handleGetChunk streams one stored chunk back to the creator or a granted
+// reader. An empty identifier is rejected by the path guard; an illegal index
+// is a 400; an unknown attachment or a chunk that never arrived is a 404; a
+// device without read access is a 403.
 func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
 	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
@@ -230,6 +232,62 @@ func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+// handleSetAttachmentAccess grants or revokes another registered device's
+// read-only access to one attachment. The request body reuses the document
+// permission entry's shape (deviceId + action). Only the creator may change
+// access: a non-creator caller gets a 403 and an unknown attachment a 404,
+// neither changing any grant. A rejected request (bad content type, malformed
+// JSON, trailing content, empty or mistyped fields, unknown action) is a 400
+// JSON error and writes nothing; an unregistered target device is a 404 JSON
+// error. Every (attachment, device) pair starts unauthorized, so the first
+// grant reports changed=true and repeats of the state that already holds
+// report changed=false. A grant widens only reads; chunk writes and the
+// finish stay creator-only.
+func handleSetAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	var req permissionRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.DeviceID == "" {
+		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
+		return
+	}
+	var grant bool
+	switch req.Action {
+	case "grant":
+		grant = true
+	case "revoke":
+		grant = false
+	default:
+		writeError(w, http.StatusBadRequest, `action must be "grant" or "revoke"`)
+		return
+	}
+
+	changed, err := s.SetAttachmentAccess(deviceID, attachmentID, req.DeviceID, grant)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to update attachment access")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deviceId":   req.DeviceID,
+		"authorized": grant,
+		"changed":    changed,
+	})
 }
 
 // isLowerHexSHA256 reports whether s is exactly 64 lowercase hex characters.

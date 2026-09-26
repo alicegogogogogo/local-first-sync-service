@@ -117,10 +117,9 @@ func (a Attachment) checkChunkShape(index int64, length int64) error {
 	return nil
 }
 
-// getAttachmentTx loads an attachment row inside tx and enforces ownership:
-// an unknown id yields ErrAttachmentNotFound and a device other than the
-// creator yields ErrAttachmentForbidden.
-func getAttachmentTx(tx *sql.Tx, id, deviceID string) (Attachment, error) {
+// loadAttachmentTx loads an attachment row inside tx; an unknown id yields
+// ErrAttachmentNotFound. It makes no ownership judgment.
+func loadAttachmentTx(tx *sql.Tx, id string) (Attachment, error) {
 	var a Attachment
 	var complete, reused int
 	err := tx.QueryRow(
@@ -133,12 +132,60 @@ func getAttachmentTx(tx *sql.Tx, id, deviceID string) (Attachment, error) {
 	case err != nil:
 		return Attachment{}, err
 	}
-	if a.DeviceID != deviceID {
-		return Attachment{}, ErrAttachmentForbidden
-	}
 	a.Complete = complete != 0
 	a.Reused = reused != 0
 	return a, nil
+}
+
+// getAttachmentTx loads an attachment row inside tx and enforces ownership:
+// an unknown id yields ErrAttachmentNotFound and a device other than the
+// creator yields ErrAttachmentForbidden.
+func getAttachmentTx(tx *sql.Tx, id, deviceID string) (Attachment, error) {
+	a, err := loadAttachmentTx(tx, id)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if a.DeviceID != deviceID {
+		return Attachment{}, ErrAttachmentForbidden
+	}
+	return a, nil
+}
+
+// getAttachmentReadableTx loads an attachment row inside tx and enforces read
+// access: the creator always passes; any other device passes only when a
+// committed access grant exists for the (attachment, device) pair. An unknown
+// id yields ErrAttachmentNotFound and a device without read access yields
+// ErrAttachmentForbidden.
+func getAttachmentReadableTx(tx *sql.Tx, id, deviceID string) (Attachment, error) {
+	a, err := loadAttachmentTx(tx, id)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if a.DeviceID == deviceID {
+		return a, nil
+	}
+	granted, err := attachmentAccessGrantedTx(tx, id, deviceID)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if !granted {
+		return Attachment{}, ErrAttachmentForbidden
+	}
+	return a, nil
+}
+
+// attachmentAccessGrantedTx reports whether deviceID currently holds a read
+// grant for the attachment, evaluated inside tx so the verdict shares the
+// caller's serialized transaction.
+func attachmentAccessGrantedTx(tx *sql.Tx, attachmentID, deviceID string) (bool, error) {
+	var granted bool
+	if err := tx.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM attachment_access WHERE attachment_id = ? AND device_id = ?)`,
+		attachmentID, deviceID,
+	).Scan(&granted); err != nil {
+		return false, err
+	}
+	return granted, nil
 }
 
 // CreateAttachment registers a new resumable upload owned by deviceID.
@@ -397,7 +444,8 @@ func (s *Store) CompleteAttachment(deviceID, attachmentID string) (CompleteResul
 
 // GetAttachment returns the stored metadata of an upload together with the
 // sorted indices of the chunks received so far. An unknown id yields
-// ErrAttachmentNotFound; a non-creator device yields ErrAttachmentForbidden.
+// ErrAttachmentNotFound; a device that is neither the creator nor a granted
+// reader yields ErrAttachmentForbidden.
 func (s *Store) GetAttachment(deviceID, attachmentID string) (Attachment, []int64, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -405,7 +453,7 @@ func (s *Store) GetAttachment(deviceID, attachmentID string) (Attachment, []int6
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	a, err := getAttachmentTx(tx, attachmentID, deviceID)
+	a, err := getAttachmentReadableTx(tx, attachmentID, deviceID)
 	if err != nil {
 		return Attachment{}, nil, err
 	}
@@ -436,7 +484,8 @@ func (s *Store) GetAttachment(deviceID, attachmentID string) (Attachment, []int6
 }
 
 // GetAttachmentChunk returns the bytes stored at index. An unknown attachment
-// yields ErrAttachmentNotFound and a non-creator device ErrAttachmentForbidden.
+// yields ErrAttachmentNotFound and a device that is neither the creator nor a
+// granted reader yields ErrAttachmentForbidden.
 // For a known attachment, a negative index or one beyond the declared chunk
 // range yields *ErrChunkInvalid (the caller maps it to 400); an in-range index
 // with no stored chunk yields ErrChunkNotFound (404).
@@ -447,7 +496,7 @@ func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) (
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	a, err := getAttachmentTx(tx, attachmentID, deviceID)
+	a, err := getAttachmentReadableTx(tx, attachmentID, deviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,6 +519,75 @@ func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) (
 		return nil, err
 	}
 	return data, tx.Commit()
+}
+
+// SetAttachmentAccess grants or revokes targetID's read-only access to the
+// attachment, on behalf of callerID, and reports whether the stored grant
+// actually changed.
+//
+// Only the creator may change access: an unknown attachment yields
+// ErrAttachmentNotFound and a caller other than the creator yields
+// ErrAttachmentForbidden — neither writes anything. An unregistered target
+// device yields ErrDeviceNotFound, again with nothing written. Every
+// (attachment, device) pair starts unauthorized, so the first grant is the
+// first write for the pair (changed=true); repeating the state that already
+// holds writes nothing and reports changed=false. The lookup and the write
+// run in one serialized transaction and commit synchronously, so concurrent
+// grant/revoke calls each land as a complete state and survive a restart.
+//
+// A grant widens only the read side: chunk writes and the finish stay
+// creator-only. A revoke deletes nothing but the grant itself — sealed
+// content and the digest-reuse judgment are untouched.
+func (s *Store) SetAttachmentAccess(callerID, attachmentID, targetID string, grant bool) (changed bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	a, err := loadAttachmentTx(tx, attachmentID)
+	if err != nil {
+		return false, err
+	}
+	if a.DeviceID != callerID {
+		return false, ErrAttachmentForbidden
+	}
+
+	targetExists, err := DeviceExistsTx(tx, targetID)
+	if err != nil {
+		return false, err
+	}
+	if !targetExists {
+		return false, ErrDeviceNotFound
+	}
+
+	granted, err := attachmentAccessGrantedTx(tx, attachmentID, targetID)
+	if err != nil {
+		return false, err
+	}
+	if granted == grant {
+		return false, tx.Commit()
+	}
+
+	if grant {
+		if _, err := tx.Exec(
+			`INSERT INTO attachment_access (attachment_id, device_id) VALUES (?, ?)`,
+			attachmentID, targetID,
+		); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err := tx.Exec(
+			`DELETE FROM attachment_access WHERE attachment_id = ? AND device_id = ?`,
+			attachmentID, targetID,
+		); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func bytesEqual(a, b []byte) bool {

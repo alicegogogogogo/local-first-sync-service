@@ -133,6 +133,9 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments/{attachmentId}/complete", func(w http.ResponseWriter, r *http.Request) {
 		handleCompleteAttachment(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, r *http.Request) {
+		handleSetAttachmentAccess(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})
