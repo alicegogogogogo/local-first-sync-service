@@ -60,6 +60,13 @@ type ListedChange struct {
 	Cursor   int64           `json:"cursor"`
 }
 
+// ExportedSnapshot is one entry in an ExportSnapshots result. State is the
+// snapshot state stored at creation, returned verbatim.
+type ExportedSnapshot struct {
+	Cursor int64
+	State  json.RawMessage
+}
+
 // MergeResult reports the outcome of an accepted MergeChange. Outcome is one
 // of "idempotent", "applied" or "merged".
 type MergeResult struct {

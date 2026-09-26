@@ -151,6 +151,11 @@ func (a *App) GetSnapshot(documentID string, cursor int64) (json.RawMessage, err
 	return a.events.GetSnapshot(documentID, cursor)
 }
 
+// ExportSnapshots delegates to the change event service.
+func (a *App) ExportSnapshots(documentID string, from int64, to *int64) ([]events.ExportedSnapshot, error) {
+	return a.events.ExportSnapshots(documentID, from, to)
+}
+
 // RestoreSnapshot delegates to the change event service.
 func (a *App) RestoreSnapshot(documentID, deviceID, changeID string, snapshotCursor int64) (events.RestoreResult, error) {
 	return a.events.RestoreSnapshot(documentID, deviceID, changeID, snapshotCursor)

@@ -82,6 +82,55 @@ func (s *Service) GetSnapshot(documentID string, cursor int64) (json.RawMessage,
 	}
 }
 
+// ExportSnapshots returns every snapshot of documentID whose cursor falls in
+// the closed interval [from, to], in ascending cursor order; a nil to means no
+// upper bound. Each cursor appears at most once.
+//
+// The read never writes: it creates no snapshot, moves no cursor and records no
+// change or notification. An unknown document, or a range without a snapshot,
+// yields an empty slice rather than an error. The snapshots table is written
+// one row at a time inside a serialized transaction, and the single range
+// query sees one committed state, so a snapshot committed concurrently is
+// present in full or absent altogether — never half a row.
+func (s *Service) ExportSnapshots(documentID string, from int64, to *int64) ([]ExportedSnapshot, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if to != nil {
+		rows, err = s.db.Query(
+			`SELECT cursor, state FROM snapshots
+			 WHERE document_id = ? AND cursor BETWEEN ? AND ?
+			 ORDER BY cursor ASC`,
+			documentID, from, *to,
+		)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT cursor, state FROM snapshots
+			 WHERE document_id = ? AND cursor >= ?
+			 ORDER BY cursor ASC`,
+			documentID, from,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make([]ExportedSnapshot, 0)
+	for rows.Next() {
+		var snap ExportedSnapshot
+		if err := rows.Scan(&snap.Cursor, &snap.State); err != nil {
+			return nil, err
+		}
+		out = append(out, snap)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RestoreSnapshot appends one ordinary change whose payload is the state of
 // documentID's snapshot at snapshotCursor, all within a single serialized
 // transaction.
