@@ -86,11 +86,18 @@ func TestNewFamiliesAlwaysJSON(t *testing.T) {
 		assertJSONError(t, w)
 	}
 
-	// The pre-existing document surface keeps its old plain 404 for a trailing
-	// slash; only the empty documentID segment was ever the JSON-400 case.
-	w := serveRecorder(h, newJSONRequest(http.MethodGet, "/v1/documents/doc/changes/", "", ""))
-	if w.Code != http.StatusNotFound || w.Header().Get("Content-Type") == "application/json" {
-		t.Fatalf("legacy trailing slash changed: %d %q", w.Code, w.Header().Get("Content-Type"))
+	// The change collection export/read surface answers its malformed shapes
+	// with a JSON 400 too: a trailing slash or an extra segment is not a
+	// redirect or plain-text 404.
+	for _, p := range []string{
+		"/v1/documents/doc/changes/",
+		"/v1/documents/doc/changes/extra",
+	} {
+		w := serveRecorder(h, newJSONRequest(http.MethodGet, p, "", ""))
+		if w.Code != http.StatusBadRequest || w.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("GET %s = %d %q, want a JSON 400", p, w.Code, w.Header().Get("Content-Type"))
+		}
+		assertJSONError(t, w)
 	}
 }
 

@@ -76,7 +76,9 @@ func handleListPermissions(s *app.App, w http.ResponseWriter, r *http.Request) {
 // segment past the path answers 400, not 404. Empty segments are already
 // rejected by the guard itself. The keyword in the documentID position is only
 // treated as the endpoint word when nothing follows it; a document literally
-// named "permissions" keeps its ordinary changes/merge/snapshot routes.
+// named "permissions" keeps its ordinary changes/merge/snapshot routes, and
+// its own permission resource — including every malformed shape of it — is
+// judged by the same rule as any other document's.
 func malformedPermissionPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -90,8 +92,12 @@ func malformedPermissionPath(p string) bool {
 		if i == 0 {
 			// The keyword sits where the document id belongs. Bare, or with a
 			// trailing slash, the documentID segment is missing; with a real
-			// suffix it is an ordinary document named "permissions".
-			return len(segs) == 1 || (len(segs) == 2 && segs[1] == "")
+			// suffix it is an ordinary document named "permissions", so keep
+			// scanning for the keyword in its resource position.
+			if len(segs) == 1 || (len(segs) == 2 && segs[1] == "") {
+				return true
+			}
+			continue
 		}
 		// Keyword position reached. The resource is exactly
 		// {documentID}/permissions; a trailing slash or any further segment is

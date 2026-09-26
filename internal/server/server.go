@@ -282,6 +282,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleListChanges(s, w, r)
 	})
+	// Non-GET/POST verbs on the change collection path: the exact GET and
+	// POST patterns above are more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of ServeMux's plain-text
+	// 405. The collection's export shares the GET read's exact path, so it
+	// needs no route of its own.
+	mux.HandleFunc("/v1/documents/{documentID}/changes", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
 		handlePollChanges(s, w, r)
 	})
@@ -401,7 +409,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1045,6 +1053,20 @@ func isJSONObject(raw json.RawMessage) bool {
 
 func handleListChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID")
+
+	// A request carrying the export's from/to parameters is the batch export
+	// over the same collection path; anything else is the ordinary paged
+	// read. The two never mix: the export parses only from/to, the paged read
+	// only after/limit, exactly as before.
+	q := r.URL.Query()
+	_, isExport := q["from"]
+	if _, hasTo := q["to"]; hasTo {
+		isExport = true
+	}
+	if isExport {
+		handleExportChanges(s, w, r)
+		return
+	}
 
 	after, limit, ok := parseChangesQuery(w, r)
 	if !ok {
