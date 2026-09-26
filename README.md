@@ -242,6 +242,26 @@ Sec-WebSocket-Version: 13
 - `cursor` 为十进制非负整数；格式错误或空 `documentID` 返回 `400` JSON 错误。
 - 命中返回 `200` `{"cursor":N,"state":...}`；文档、cursor 或快照不存在返回 `404` JSON 错误。
 
+### `GET /v1/documents/{documentID}/snapshots`
+
+按游标区间一次性批量导出某文档的历史快照。仅接受 `GET`，无请求体。查询参数：
+
+- `from`：闭区间起点，十进制非负整数，缺省为 `0`。
+- `to`：闭区间终点，十进制非负整数；缺省时不设上界。终点小于起点返回 `400` JSON 错误。
+
+- 只导出 cursor 落在闭区间 `[from, to]` 内的快照，按游标升序排列，同一游标最多出现一次。
+- 未知文档或区间内没有任何快照时同样成功：返回 `200`，正文为空列表与零计数，而不是错误。
+- 正文是一行紧凑 JSON、末尾一个换行，顶层键按 `snapshots`、`count` 的顺序固定；数组元素按游标递增，每项只有 `cursor` 与 `state` 两个键且键序固定。`state` 原样呈现创建时保存的 JSON 内容，可以是 `null`、数字、字符串、数组或对象，与单个读取入口完全一致。`count` 为本次导出的快照条数，与数组长度一致，为非负整数。例如：
+
+```
+{"snapshots":[{"cursor":1,"state":null},{"cursor":2,"state":{"any":"json"}}],"count":2}
+```
+
+- 导出是只读操作：不创建快照、不占用变更游标，也不产生变更记录或推送通知。
+- 导出期间并发创建的快照要么整体出现在结果里，要么整体缺席，不会读到半个记录；快照同步落盘，进程重启后同一区间导出的正文逐字不变。
+- `from`/`to` 不是十进制非负整数、终点小于起点、`documentID` 为空，均返回 `400` JSON 错误且零写入。
+- 路径段缺失或多余（如 `/v1/documents/{id}/snapshots/`、`/v1/documents/{id}/snapshots/1/extra`）或方法不是 `GET`（集合路径上的 `POST` 仍是上面的创建入口）同样返回 `400` JSON 错误，不重定向也不输出 HTML；这些失败一律零写入。
+
 ### `POST /v1/documents/{documentID}/restore`
 
 把某个快照的历史 state 作为一次普通变更追加回当前文档。仅接受 `Content-Type: application/json`。请求体：

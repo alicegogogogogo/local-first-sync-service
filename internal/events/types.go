@@ -115,6 +115,12 @@ func (e *ErrRestoreConflict) Error() string {
 	return fmt.Sprintf("change id %q conflicts with the change log", e.ID)
 }
 
+// ExportedSnapshot is one row of an ExportSnapshots result.
+type ExportedSnapshot struct {
+	Cursor int64           `json:"cursor"`
+	State  json.RawMessage `json:"state"`
+}
+
 // RestoreResult reports the outcome of an accepted RestoreSnapshot.
 type RestoreResult struct {
 	ID           string `json:"id"`

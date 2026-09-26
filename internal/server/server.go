@@ -200,8 +200,22 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
 		handlePostSnapshot(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		handleExportSnapshots(s, w, r)
+	})
+	// Non-GET verbs on the snapshot collection path: the exact GET pattern
+	// above is more specific, so only other verbs reach this method-less
+	// pattern and get a JSON 400 instead of ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetSnapshot(s, w, r)
+	})
+	// Non-GET verbs on the single-snapshot path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the read is GET-only.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleRestore(s, w, r)
@@ -267,7 +281,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
