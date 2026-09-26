@@ -139,6 +139,22 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteAttachment(s, w, r)
+	})
+	// The attachment item path accepts only GET and DELETE; every other verb
+	// gets a JSON 400 rather than ServeMux's plain-text 405. A DELETE short of
+	// the attachment id or with extra segments is a malformed delete and also
+	// answers a JSON 400 instead of the subtree 404.
+	mux.HandleFunc("/v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "attachment delete path is malformed")
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/attachments/{attachmentId}/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "attachment delete path is malformed")
+	})
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetChunk(s, w, r)
 	})

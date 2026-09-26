@@ -525,6 +525,71 @@ func (s *Store) GetAttachmentChunk(deviceID, attachmentID string, index int64) (
 	return data, tx.Commit()
 }
 
+// DeleteAttachment removes the attachment owned by deviceID together with
+// every trace it left behind: the received chunks, the completion state and
+// every access grant. An unknown id yields ErrAttachmentNotFound and a device
+// other than the creator yields ErrAttachmentForbidden — neither writes
+// anything, so a repeat delete misses the same way a never-created id does.
+//
+// Finished content is addressed by digest and shared across attachments, so
+// the stored bytes are reclaimed only when the deleted attachment was the
+// last completed one referencing them; other finished attachments with the
+// same digest keep reading their content unchanged. An incomplete upload
+// references no shared content, so deleting it only drops its chunks.
+//
+// The check, the row removals and the content reclamation run in one
+// serialized transaction that commits synchronously, so concurrent deletes of
+// the same attachment commit at most once and a restart still finds the
+// attachment gone.
+func (s *Store) DeleteAttachment(deviceID, attachmentID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	a, err := getAttachmentTx(tx, attachmentID, deviceID)
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(
+		`DELETE FROM attachment_access WHERE attachment_id = ?`, attachmentID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM attachment_chunks WHERE attachment_id = ?`, attachmentID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM attachments WHERE id = ?`, attachmentID,
+	); err != nil {
+		return err
+	}
+
+	// Reclaim the digest-addressed content only when no completed attachment
+	// references it any longer.
+	if a.Complete {
+		var stillReferenced bool
+		if err := tx.QueryRow(
+			`SELECT EXISTS(SELECT 1 FROM attachments WHERE sha256 = ? AND complete = 1)`,
+			a.SHA256,
+		).Scan(&stillReferenced); err != nil {
+			return err
+		}
+		if !stillReferenced {
+			if _, err := tx.Exec(
+				`DELETE FROM attachment_contents WHERE sha256 = ?`, a.SHA256,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
 // SetAttachmentAccess grants or revokes targetDeviceID's read access to the
 // attachment, on behalf of callerDeviceID. Every (attachment, device) pair
 // starts unauthorized, so the first grant is the first write for the pair

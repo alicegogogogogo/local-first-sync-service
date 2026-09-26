@@ -29,7 +29,11 @@
 // reuses the stored bytes instead of copying them. The creator may grant
 // other registered devices read-only access per attachment; every
 // (attachment, device) pair starts unauthorized, grants and revokes commit in
-// the same serialized way, and access never widens the write paths.
+// the same serialized way, and access never widens the write paths. Deletes
+// are owner-scoped and hard: the record, its chunks and its grants vanish in
+// one serialized transaction, a repeat delete misses with 404, the id is free
+// to be created again, and the shared content bytes are reclaimed once the
+// last completed attachment referencing them is gone.
 package store
 
 import (

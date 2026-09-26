@@ -289,6 +289,33 @@ func handleSetAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// handleDeleteAttachment removes an upload outright. Only the creating device
+// may delete: any other device gets a 403 and an unknown (or already deleted)
+// id a 404, neither writing anything. A successful delete answers the
+// attachment id and a deletion marker, after which the record, its chunks,
+// its completion state and every access grant are gone: every later read,
+// chunk write, finish or access change against the id is a 404, and
+// re-creating the id starts a brand-new upload. Digest-addressed content is
+// reclaimed only when no finished attachment references it any longer.
+func handleDeleteAttachment(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	if err := s.DeleteAttachment(deviceID, attachmentID); err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to delete attachment")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"attachmentId": attachmentID, "deleted": true})
+}
+
 // isLowerHexSHA256 reports whether s is exactly 64 lowercase hex characters.
 func isLowerHexSHA256(s string) bool {
 	if len(s) != 64 {
