@@ -239,6 +239,12 @@ func (a *App) DocumentAuthorized(documentID, deviceID string) (bool, error) {
 	return a.Authz.DocumentAuthorized(documentID, deviceID)
 }
 
+// ListDocumentPermissions delegates to the permission service's read-only
+// ledger query.
+func (a *App) ListDocumentPermissions(documentID string, limit, offset int64) ([]authz.PermissionEntry, error) {
+	return a.Authz.ListDocumentPermissions(documentID, limit, offset)
+}
+
 // ---- CRDT state service boundary. ----
 
 // SubmitCRDTOps delegates to the CRDT state service.

@@ -200,6 +200,71 @@ func (s *Service) DeleteDevicePermissionsTx(q store.DBTX, deviceID string) error
 	return err
 }
 
+// PermissionEntry is one row of a document's authorization ledger: the
+// device id together with whether it is currently authorized for the
+// document.
+type PermissionEntry struct {
+	DeviceID   string
+	Authorized bool
+}
+
+// ListDocumentPermissions is the read-only ledger query for one document:
+// every currently registered device appears exactly once, ordered by device
+// id ascending, with its present authorization. Devices start authorized, so
+// a registered device without a deviation row is reported authorized; a row
+// recording a revoke reports unauthorized and a row recording a grant
+// authorized again. A device that has been deregistered — whose ledger rows
+// are removed by DeleteDevicePermissionsTx in the same transaction as its
+// registration — can never appear, even if a stale row somehow remained.
+//
+// The document id need not name a document any write path has ever seen:
+// authorization is the devices' default plus the ledger, so an unknown
+// document simply reports every registered device as authorized. The read
+// runs in one serialized transaction and writes nothing: it changes no
+// authorization, moves no cursor and notifies no revoke sink.
+func (s *Service) ListDocumentPermissions(documentID string, limit, offset int64) ([]PermissionEntry, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.Query(
+		// Every registered device is the outer row; a missing ledger row is
+		// the default (authorized = 1), so COALESCE supplies it. The join
+		// also confines the result to registered devices: an orphaned ledger
+		// row has no matching device and never appears.
+		`SELECT d.id, COALESCE(p.authorized, 1) AS authorized
+		 FROM devices d
+		 LEFT JOIN document_permissions p
+		   ON p.document_id = ? AND p.device_id = d.id
+		 ORDER BY d.id ASC
+		 LIMIT ? OFFSET ?`,
+		documentID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]PermissionEntry, 0)
+	for rows.Next() {
+		var entry PermissionEntry
+		var authorized int
+		if err := rows.Scan(&entry.DeviceID, &authorized); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		entry.Authorized = authorized != 0
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	return entries, tx.Commit()
+}
+
 // DocumentAuthorized reports whether deviceID currently holds permission for
 // documentID. Devices start authorized, so an absent row means authorized.
 func (s *Service) DocumentAuthorized(documentID, deviceID string) (bool, error) {

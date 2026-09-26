@@ -334,6 +334,15 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
 		handleSetPermission(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
+		handleListPermissions(s, w, r)
+	})
+	// The permission collection path accepts GET (the read-only ledger) and
+	// POST (grant/revoke); every other verb gets a JSON 400 rather than
+	// ServeMux's plain-text 405 or its subtree redirect.
+	mux.HandleFunc("/v1/documents/{documentID}/permissions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/ops", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTOps(s, w, r)
 	})
@@ -392,7 +401,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}

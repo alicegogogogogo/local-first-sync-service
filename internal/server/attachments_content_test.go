@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
@@ -391,5 +395,125 @@ func TestAttachmentContentMatchesPerChunkReads(t *testing.T) {
 	r = httptest.NewRequest(http.MethodGet, "/v1/devices/dev-1/attachments/att-1/chunks/0", nil)
 	if w := serveRecorder(h, r); w.Code != http.StatusOK || w.Body.String() != "the" {
 		t.Fatalf("chunk 0 after content read = %d %q", w.Code, w.Body.String())
+	}
+}
+
+// The whole-content read is read-only with respect to the document channels:
+// it neither occupies a change cursor nor pushes a frame to a live
+// subscription. The push channel still works — a real commit afterwards is
+// delivered — proving the silence is the read's, not a dead subscription.
+func TestAttachmentContentReadNoCursorOrSubscriptionPush(t *testing.T) {
+	srv, _ := newWSTestServer(t)
+
+	// Set up a creator with a sealed attachment, a session and one seeded
+	// change, all over the public HTTP surface.
+	resp, err := srv.Client().Post(srv.URL+"/v1/devices", "application/json",
+		strings.NewReader(`{"deviceId":"dev-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("register = %d", resp.StatusCode)
+	}
+	resp, err = srv.Client().Post(srv.URL+"/v1/devices/dev-1/sessions", "application/json",
+		strings.NewReader(`{"sessionId":"sess"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("session = %d", resp.StatusCode)
+	}
+	resp, err = srv.Client().Post(srv.URL+"/v1/documents/doc/changes", "application/json",
+		strings.NewReader(`{"deviceId":"dev-1","changes":[{"id":"seed","payload":{"n":1}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("seed change = %d", resp.StatusCode)
+	}
+	content := []byte("whole content bytes")
+	mustCreateAttachment(t, srv.Config.Handler, "dev-1", "att-1", content, 4)
+	for i := 0; i*4 < len(content); i++ {
+		lo := i * 4
+		hi := lo + 4
+		if hi > len(content) {
+			hi = len(content)
+		}
+		putChunk(t, srv.Config.Handler, "dev-1", "att-1", int64(i), content[lo:hi])
+	}
+	w, body := completeAttachment(t, srv.Config.Handler, "dev-1", "att-1")
+	if w.Code != http.StatusOK || body["complete"] != true {
+		t.Fatalf("complete = %d %v", w.Code, body)
+	}
+
+	// Assertion 1: the read does not occupy the change cursor.
+	getContent := func() {
+		t.Helper()
+		r, err := http.NewRequest(http.MethodGet,
+			srv.URL+"/v1/devices/dev-1/attachments/att-1/content", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cresp, err := srv.Client().Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(cresp.Body)
+		_ = cresp.Body.Close()
+		if cresp.StatusCode != http.StatusOK || !bytes.Equal(data, content) {
+			t.Fatalf("content read = %d %q", cresp.StatusCode, data)
+		}
+	}
+	getContent()
+	getContent()
+	lresp, err := srv.Client().Get(srv.URL + "/v1/documents/doc/changes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list struct {
+		NextCursor int64 `json:"nextCursor"`
+	}
+	if err := json.NewDecoder(lresp.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	_ = lresp.Body.Close()
+	if list.NextCursor != 1 {
+		t.Fatalf("nextCursor = %d, want 1: the content read moved the cursor", list.NextCursor)
+	}
+
+	// Assertion 2: the read pushes nothing over a live subscription parked at
+	// the high-water cursor.
+	conn, upgrade := dialWS(t, subscribeURL(srv, "sess", "doc", "1"))
+	if conn == nil {
+		t.Fatalf("subscribe = %d", upgrade.StatusCode)
+	}
+	defer conn.close()
+	conn.setReadDeadline(300 * time.Millisecond)
+	if _, _, _, ok := conn.readFrameMaybe(); ok {
+		t.Fatal("a frame arrived before the content read")
+	}
+	conn.clearReadDeadline()
+
+	getContent()
+
+	conn.setReadDeadline(500 * time.Millisecond)
+	if _, opcode, payload, ok := conn.readFrameMaybe(); ok {
+		t.Fatalf("the content read pushed a frame (opcode %d): %s", opcode, payload)
+	}
+	conn.clearReadDeadline()
+
+	// The subscription is alive: the next genuine commit is delivered at once.
+	resp, err = srv.Client().Post(srv.URL+"/v1/documents/doc/changes", "application/json",
+		strings.NewReader(`{"deviceId":"dev-1","changes":[{"id":"live","payload":{"n":2}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	frame := conn.readChange()
+	if frame.Cursor != 2 || frame.ID != "live" {
+		t.Fatalf("live frame after content read = %+v", frame)
 	}
 }
