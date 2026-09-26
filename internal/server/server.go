@@ -151,6 +151,29 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, r *http.Request) {
 		handleSetAttachmentAccess(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, r *http.Request) {
+		handleListAttachmentAccess(s, w, r)
+	})
+	// The access subresource accepts GET (roster) and POST (grant/revoke);
+	// every other verb gets a JSON 400, and extra segments past it are a
+	// malformed path that also answers a JSON 400. A method-less pattern
+	// cannot be used here — it would conflict with the GET extra-segment
+	// wildcard above, which already answers GET .../access/{extra} — so the
+	// rejected verbs (including POST with a stray segment) are named
+	// explicitly.
+	accessBad := func(message string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusBadRequest, message)
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
+		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/access/{rest...}",
+			accessBad("attachment access path is malformed"))
+	}
+	for _, method := range []string{http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
+		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/access",
+			accessBad("method is not allowed on this path"))
+	}
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})

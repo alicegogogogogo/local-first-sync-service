@@ -161,13 +161,17 @@ CREATE TABLE IF NOT EXISTS attachment_access (
 	attachment_id TEXT NOT NULL REFERENCES attachments(id),
 	device_id     TEXT NOT NULL,
 	authorized    INTEGER NOT NULL,
+	granted_seq   INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (attachment_id, device_id)
 );
 `)
 	if err != nil {
 		return err
 	}
-	return s.ensureAttachmentCreatedSeq()
+	if err := s.ensureAttachmentCreatedSeq(); err != nil {
+		return err
+	}
+	return s.ensureAttachmentAccessGrantedSeq()
 }
 
 // ensureAttachmentCreatedSeq adds the creation-order column to databases
@@ -209,6 +213,55 @@ func (s *Store) ensureAttachmentCreatedSeq() error {
 	_, err = s.db.Exec(
 		`UPDATE attachments SET created_seq = (
 			SELECT COUNT(*) FROM attachments older WHERE older.rowid <= attachments.rowid
+		)`,
+	)
+	return err
+}
+
+// ensureAttachmentAccessGrantedSeq adds the grant-order column to access
+// tables created before it existed. Existing rows are backfilled one past the
+// per-attachment maximum in insertion (rowid) order, so surviving grants keep
+// a stable relative order; every new grant takes a strictly larger value, even
+// after the previously newest grant was revoked, so a re-granted device lists
+// at the position of its latest grant and a value is never reused.
+func (s *Store) ensureAttachmentAccessGrantedSeq() error {
+	rows, err := s.db.Query(`PRAGMA table_info(attachment_access)`)
+	if err != nil {
+		return err
+	}
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "granted_seq" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if hasColumn {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE attachment_access ADD COLUMN granted_seq INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`UPDATE attachment_access SET granted_seq = (
+			SELECT rn FROM (
+				SELECT rowid AS rid,
+				       ROW_NUMBER() OVER (PARTITION BY attachment_id ORDER BY rowid) AS rn
+				FROM attachment_access
+			) WHERE rid = attachment_access.rowid
 		)`,
 	)
 	return err

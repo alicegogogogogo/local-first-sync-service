@@ -316,6 +316,44 @@ func handleGetChunk(s *app.App, w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleListAttachmentAccess is the read-only roster over an attachment's
+// access subresource: the device ids the attachment is currently open to for
+// reading — every device the creator granted through the access endpoint and
+// that has not been revoked — each at most once, ordered by the time their
+// latest grant took effect ascending. The creator itself is not part of the
+// roster (its reads come from ownership, so a self grant/revoke neither adds
+// nor removes an entry). Only the attachment's creator may read it — the
+// device in the path is the caller identity and there is no other
+// authentication: an unknown or deleted attachment is a 404 and a non-creator
+// caller a 403, judged independently. Pagination shares the attachment
+// listing's limit/offset parsing, so an illegal value is a 400 checked before
+// the attachment lookup. The handler writes nothing: no access row, chunk or
+// attachment state changes.
+func handleListAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	limit, offset, ok := parseAttachmentListQuery(w, r)
+	if !ok {
+		return
+	}
+
+	devices, err := s.ListAttachmentAccess(deviceID, attachmentID, limit, offset)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to list attachment access")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
+}
+
 // handleSetAttachmentAccess grants or revokes a registered device's read
 // access to one attachment. Every (attachment, device) pair starts
 // unauthorized, so the first grant is the first write; repeating the current
