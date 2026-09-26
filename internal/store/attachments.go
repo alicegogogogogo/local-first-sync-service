@@ -228,9 +228,13 @@ func (s *Store) CreateAttachment(deviceID string, a Attachment) (created bool, e
 	).Scan(&owner, &totalBytes, &chunkSize, &digest)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
+		// The creation sequence is one past the current maximum, assigned
+		// inside the same serialized transaction as the insert, so values are
+		// unique, monotone and never reused — a deleted id that is created
+		// again lists as a brand-new record at the end.
 		if _, err := tx.Exec(
-			`INSERT INTO attachments (id, device_id, total_bytes, chunk_size, sha256, complete, reused)
-			 VALUES (?, ?, ?, ?, ?, 0, 0)`,
+			`INSERT INTO attachments (id, device_id, total_bytes, chunk_size, sha256, complete, reused, created_seq)
+			 VALUES (?, ?, ?, ?, ?, 0, 0, (SELECT COALESCE(MAX(created_seq), 0) + 1 FROM attachments))`,
 			a.ID, deviceID, a.TotalBytes, a.ChunkSize, a.SHA256,
 		); err != nil {
 			return false, err
@@ -646,6 +650,98 @@ func (s *Store) SetAttachmentAccess(callerDeviceID, attachmentID, targetDeviceID
 		return false, err
 	}
 	return true, nil
+}
+
+// ListedAttachment is one entry of a device's attachment listing: the stored
+// metadata, whether the listing device created the attachment, and the sorted
+// indices of the chunks received so far.
+type ListedAttachment struct {
+	Attachment
+	Owned          bool
+	ReceivedChunks []int64
+}
+
+// ListAttachments returns the page of attachments visible to deviceID: every
+// attachment the device created plus every attachment another device created
+// and granted it read access to, each appearing at most once. Entries are
+// ordered by creation sequence ascending — a stable order that survives
+// restarts and never reuses a position, so a deleted id that is created again
+// lists as a new record at the end — and paginated by limit/offset. An
+// unregistered device yields ErrDeviceNotFound and no listing. The read runs
+// in one serialized transaction and writes nothing.
+func (s *Store) ListAttachments(deviceID string, limit, offset int64) ([]ListedAttachment, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	exists, err := DeviceExistsTx(tx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrDeviceNotFound
+	}
+
+	rows, err := tx.Query(
+		`SELECT a.id, a.device_id, a.total_bytes, a.chunk_size, a.sha256, a.complete
+		 FROM attachments a
+		 WHERE a.device_id = ?
+			OR EXISTS (SELECT 1 FROM attachment_access ac
+				WHERE ac.attachment_id = a.id AND ac.device_id = ? AND ac.authorized <> 0)
+		 ORDER BY a.created_seq ASC
+		 LIMIT ? OFFSET ?`,
+		deviceID, deviceID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]ListedAttachment, 0)
+	for rows.Next() {
+		var item ListedAttachment
+		var complete int
+		if err := rows.Scan(
+			&item.ID, &item.DeviceID, &item.TotalBytes, &item.ChunkSize, &item.SHA256, &complete,
+		); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		item.Complete = complete != 0
+		item.ReceivedChunks = make([]int64, 0)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	for i := range items {
+		items[i].Owned = items[i].DeviceID == deviceID
+		chunkRows, err := tx.Query(
+			`SELECT idx FROM attachment_chunks WHERE attachment_id = ? ORDER BY idx ASC`,
+			items[i].ID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		for chunkRows.Next() {
+			var idx int64
+			if err := chunkRows.Scan(&idx); err != nil {
+				_ = chunkRows.Close()
+				return nil, err
+			}
+			items[i].ReceivedChunks = append(items[i].ReceivedChunks, idx)
+		}
+		if err := chunkRows.Err(); err != nil {
+			_ = chunkRows.Close()
+			return nil, err
+		}
+		_ = chunkRows.Close()
+	}
+
+	return items, tx.Commit()
 }
 
 func bytesEqual(a, b []byte) bool {

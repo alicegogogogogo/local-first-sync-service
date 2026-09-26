@@ -143,7 +143,8 @@ CREATE TABLE IF NOT EXISTS attachments (
 	chunk_size  INTEGER NOT NULL,
 	sha256      TEXT NOT NULL,
 	complete    INTEGER NOT NULL DEFAULT 0,
-	reused      INTEGER NOT NULL DEFAULT 0
+	reused      INTEGER NOT NULL DEFAULT 0,
+	created_seq INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS attachment_chunks (
 	attachment_id TEXT NOT NULL REFERENCES attachments(id),
@@ -163,6 +164,53 @@ CREATE TABLE IF NOT EXISTS attachment_access (
 	PRIMARY KEY (attachment_id, device_id)
 );
 `)
+	if err != nil {
+		return err
+	}
+	return s.ensureAttachmentCreatedSeq()
+}
+
+// ensureAttachmentCreatedSeq adds the creation-order column to databases
+// created before it existed. Existing rows are backfilled in insertion
+// (rowid) order so their relative listing order is unchanged; new rows take
+// strictly larger values, so the sequence never reuses a value even after
+// the newest attachment is deleted and its id created again.
+func (s *Store) ensureAttachmentCreatedSeq() error {
+	rows, err := s.db.Query(`PRAGMA table_info(attachments)`)
+	if err != nil {
+		return err
+	}
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "created_seq" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if hasColumn {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE attachments ADD COLUMN created_seq INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`UPDATE attachments SET created_seq = (
+			SELECT COUNT(*) FROM attachments older WHERE older.rowid <= attachments.rowid
+		)`,
+	)
 	return err
 }
 

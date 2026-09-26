@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
@@ -19,6 +20,88 @@ type attachmentRequest struct {
 	TotalBytes json.RawMessage `json:"totalBytes"`
 	ChunkSize  json.RawMessage `json:"chunkSize"`
 	SHA256     string          `json:"sha256"`
+}
+
+// attachmentListEntry is one item of the attachment listing response.
+type attachmentListEntry struct {
+	ID             string  `json:"attachmentId"`
+	TotalBytes     int64   `json:"totalBytes"`
+	ChunkSize      int64   `json:"chunkSize"`
+	SHA256         string  `json:"sha256"`
+	Complete       bool    `json:"complete"`
+	Owned          bool    `json:"owned"`
+	ReceivedChunks []int64 `json:"receivedChunks"`
+}
+
+// handleListAttachments is the read-only listing over the attachment
+// collection: every upload the device in the path created plus every upload
+// another device created and granted it read access to, each at most once,
+// ordered by creation ascending. limit (1..1000, default 100) and offset
+// (non-negative, default 0) page the result; an illegal value is a 400 JSON
+// error checked before the device lookup. An unregistered device is a 404
+// JSON error with no listing. The handler writes nothing: no attachment,
+// chunk or access state changes.
+func handleListAttachments(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId") // route pattern + guard guarantee non-empty
+
+	limit, offset, ok := parseAttachmentListQuery(w, r)
+	if !ok {
+		return
+	}
+
+	items, err := s.ListAttachments(deviceID, limit, offset)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to list attachments")
+		}
+		return
+	}
+
+	entries := make([]attachmentListEntry, 0, len(items))
+	for _, item := range items {
+		entries = append(entries, attachmentListEntry{
+			ID:             item.ID,
+			TotalBytes:     item.TotalBytes,
+			ChunkSize:      item.ChunkSize,
+			SHA256:         item.SHA256,
+			Complete:       item.Complete,
+			Owned:          item.Owned,
+			ReceivedChunks: item.ReceivedChunks,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"attachments": entries})
+}
+
+// parseAttachmentListQuery parses the limit/offset pagination parameters of
+// the attachment listing, writing the documented 400 on an illegal value.
+func parseAttachmentListQuery(w http.ResponseWriter, r *http.Request) (limit, offset int64, ok bool) {
+	q := r.URL.Query()
+
+	limit = defaultListLimit
+	if raw := q.Get("limit"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 1 || v > maxListLimit {
+			writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+			return 0, 0, false
+		}
+		limit = v
+	}
+
+	offset = 0
+	if raw := q.Get("offset"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return 0, 0, false
+		}
+		offset = v
+	}
+
+	return limit, offset, true
 }
 
 // handleCreateAttachment registers a resumable chunked upload for the device

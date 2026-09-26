@@ -127,6 +127,21 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateAttachment(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
+		handleListAttachments(s, w, r)
+	})
+	// The attachment collection path accepts GET (list), POST (create) and
+	// DELETE (the malformed-delete 400 below); every other verb gets a JSON
+	// 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// A GET with extra segments past the collection or item path is a
+	// malformed list/read and answers a JSON 400 instead of the subtree 404;
+	// the more specific chunks route above still wins for its exact shape.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "attachment list path is malformed")
+	})
 	mux.HandleFunc("PUT /v1/devices/{deviceId}/attachments/{attachmentId}/chunks/{index}", func(w http.ResponseWriter, r *http.Request) {
 		handlePutChunk(s, w, r)
 	})
