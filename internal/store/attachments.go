@@ -603,8 +603,11 @@ func (s *Store) DeleteAttachment(deviceID, attachmentID string) error {
 // target device ErrDeviceNotFound — none of these write anything. The lookup
 // and the write run in one serialized transaction, so concurrent grant/revoke
 // calls each commit completely and the final state matches the last committed
-// action. Access only widens the read paths; chunk writes and the finish stay
-// creator-only, and a revoke never deletes stored chunks or sealed content.
+// action. Every state-changing write is stamped with a monotone grant
+// sequence persisted alongside the state, so ListAttachmentAccess can order
+// each device by its most recent grant across restarts. Access only widens
+// the read paths; chunk writes and the finish stay creator-only, and a
+// revoke never deletes stored chunks or sealed content.
 func (s *Store) SetAttachmentAccess(callerDeviceID, attachmentID, targetDeviceID string, authorized bool) (changed bool, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -639,9 +642,17 @@ func (s *Store) SetAttachmentAccess(callerDeviceID, attachmentID, targetDeviceID
 	if authorized {
 		v = 1
 	}
+	// Every state-changing write also takes the next grant sequence, assigned
+	// inside the same serialized transaction, so the values are unique and
+	// monotone: a grant (including a re-grant after a revoke) lists at the
+	// position of its most recent effective time. A revoke bumps the sequence
+	// too, which only leaves harmless gaps — revoked rows are never listed.
 	if _, err := tx.Exec(
-		`INSERT INTO attachment_access (attachment_id, device_id, authorized) VALUES (?, ?, ?)
-		 ON CONFLICT (attachment_id, device_id) DO UPDATE SET authorized = excluded.authorized`,
+		`INSERT INTO attachment_access (attachment_id, device_id, authorized, granted_seq)
+		 VALUES (?, ?, ?, (SELECT COALESCE(MAX(granted_seq), 0) + 1 FROM attachment_access))
+		 ON CONFLICT (attachment_id, device_id) DO UPDATE SET
+			authorized = excluded.authorized,
+			granted_seq = excluded.granted_seq`,
 		attachmentID, targetDeviceID, v,
 	); err != nil {
 		return false, err
@@ -650,6 +661,59 @@ func (s *Store) SetAttachmentAccess(callerDeviceID, attachmentID, targetDeviceID
 		return false, err
 	}
 	return true, nil
+}
+
+// ListAttachmentAccess returns the page of devices that currently hold read
+// access to the attachment, on behalf of callerDeviceID. Only currently
+// authorized devices are listed, each at most once — a device re-granted
+// after a revoke appears exactly once — ordered by the time its most recent
+// grant took effect, ascending; that order is persisted with the access
+// state, so it survives a restart unchanged. An unknown (or deleted)
+// attachment yields ErrAttachmentNotFound and a caller other than the
+// creator ErrAttachmentForbidden — the two judgments are independent and
+// neither writes anything. The read runs in one serialized transaction, so a
+// page never observes a half-committed grant or revoke.
+func (s *Store) ListAttachmentAccess(callerDeviceID, attachmentID string, limit, offset int64) ([]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	a, err := loadAttachmentTx(tx, attachmentID)
+	if err != nil {
+		return nil, err
+	}
+	if a.DeviceID != callerDeviceID {
+		return nil, ErrAttachmentForbidden
+	}
+
+	rows, err := tx.Query(
+		`SELECT device_id FROM attachment_access
+		 WHERE attachment_id = ? AND authorized <> 0
+		 ORDER BY granted_seq ASC
+		 LIMIT ? OFFSET ?`,
+		attachmentID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	devices := make([]string, 0)
+	for rows.Next() {
+		var deviceID string
+		if err := rows.Scan(&deviceID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		devices = append(devices, deviceID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	return devices, tx.Commit()
 }
 
 // ListedAttachment is one entry of a device's attachment listing: the stored

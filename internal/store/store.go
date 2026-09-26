@@ -161,13 +161,17 @@ CREATE TABLE IF NOT EXISTS attachment_access (
 	attachment_id TEXT NOT NULL REFERENCES attachments(id),
 	device_id     TEXT NOT NULL,
 	authorized    INTEGER NOT NULL,
+	granted_seq   INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (attachment_id, device_id)
 );
 `)
 	if err != nil {
 		return err
 	}
-	return s.ensureAttachmentCreatedSeq()
+	if err := s.ensureAttachmentCreatedSeq(); err != nil {
+		return err
+	}
+	return s.ensureAttachmentAccessGrantedSeq()
 }
 
 // ensureAttachmentCreatedSeq adds the creation-order column to databases
@@ -209,6 +213,51 @@ func (s *Store) ensureAttachmentCreatedSeq() error {
 	_, err = s.db.Exec(
 		`UPDATE attachments SET created_seq = (
 			SELECT COUNT(*) FROM attachments older WHERE older.rowid <= attachments.rowid
+		)`,
+	)
+	return err
+}
+
+// ensureAttachmentAccessGrantedSeq adds the grant-order column to databases
+// created before it existed. Existing rows are backfilled in insertion
+// (rowid) order so the relative listing order of already-authorized devices
+// is preserved; new state-changing writes take strictly larger values, so a
+// re-grant after a revoke always lists at the position of its most recent
+// grant and the sequence never reuses a value.
+func (s *Store) ensureAttachmentAccessGrantedSeq() error {
+	rows, err := s.db.Query(`PRAGMA table_info(attachment_access)`)
+	if err != nil {
+		return err
+	}
+	hasColumn := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, colType string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "granted_seq" {
+			hasColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if hasColumn {
+		return nil
+	}
+	if _, err := s.db.Exec(
+		`ALTER TABLE attachment_access ADD COLUMN granted_seq INTEGER NOT NULL DEFAULT 0`,
+	); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`UPDATE attachment_access SET granted_seq = (
+			SELECT COUNT(*) FROM attachment_access older WHERE older.rowid <= attachment_access.rowid
 		)`,
 	)
 	return err

@@ -372,6 +372,41 @@ func handleSetAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// handleListAttachmentAccess is the read-only listing over one attachment's
+// access sub-resource: the devices the creator currently grants read access
+// to, each at most once, ordered by the time its most recent grant took
+// effect ascending. limit (1..1000, default 100) and offset (non-negative,
+// default 0) page the result with the same rules as the attachment listing;
+// an illegal value is a 400 JSON error checked before any lookup. Only the
+// creator may read the list: any other device gets a 403 JSON error, an
+// unknown or deleted attachment a 404 JSON error — the two judgments are
+// independent. The handler writes nothing: no attachment, chunk or access
+// state changes.
+func handleListAttachmentAccess(s *app.App, w http.ResponseWriter, r *http.Request) {
+	deviceID := r.PathValue("deviceId")         // route pattern + guard guarantee non-empty
+	attachmentID := r.PathValue("attachmentId") // route pattern + guard guarantee non-empty
+
+	limit, offset, ok := parseAttachmentListQuery(w, r)
+	if !ok {
+		return
+	}
+
+	devices, err := s.ListAttachmentAccess(deviceID, attachmentID, limit, offset)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrAttachmentNotFound):
+			writeError(w, http.StatusNotFound, "attachment not found")
+		case errors.Is(err, store.ErrAttachmentForbidden):
+			writeError(w, http.StatusForbidden, "attachment belongs to another device")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to list attachment access")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
+}
+
 // handleDeleteAttachment removes an upload outright. Only the creating device
 // may delete: any other device gets a 403 and an unknown (or already deleted)
 // id a 404, neither writing anything. A successful delete answers the

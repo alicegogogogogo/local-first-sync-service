@@ -151,6 +151,18 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, r *http.Request) {
 		handleSetAttachmentAccess(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, r *http.Request) {
+		handleListAttachmentAccess(s, w, r)
+	})
+	// The access path accepts GET (list) and POST (grant/revoke); every other
+	// verb gets a JSON 400 rather than ServeMux's plain-text 405. A
+	// method-less pattern would conflict with the GET catch-all for extra
+	// segments below, so the rejection is registered per verb.
+	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions} {
+		mux.HandleFunc(method+" /v1/devices/{deviceId}/attachments/{attachmentId}/access", func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+		})
+	}
 	mux.HandleFunc("GET /v1/devices/{deviceId}/attachments/{attachmentId}", func(w http.ResponseWriter, r *http.Request) {
 		handleGetAttachment(s, w, r)
 	})
