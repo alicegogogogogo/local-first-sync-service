@@ -219,12 +219,14 @@ func malformedSessionChangesPath(p string) bool {
 	// Keyword position reached. The collection is exactly
 	// {sessionId}/documents/{documentId}/changes; the subscribe subresource
 	// adds one trailing "subscribe" segment and keeps its own guard; the long
-	// poll adds one trailing "poll" segment and keeps its own guard. Anything
-	// else past the keyword is a malformed 400.
+	// poll adds one trailing "poll" segment and keeps its own guard; the
+	// offline replay adds one trailing "replay" segment and keeps its own
+	// route. Anything else past the keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
-	return !(collection || subscribe || poll)
+	replay := len(segs) == 5 && segs[4] == "replay"
+	return !(collection || subscribe || poll || replay)
 }
 
 // malformedSessionPollPath reports whether p targets the session-scoped

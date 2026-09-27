@@ -78,6 +78,13 @@ type sessionPostRequest struct {
 	Changes []changeIn `json:"changes"`
 }
 
+// sessionReplayRequest is the body of the session-scoped offline replay: the
+// operations array only — the calling device is the session's owning device,
+// so any deviceId field in the body is unknown to this struct and ignored.
+type sessionReplayRequest struct {
+	Operations []changeIn `json:"operations"`
+}
+
 type replayRequest struct {
 	DeviceID   string     `json:"deviceId"`
 	Operations []changeIn `json:"operations"`
@@ -235,6 +242,17 @@ func NewHandler(s *app.App) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionPostChanges(s, w, r)
+	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/replay", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionReplayChanges(s, w, r)
+	})
+	// Verbs other than POST on the session offline-replay path: the exact POST
+	// pattern above is more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of the subtree's
+	// unknown-path JSON 404. The replay is a write entry: POST with a JSON
+	// body only.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/replay", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Verbs other than GET/POST on the session change collection path: the
 	// exact GET and POST patterns above are more specific, so only other
@@ -1261,6 +1279,108 @@ func handleSessionPostChanges(s *app.App, w http.ResponseWriter, r *http.Request
 			})
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to commit changes")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+// handleSessionReplayChanges is the session-scoped offline operation replay
+// over a replay subsegment of the same change collection the session commits
+// to and reads:
+//
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/changes/replay
+//
+// A disconnected client retries a batch of offline operations using its
+// existing session identity; the session's owning device resolved from the
+// path is the calling device, exactly as for the session reads, exports,
+// commits and subscriptions. No device id travels in the body — an extra
+// deviceId (or any other stray field) is ignored and never overrides the
+// session device — and no new credential is introduced.
+//
+// The request body carries only an operations array, in original order, each
+// element a stable id and any legal JSON payload. Per-element and success-body
+// semantics are byte-identical to the document-level replay: results arrive in
+// request order, each naming its id, whether it was created and the cursor it
+// was first assigned; an existing id is idempotent only when the source device
+// and the decoded payload both match (created=false with the first cursor),
+// and a payload/device mismatch is a 409 naming the conflicting id. Both
+// handlers funnel into the same serialized commit, so the batch is atomic,
+// shares the document's one contiguous cursor space with ordinary commits,
+// merges and restores, and a change-bearing commit wakes long polls and pushes
+// to subscribers; an idempotent-only retry notifies nobody.
+//
+// The checks run in the fixed order request shape (400), session existence
+// (404), document permission (403) — the permission verdict is taken inside
+// the commit transaction, so a revoked device writes nothing — and a
+// payload/device mismatch against an existing id is a 409 reporting the
+// conflicting id. Every rejection leaves the log untouched.
+func handleSessionReplayChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	var req sessionReplayRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if req.Operations == nil || len(req.Operations) == 0 {
+		writeError(w, http.StatusBadRequest, "operations must be a non-empty array")
+		return
+	}
+
+	changes := make([]events.Change, len(req.Operations))
+	seen := make(map[string]struct{}, len(req.Operations))
+	for i, op := range req.Operations {
+		if op.ID == "" {
+			writeError(w, http.StatusBadRequest, "each operation must have a non-empty string id")
+			return
+		}
+		if len(op.Payload) == 0 {
+			writeError(w, http.StatusBadRequest, "each operation must carry a JSON payload")
+			return
+		}
+		if _, dup := seen[op.ID]; dup {
+			writeError(w, http.StatusBadRequest, "duplicate operation id within batch: "+op.ID)
+			return
+		}
+		seen[op.ID] = struct{}{}
+		changes[i] = events.Change{ID: op.ID, Payload: op.Payload}
+	}
+
+	// Request shape is settled; only now does the session lookup run, so a
+	// malformed batch against an unknown session is still a 400.
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+	for i := range changes {
+		changes[i].DeviceID = deviceID
+	}
+
+	results, err := s.PostSessionChanges(documentID, changes)
+	if err != nil {
+		var conflict *events.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			// The session's device was deregistered between the lookup and
+			// the commit; its cascade removed the session too, so the
+			// identity the caller used no longer exists.
+			writeError(w, http.StatusNotFound, "session not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.As(err, &conflict):
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "operation id already exists with different deviceId or payload",
+				"conflictId": conflict.ID,
+			})
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to replay operations")
 		}
 		return
 	}
