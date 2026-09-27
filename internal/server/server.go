@@ -380,6 +380,19 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
 		handlePollChanges(s, w, r)
 	})
+	// Document-level change subscription: a GET WebSocket upgrade carrying the
+	// calling device in the deviceId query parameter. It is the document view's
+	// counterpart to the session subscription and shares the exact change
+	// collection path the paged read owns.
+	mux.HandleFunc("GET /v1/documents/{documentID}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleDocumentSubscribe(s, w, r)
+	})
+	// Non-GET verbs on the document subscription path: the exact GET pattern
+	// above is more specific, so only other verbs reach this method-less
+	// pattern and get a JSON 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Non-GET verbs on the poll path: the exact GET pattern above is more
 	// specific, so only other verbs reach this method-less pattern and get a
 	// JSON 400 instead of ServeMux's plain-text 405.
@@ -453,6 +466,17 @@ func NewHandler(s *app.App) http.Handler {
 	})
 	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTState(s, w, r)
+	})
+	// Document-level CRDT state subscription: a GET WebSocket upgrade carrying
+	// the calling device in the deviceId query parameter. It is the document
+	// view's counterpart to the session CRDT subscription.
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleDocumentCRDTStateSubscribe(s, w, r)
+	})
+	// Non-GET verbs on the document CRDT state subscription path get a JSON 400
+	// rather than ServeMux's plain-text 405: the subscription is GET-only.
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/state/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/compact", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTCompact(s, w, r)
@@ -536,6 +560,18 @@ func malformedNewDocumentPath(p string) bool {
 	// non-empty documentID and "changes".
 	for i, seg := range segs {
 		if seg == "poll" && i > 0 {
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// Document change subscription: "subscribe" must be exactly the third
+	// segment, after a non-empty documentID and "changes". The CRDT namespace
+	// has its own state/subscribe endpoint and its own guard, so a "subscribe"
+	// under crdt/ is not the change-subscription keyword.
+	for i, seg := range segs {
+		if seg == "subscribe" && i > 0 {
+			if len(segs) >= 2 && segs[1] == "crdt" {
+				continue
+			}
 			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
 		}
 	}

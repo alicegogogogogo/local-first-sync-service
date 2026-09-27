@@ -350,12 +350,13 @@ func marshalCRDTState(state crdt.State) []byte {
 }
 
 // malformedCRDTPath reports whether p targets the CRDT namespace but is not at
-// one of the four exact endpoints:
+// one of the five exact endpoints:
 //
 //	POST     /v1/documents/{documentID}/crdt/ops
 //	GET      /v1/documents/{documentID}/crdt/state
 //	POST     /v1/documents/{documentID}/crdt/compact
 //	GET      /v1/documents/{documentID}/crdt/snapshot
+//	GET      /v1/documents/{documentID}/crdt/state/subscribe
 //
 // A missing/empty document id, a trailing slash, extra path segments, or a
 // "crdt" segment in any position short of that shape is a malformed 400 rather
@@ -370,7 +371,15 @@ func malformedCRDTPath(p string) bool {
 	segs := strings.Split(rest, "/")
 	for i, seg := range segs {
 		if seg == "crdt" && i > 0 {
-			if len(segs) != 3 || segs[0] == "" {
+			if segs[0] == "" {
+				return true
+			}
+			// The CRDT state subscription adds one trailing "subscribe"
+			// segment past the state read; nothing else may follow state.
+			if len(segs) == 4 && segs[2] == "state" && segs[3] == "subscribe" {
+				return false
+			}
+			if len(segs) != 3 {
 				return true
 			}
 			switch segs[2] {

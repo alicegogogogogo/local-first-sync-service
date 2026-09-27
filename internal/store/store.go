@@ -534,6 +534,14 @@ func DeleteDeviceTx(q DBTX, deviceID string) error {
 	return nil
 }
 
+// DeviceExists reports whether a live device with deviceID is registered. It
+// is the non-transactional counterpart to DeviceExistsTx, used by the
+// document-level subscription handlers whose existence verdict runs before
+// the WebSocket upgrade rather than inside a write transaction.
+func (s *Store) DeviceExists(deviceID string) (bool, error) {
+	return DeviceExistsTx(s.db, deviceID)
+}
+
 // SessionExists reports whether a live session with sessionID exists.
 // Ownership is intentionally not part of this check: session-scoped reads only
 // require that the session currently exists.
