@@ -221,12 +221,14 @@ func malformedSessionChangesPath(p string) bool {
 	// adds one trailing "subscribe" segment and keeps its own guard; the long
 	// poll adds one trailing "poll" segment and keeps its own guard; the
 	// offline replay adds one trailing "replay" segment and keeps its own
-	// guard. Anything else past the keyword is a malformed 400.
+	// guard; the single-change merge adds one trailing "merge" segment and
+	// keeps its own guard. Anything else past the keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
 	replay := len(segs) == 5 && segs[4] == "replay"
-	return !(collection || subscribe || poll || replay)
+	merge := len(segs) == 5 && segs[4] == "merge"
+	return !(collection || subscribe || poll || replay || merge)
 }
 
 // malformedSessionPollPath reports whether p targets the session-scoped
@@ -278,8 +280,55 @@ func malformedSessionPollPath(p string) bool {
 	return false
 }
 
-// malformedSessionReplayPath reports whether p targets the session-scoped
-// offline replay endpoint but is not at its exact location
+// malformedSessionMergePath reports whether p targets the session-scoped
+// single-change merge endpoint but is not at its exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/changes/merge): a missing
+// "documents"/"changes" segment, an extra segment, or a "merge" segment in a
+// position short of the registered shape. ServeMux would answer those with a
+// plain-text 404 (or a redirect for an empty segment); every failure of this
+// endpoint must be a JSON 400 instead. Empty segments are already rejected by
+// the guard itself.
+//
+// "merge" is treated as the endpoint keyword only in its terminal segment
+// position (the fifth segment, index 4); a session or document identifier
+// literally named "merge" occupies an identifier position (index 0 or 2) and is
+// therefore left to the ordinary changes routes like any other id.
+func malformedSessionMergePath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	// The CRDT namespace ("crdt" immediately past the document identifier)
+	// has its own guard; "merge" there is an ordinary identifier, not the
+	// changes-merge keyword.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	for i, seg := range segs {
+		if seg != "merge" {
+			continue
+		}
+		// Identifier positions: sessionId (0) and documentId (2). A value of
+		// "merge" there is an ordinary identifier, not the endpoint word.
+		if i == 0 || i == 2 {
+			continue
+		}
+		// Endpoint keyword position: the fifth segment must be exactly "merge"
+		// with the documents/changes scaffolding around it, and no segment may
+		// follow. Any other occurrence is a malformed path.
+		if i == 4 && len(segs) == 5 &&
+			segs[0] != "" &&
+			segs[1] == "documents" &&
+			segs[2] != "" &&
+			segs[3] == "changes" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 // (/v1/sessions/{sessionId}/documents/{documentId}/changes/replay): a missing
 // "documents"/"changes" segment, an extra segment, or a "replay" segment in a
 // position short of the registered shape. ServeMux would answer those with a

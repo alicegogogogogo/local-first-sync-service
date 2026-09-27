@@ -213,6 +213,41 @@ func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []in
 	return nil
 }
 
+// MergeChangeAuthorized is the session-scoped merge: it has exactly the merge
+// semantics of MergeChange, but enforces the gate (registration then
+// permission) first in the same serialized transaction: an unregistered device
+// yields store.ErrDeviceNotFound and a revoked device yields
+// ErrPermissionDenied. None of those outcomes writes anything or exposes
+// change content. The device identity is resolved from the session by the HTTP
+// layer before the call.
+func (s *Service) MergeChangeAuthorized(documentID string, baseCursor int64, c Change) (MergeResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return MergeResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Gate first: the device row and the permission row are read before any
+	// change content is observed, so a rejected merge cannot reveal anything.
+	if s.gate != nil {
+		if err := s.gate.DeviceAuthorizedTx(tx, documentID, c.DeviceID); err != nil {
+			return MergeResult{}, err
+		}
+	}
+
+	result, appended, err := mergeChangeTx(tx, documentID, baseCursor, c)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return MergeResult{}, err
+	}
+	if appended {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
 // MergeChange validates and appends one change against a caller-observed base
 // cursor, all within a single serialized transaction.
 //
@@ -239,21 +274,40 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	result, appended, err := mergeChangeTx(tx, documentID, baseCursor, c)
+	if err != nil {
+		return MergeResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return MergeResult{}, err
+	}
+	if appended {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
+// mergeChangeTx runs the merge judgment and (when allowed) the single append
+// inside the caller's serialized transaction. It reports appended=true only
+// when a new change row was inserted, so the caller wakes the push channels
+// exactly once for a change-bearing commit; an idempotent re-post appends
+// nothing and notifies nothing.
+func mergeChangeTx(tx *sql.Tx, documentID string, baseCursor int64, c Change) (MergeResult, bool, error) {
 	// Current cursor is the document's high-water mark (0 when unknown); it
 	// never drops below the compaction boundary.
 	current, err := currentCursorTx(tx, documentID)
 	if err != nil {
-		return MergeResult{}, err
+		return MergeResult{}, false, err
 	}
 	if baseCursor > current || (baseCursor != 0 && current == 0) {
-		return MergeResult{}, ErrStaleCursor
+		return MergeResult{}, false, ErrStaleCursor
 	}
 	boundary, err := boundaryOfTx(tx, documentID)
 	if err != nil {
-		return MergeResult{}, err
+		return MergeResult{}, false, err
 	}
 	if baseCursor < boundary {
-		return MergeResult{}, ErrCompactedBase
+		return MergeResult{}, false, ErrCompactedBase
 	}
 
 	// An existing id keeps the original idempotency/conflict rules.
@@ -271,7 +325,7 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 		// logic below.
 		found, cursor, err := resolveTrimmedIdentity(tx, documentID, c)
 		if err != nil {
-			return MergeResult{}, err
+			return MergeResult{}, false, err
 		}
 		if found {
 			return MergeResult{
@@ -283,13 +337,13 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 					Created: false,
 					Cursor:  cursor,
 				},
-			}, nil
+			}, false, nil
 		}
 	case err != nil:
-		return MergeResult{}, err
+		return MergeResult{}, false, err
 	default:
 		if existingDevice != c.DeviceID || !store.JSONEqual(existingPayload, c.Payload) {
-			return MergeResult{}, &ErrConflict{ID: c.ID}
+			return MergeResult{}, false, &ErrConflict{ID: c.ID}
 		}
 		return MergeResult{
 			ID:      c.ID,
@@ -300,7 +354,7 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 				Created: false,
 				Cursor:  existingCursor,
 			},
-		}, nil
+		}, false, nil
 	}
 
 	outcome := "applied"
@@ -310,9 +364,9 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 		newKeys, err := objectKeys(c.Payload)
 		if err != nil {
 			if errors.Is(err, errNotObject) {
-				return MergeResult{}, &ErrConflict{ID: c.ID}
+				return MergeResult{}, false, &ErrConflict{ID: c.ID}
 			}
-			return MergeResult{}, err
+			return MergeResult{}, false, err
 		}
 		rows, err := tx.Query(
 			`SELECT payload FROM changes
@@ -321,32 +375,32 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 			documentID, baseCursor,
 		)
 		if err != nil {
-			return MergeResult{}, err
+			return MergeResult{}, false, err
 		}
 		for rows.Next() {
 			var laterPayload []byte
 			if err := rows.Scan(&laterPayload); err != nil {
 				_ = rows.Close()
-				return MergeResult{}, err
+				return MergeResult{}, false, err
 			}
 			laterKeys, err := objectKeys(laterPayload)
 			if err != nil {
 				_ = rows.Close()
 				if errors.Is(err, errNotObject) {
-					return MergeResult{}, &ErrConflict{ID: c.ID}
+					return MergeResult{}, false, &ErrConflict{ID: c.ID}
 				}
-				return MergeResult{}, err
+				return MergeResult{}, false, err
 			}
 			for k := range newKeys {
 				if _, clash := laterKeys[k]; clash {
 					_ = rows.Close()
-					return MergeResult{}, &ErrConflict{ID: c.ID}
+					return MergeResult{}, false, &ErrConflict{ID: c.ID}
 				}
 			}
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
-			return MergeResult{}, err
+			return MergeResult{}, false, err
 		}
 		_ = rows.Close()
 		outcome = "merged"
@@ -357,14 +411,9 @@ func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (Me
 		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
 		documentID, next, c.ID, c.DeviceID, []byte(c.Payload),
 	); err != nil {
-		return MergeResult{}, err
+		return MergeResult{}, false, err
 	}
-
-	if err := tx.Commit(); err != nil {
-		return MergeResult{}, err
-	}
-	s.notifyWaiters(documentID)
-	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, nil
+	return MergeResult{ID: c.ID, Outcome: outcome, Cursor: next}, true, nil
 }
 
 // errNotObject marks a payload that is not a JSON object.
