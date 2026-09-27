@@ -156,17 +156,74 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	result, appended, err := restoreSnapshotTx(tx, documentID, deviceID, changeID, snapshotCursor)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RestoreResult{}, err
+	}
+	if appended {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
+// RestoreSnapshotAuthorized is the session-scoped restore: it has exactly the
+// restore semantics of RestoreSnapshot, but enforces the gate (registration
+// then permission) first in the same serialized transaction: an unregistered
+// device yields store.ErrDeviceNotFound and a revoked device yields
+// ErrPermissionDenied. The gate is passed before the snapshot is looked up, so
+// a rejected restore neither observes the snapshot nor any change content and
+// writes nothing. The device identity is resolved from the session by the HTTP
+// layer before the call. An idempotent re-post appends nothing and, like every
+// other write path, neither wakes a long poll nor pushes to subscribers.
+func (s *Service) RestoreSnapshotAuthorized(documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Gate first: the device row and the permission row are read before the
+	// snapshot or any change id is observed, so a rejected restore reveals
+	// nothing.
+	if s.gate != nil {
+		if err := s.gate.DeviceAuthorizedTx(tx, documentID, deviceID); err != nil {
+			return RestoreResult{}, err
+		}
+	}
+
+	result, appended, err := restoreSnapshotTx(tx, documentID, deviceID, changeID, snapshotCursor)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RestoreResult{}, err
+	}
+	if appended {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
+// restoreSnapshotTx runs the restore judgment and (when allowed) the single
+// append inside the caller's serialized transaction. It reports appended=true
+// only when a new change row was inserted, so the caller wakes the push
+// channels exactly once for a change-bearing commit; an idempotent re-post
+// appends nothing and notifies nothing.
+func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, bool, error) {
 	// The snapshot must exist; its state is the payload to append.
 	var state []byte
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
 		documentID, snapshotCursor,
 	).Scan(&state)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return RestoreResult{}, ErrSnapshotNotFound
+		return RestoreResult{}, false, ErrSnapshotNotFound
 	case err != nil:
-		return RestoreResult{}, err
+		return RestoreResult{}, false, err
 	}
 
 	// Resolve the change id: an ordinary row, a prior restore and a
@@ -198,25 +255,25 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 		case errors.Is(err, sql.ErrNoRows):
 			// Genuinely new id; fall through to append below.
 		case err != nil:
-			return RestoreResult{}, err
+			return RestoreResult{}, false, err
 		default:
 			stateDigest, err := payloadDigest(state)
 			if err != nil {
-				return RestoreResult{}, err
+				return RestoreResult{}, false, err
 			}
 			if !restoredFrom.Valid || restoredFrom.Int64 != snapshotCursor ||
 				summaryDevice != deviceID || !bytes.Equal(summaryDigest, stateDigest) {
-				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+				return RestoreResult{}, false, &ErrRestoreConflict{ID: changeID}
 			}
 			return RestoreResult{
 				ID:           changeID,
 				Created:      false,
 				Cursor:       summaryCursor,
 				RestoredFrom: snapshotCursor,
-			}, nil
+			}, false, nil
 		}
 	case err != nil:
-		return RestoreResult{}, err
+		return RestoreResult{}, false, err
 	default:
 		var restDevice string
 		var restSnapshotCursor int64
@@ -229,49 +286,45 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 		case errors.Is(err, sql.ErrNoRows):
 			// The id belongs to an ordinary change (or a batch/merge change),
 			// not a restore: never treat it as an idempotent restore.
-			return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			return RestoreResult{}, false, &ErrRestoreConflict{ID: changeID}
 		case err != nil:
-			return RestoreResult{}, err
+			return RestoreResult{}, false, err
 		default:
 			if restDevice != deviceID || restSnapshotCursor != snapshotCursor || !store.JSONEqual(restState, state) {
-				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+				return RestoreResult{}, false, &ErrRestoreConflict{ID: changeID}
 			}
 			return RestoreResult{
 				ID:           changeID,
 				Created:      false,
 				Cursor:       existingCursor,
 				RestoredFrom: snapshotCursor,
-			}, nil
+			}, false, nil
 		}
 	}
 
 	nextCursor, err := currentCursorTx(tx, documentID)
 	if err != nil {
-		return RestoreResult{}, err
+		return RestoreResult{}, false, err
 	}
 	nextCursor++
 	if _, err := tx.Exec(
 		`INSERT INTO changes (document_id, cursor, id, device_id, payload) VALUES (?, ?, ?, ?, ?)`,
 		documentID, nextCursor, changeID, deviceID, state,
 	); err != nil {
-		return RestoreResult{}, err
+		return RestoreResult{}, false, err
 	}
 	if _, err := tx.Exec(
 		`INSERT INTO restores (document_id, change_id, device_id, snapshot_cursor, change_cursor, state)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		documentID, changeID, deviceID, snapshotCursor, nextCursor, state,
 	); err != nil {
-		return RestoreResult{}, err
+		return RestoreResult{}, false, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return RestoreResult{}, err
-	}
-	s.notifyWaiters(documentID)
 	return RestoreResult{
 		ID:           changeID,
 		Created:      true,
 		Cursor:       nextCursor,
 		RestoredFrom: snapshotCursor,
-	}, nil
+	}, true, nil
 }

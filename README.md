@@ -233,6 +233,28 @@ go test ./...
 - 判定顺序固定为请求形状与参数、会话存在性、文档权限，前序失败优先返回：`from`/`to` 不是十进制非负整数、终点小于起点、`sessionId`/`documentId` 为空、路径段缺失或多余、方法不是 `GET` 均返回 `400` JSON 错误且零写入，不重定向也不输出 HTML；会话不存在或已删除返回 `404` JSON 错误，会话所属设备对该文档的权限被撤回返回 `403` JSON 错误，两类失败都不返回任何快照内容，也不留下任何记录。
 - 快照同步落盘，进程重启后同一区间的导出正文逐字不变。文档级快照导出、创建、单个读取与恢复的既有语义不变。
 
+### `POST /v1/sessions/{sessionId}/documents/{documentId}/restore`
+
+会话视角的历史恢复：客户端用**已存在的会话身份**把某个快照的历史 state 作为一次普通变更追加回当前文档，入口挂在会话文档资源下再加 `restore` 子段。与会话批量提交共用同一套身份判定：会话所属设备即为调用设备（来源取自会话归属，请求里误带的 `deviceId` 等多余字段一律忽略，不引入新认证）。仅接受 `Content-Type: application/json`。请求体只带变更标识和快照游标：
+
+```json
+{"changeId": "change-9", "snapshotCursor": 2}
+```
+
+行为与文档级恢复逐字同口径：
+
+- `sessionId`、`documentId` 均为非空字符串；`changeId` 为非空字符串；`snapshotCursor` 为正整数（拒绝小数、字符串、布尔、`null`、零或缺失）。
+- 成功返回 `200`：`{"id":changeId,"created":true,"cursor":N,"restoredFrom":snapshotCursor}`，字段口径沿用文档级恢复。
+- 命中快照后在单个序列化事务内把该快照的 `state` 作为 payload、以会话设备和 `changeId` 追加一条普通 change；历史记录不变，文档 cursor 加一。
+- 同一文档同一 `changeId` 仅当来源设备、`snapshotCursor` 与来源 state 都相同时才算幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入。会话路径与文档级恢复共享同一份恢复来源记录，两个入口的幂等与冲突判定完全一致。
+- 类型头不符、请求体不是合法 JSON、带尾随内容、`changeId` 缺失或为空、字段类型错误、`snapshotCursor` 不是正整数，均返回 `400` JSON 错误且零写入。
+- `snapshotCursor` 未命中该文档的快照时返回 `404` JSON 错误且零写入，未知文档同样按未命中处理。
+- 判定顺序固定为请求形状、会话存在性、文档权限，前序失败优先：会话不存在或已删除返回 `404` JSON 错误，会话所属设备对该文档的权限被撤回返回 `403` JSON 错误，两类失败都不暴露快照或变更内容且零写入；权限判定与快照查询都在写入事务内完成。
+- 段缺失、空标识、路径段多余（尾斜杠、额外段，如挂在 `changes` 集合下的 `.../changes/restore`）或方法不匹配（非 POST）一律返回 `400` JSON 错误，不重定向也不输出 HTML；取名 `restore` 的会话或文档标识按普通标识处理，关键字只在端点段位置才被当作端点词。
+- 恢复在序列化事务内原子提交，与普通提交、会话批量提交、离线重放和合并共享同一连续游标空间；并发请求要么整体生效要么整体缺席，不会重复分配游标也不留下半批数据。恢复来源随数据落盘，重启后幂等与冲突判定、来源 state 都保持一致。
+- 携带新变更的恢复事务提交后立即唤醒长轮询并推送给订阅方；幂等重复提交不分配新游标，不唤醒长轮询也不产生任何推送。订阅建立后权限被撤回以 **4403** 结束、终止信号以 **1001** 结束的既有语义不变。
+- 文档级恢复、快照导出与读取、变更提交、重放与合并等既有入口的行为不变。
+
 ### `POST /v1/documents/{documentID}/permissions`
 
 按文档和设备持久化访问权限。仅接受 `Content-Type: application/json`。请求体：
@@ -740,4 +762,4 @@ Sec-WebSocket-Version: 13
 
 ### 路径中的空标识
 
-`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//changes/compact`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/documents//crdt/compact`、`/v1/documents//crdt/snapshot`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/poll`、`/v1/sessions/{id}/documents//changes/poll`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe`、`/v1/sessions//documents/{id}/crdt/ops`、`/v1/sessions/{id}/documents//crdt/ops`、`/v1/sessions//documents/{id}/snapshots`、`/v1/sessions/{id}/documents//snapshots` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/压缩/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/changes/compact/`、`/v1/documents/{id}/changes/compact/x`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/documents/{id}/crdt/compact/x`、`/v1/documents/{id}/crdt/snapshot/`、`/v1/sessions/{id}/documents/{id}/changes/poll/`、`/v1/sessions/{id}/documents/{id}/changes/poll/extra`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`、`/v1/sessions/{id}/documents/{id}/crdt/ops/extra`、`/v1/sessions/{id}/documents/{id}/changes/extra`、`/v1/sessions/{id}/documents/{id}/snapshots/`、`/v1/sessions/{id}/documents/{id}/snapshots/1`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`compact`、`subscribe`、`state`、`snapshot`、`snapshots`、`ops` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、快照导出、CRDT 状态读取与订阅行为与其它标识完全一致。设备注销同样只在精确路径 `DELETE /v1/devices/{deviceId}` 上成立：`DELETE /v1/devices/`（空标识）、`/v1/devices/{id}/`、缺段（`DELETE /v1/devices`）或多段（`/v1/devices/{id}/x`）以及在该路径上使用 GET/POST/PUT/PATCH 等其它方法，均返回 `400` JSON 错误，不重定向也不输出 HTML。非空路径的语义保持不变。
+`/v1/documents//changes`、`/v1/documents//merge`、`/v1/documents//changes/poll`、`/v1/documents//changes/compact`、`/v1/documents//replay`、`/v1/documents//crdt/ops`、`/v1/documents//crdt/state`、`/v1/documents//crdt/compact`、`/v1/documents//crdt/snapshot`、`/v1/devices//sessions`、`/v1/devices/{id}/sessions/`、`/v1/sessions//documents/{id}/changes`、`/v1/sessions/{id}/documents//changes`、`/v1/sessions//documents/{id}/changes/poll`、`/v1/sessions/{id}/documents//changes/poll`、`/v1/sessions//documents/{id}/changes/subscribe`、`/v1/sessions//documents/{id}/crdt/state`、`/v1/sessions/{id}/documents//crdt/state`、`/v1/sessions//documents/{id}/crdt/state/subscribe`、`/v1/sessions//documents/{id}/crdt/ops`、`/v1/sessions/{id}/documents//crdt/ops`、`/v1/sessions//documents/{id}/snapshots`、`/v1/sessions/{id}/documents//snapshots`、`/v1/sessions//documents/{id}/changes/merge`、`/v1/sessions/{id}/documents//changes/merge`、`/v1/sessions//documents/{id}/restore`、`/v1/sessions/{id}/documents//restore` 等任一标识段为空（连续斜杠或以斜杠结尾）的请求返回 `400` JSON 错误（`{"error": "..."}`），而不是重定向或 `404` HTML 页面；新长轮询/重放/压缩/CRDT/订阅端点的路径段缺失或多余（如 `/v1/documents/{id}/changes/poll/`、`/v1/documents/{id}/changes/compact/`、`/v1/documents/{id}/changes/compact/x`、`/v1/documents/{id}/replay/x`、`/v1/documents/{id}/crdt/`、`/v1/documents/{id}/crdt/ops/x`、`/v1/documents/{id}/crdt/compact/x`、`/v1/documents/{id}/crdt/snapshot/`、`/v1/sessions/{id}/documents/{id}/changes/poll/`、`/v1/sessions/{id}/documents/{id}/changes/poll/extra`、`/v1/sessions/{id}/documents/{id}/changes/subscribe/extra`、`/v1/sessions/{id}/documents/{id}/crdt/state/extra`、`/v1/sessions/{id}/documents/{id}/crdt/ops/extra`、`/v1/sessions/{id}/documents/{id}/changes/extra`、`/v1/sessions/{id}/documents/{id}/snapshots/`、`/v1/sessions/{id}/documents/{id}/snapshots/1`、`/v1/sessions/{id}/documents/{id}/changes/merge/`、`/v1/sessions/{id}/documents/{id}/changes/merge/extra`、`/v1/sessions/{id}/documents/{id}/restore/`、`/v1/sessions/{id}/documents/{id}/restore/extra`、`/v1/sessions/{id}/documents/{id}/changes/restore`）以及方法不匹配同样返回 `400` JSON 错误。名为 `crdt`、`poll`、`replay`、`compact`、`subscribe`、`state`、`snapshot`、`snapshots`、`ops`、`merge`、`restore` 的文档/会话标识仍按普通标识处理（关键字只在端点自身的段位置才被识别），其既有变更读取、快照导出、CRDT 状态读取与订阅行为与其它标识完全一致。设备注销同样只在精确路径 `DELETE /v1/devices/{deviceId}` 上成立：`DELETE /v1/devices/`（空标识）、`/v1/devices/{id}/`、缺段（`DELETE /v1/devices`）或多段（`/v1/devices/{id}/x`）以及在该路径上使用 GET/POST/PUT/PATCH 等其它方法，均返回 `400` JSON 错误，不重定向也不输出 HTML。非空路径的语义保持不变。
