@@ -247,6 +247,16 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleSubscribe(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionPollChanges(s, w, r)
+	})
+	// Non-GET verbs on the session long-poll path: the exact GET pattern above
+	// is more specific, so only other verbs reach this method-less pattern and
+	// get a JSON 400 instead of the subtree's unknown-path JSON 404. The poll
+	// is a read-only wait entry: GET, no request body.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionExportSnapshots(s, w, r)
 	})
@@ -441,7 +451,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionSnapshotsPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionSnapshotsPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1296,6 +1306,36 @@ func writeChangesPage(w http.ResponseWriter, changes []events.ListedChange, next
 	})
 }
 
+// parsePollWaitMs parses the long-poll waitMs query parameter, writing the
+// documented 400 on an illegal value. It accepts an integer in 0..30000
+// milliseconds and defaults to 0 when the parameter is absent; a value outside
+// the range, a fraction, an exponent or any non-numeric value is rejected. It
+// is shared by the document-scoped and session-scoped long polls so their wait
+// semantics cannot drift apart.
+func parsePollWaitMs(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	var waitMs int64
+	if raw := r.URL.Query().Get("waitMs"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 || v > maxPollWaitMillis {
+			writeError(w, http.StatusBadRequest, "waitMs must be an integer between 0 and 30000")
+			return 0, false
+		}
+		waitMs = v
+	}
+	return waitMs, true
+}
+
+// writePollPage renders a long-poll result in the shared response shape: the
+// ordinary page plus a timedOut flag, with the top-level keys in the fixed
+// changes, nextCursor, timedOut order.
+func writePollPage(w http.ResponseWriter, changes []events.ListedChange, nextCursor int64, timedOut bool) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"changes":    changes,
+		"nextCursor": nextCursor,
+		"timedOut":   timedOut,
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -1323,15 +1363,9 @@ func handlePollChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	q := r.URL.Query()
-	var waitMs int64
-	if raw := q.Get("waitMs"); raw != "" {
-		v, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || v < 0 || v > maxPollWaitMillis {
-			writeError(w, http.StatusBadRequest, "waitMs must be an integer between 0 and 30000")
-			return
-		}
-		waitMs = v
+	waitMs, ok := parsePollWaitMs(w, r)
+	if !ok {
+		return
 	}
 
 	changes, nextCursor, timedOut, err := s.WaitForChanges(
@@ -1350,11 +1384,85 @@ func handlePollChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"changes":    changes,
-		"nextCursor": nextCursor,
-		"timedOut":   timedOut,
-	})
+	writePollPage(w, changes, nextCursor, timedOut)
+}
+
+// handleSessionPollChanges is the session-scoped long-poll continuation over
+// the same change collection the session reads page:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/changes/poll
+//
+// The request is a GET with no body; the calling device is the session's
+// owning device resolved with the same identity rule as the session reads,
+// exports, commits and subscriptions. Query parameters and the success body are
+// identical to GET /v1/documents/{documentID}/changes/poll — after (default 0),
+// limit (default 100, 1..1000) and waitMs (default 0, 0..30000), answered with
+// changes, nextCursor and timedOut in that order, rows ascending by cursor.
+//
+// Rows already past after return immediately with timedOut=false; a known
+// document caught up to after parks until the first commit through any write
+// path (session batch commit, document commit, merge, restore, replay) or the
+// wait deadline; an unknown document returns an empty page with cursor 0 at
+// once and never parks. A deadline expiry returns the empty page, echoes the
+// caller's after and sets timedOut=true without advancing the cursor. Checks
+// run in the fixed order request shape and parameters (400), session
+// existence (404), document permission (403); a rejected request exposes no
+// change content. A client disconnect simply cancels the wait and writes
+// nothing; while the service is shutting down the parked request answers a
+// JSON 503.
+func handleSessionPollChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	// Parameter shape precedes the session lookup, matching the session paged
+	// read's ordering: a malformed after/limit/waitMs against an unknown
+	// session is still a 400.
+	after, limit, ok := parseChangesQuery(w, r)
+	if !ok {
+		return
+	}
+	waitMs, ok := parsePollWaitMs(w, r)
+	if !ok {
+		return
+	}
+
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return
+	}
+
+	changes, nextCursor, timedOut, err := s.WaitForChanges(
+		r.Context(), documentID, after, limit, time.Duration(waitMs)*time.Millisecond,
+	)
+	switch {
+	case errors.Is(err, events.ErrStoreClosing):
+		writeError(w, http.StatusServiceUnavailable, "service is shutting down")
+		return
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The client went away (or, with waitMs bounded, its deadline lapsed
+		// at the transport): nothing more to write and nothing was stored.
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "failed to poll changes")
+		return
+	}
+
+	writePollPage(w, changes, nextCursor, timedOut)
 }
 
 // handleReplay retries an offline batch against the existing change log. The
