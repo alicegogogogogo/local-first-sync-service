@@ -2,10 +2,13 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
 // snapshotExportItem is one element of an export body. The struct field order
@@ -39,29 +42,8 @@ type snapshotExportResponse struct {
 func handleExportSnapshots(s *app.App, w http.ResponseWriter, r *http.Request) {
 	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
 
-	q := r.URL.Query()
-
-	from := int64(0)
-	if raw := q.Get("from"); raw != "" {
-		v, ok := parseCursorPath(raw)
-		if !ok {
-			writeError(w, http.StatusBadRequest, "from must be a non-negative integer")
-			return
-		}
-		from = v
-	}
-
-	var to *int64
-	if raw := q.Get("to"); raw != "" {
-		v, ok := parseCursorPath(raw)
-		if !ok {
-			writeError(w, http.StatusBadRequest, "to must be a non-negative integer")
-			return
-		}
-		to = &v
-	}
-	if to != nil && *to < from {
-		writeError(w, http.StatusBadRequest, "to must not be less than from")
+	from, to, ok := parseExportInterval(w, r.URL.Query())
+	if !ok {
 		return
 	}
 
@@ -70,12 +52,73 @@ func handleExportSnapshots(s *app.App, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to export snapshots")
 		return
 	}
+	writeSnapshotExport(w, snaps)
+}
 
+// writeSnapshotExport renders an export result in the shared response shape: a
+// single compact JSON line with the snapshots,count key order, each item
+// keyed cursor,state, an empty export serializing as [] with count 0. It is
+// shared by the document-scoped and session-scoped exports so their bodies
+// cannot drift apart.
+func writeSnapshotExport(w http.ResponseWriter, snaps []events.ExportedSnapshot) {
 	items := make([]snapshotExportItem, 0, len(snaps))
 	for _, snap := range snaps {
 		items = append(items, snapshotExportItem{Cursor: snap.Cursor, State: snap.State})
 	}
 	writeJSON(w, http.StatusOK, snapshotExportResponse{Snapshots: items, Count: len(items)})
+}
+
+// handleSessionExportSnapshots is the session-scoped view of the snapshot
+// batch export, over the session document-read prefix with the resource
+// segment swapped to the snapshot collection:
+//
+//	GET /v1/sessions/{sessionId}/documents/{documentId}/snapshots?from=0&to=N
+//
+// The interval semantics and the response body are identical to the
+// document-level export; the path offers no other read form, so every GET is
+// the export (from/to absent means the default interval). Around the export
+// sit the session view's checks in their fixed order — request shape and
+// parameters (400), session existence (404), the session device's document
+// permission (403) — so a rejected export exposes no snapshot content and
+// writes nothing.
+func handleSessionExportSnapshots(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	// Malformed interval parameters are a request-shape error (400) checked
+	// before the resource lookup (404), matching the session change export's
+	// ordering.
+	from, to, ok := parseExportInterval(w, r.URL.Query())
+	if !ok {
+		return
+	}
+
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return
+	}
+
+	snaps, err := s.ExportSnapshots(documentID, from, to)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to export snapshots")
+		return
+	}
+	writeSnapshotExport(w, snaps)
 }
 
 // malformedSnapshotPath reports whether p targets the snapshot namespace but
@@ -110,4 +153,38 @@ func malformedSnapshotPath(p string) bool {
 		return !(collection || item)
 	}
 	return false
+}
+
+// malformedSessionSnapshotsPath reports whether p targets the session-scoped
+// snapshot collection's shape but is not the collection's exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/snapshots): extra path
+// segments past the collection (the session view has no single-snapshot
+// item, so a trailing cursor segment is malformed too). ServeMux would answer
+// those with a plain-text 404; the snapshot surface promises a JSON 400 and
+// never a redirect. Empty segments (doubled slashes, a trailing slash) are
+// already rejected by the guard itself.
+//
+// "snapshots" is treated as the collection keyword only in the fourth
+// segment, right after the document identifier; a session or document
+// identifier literally named "snapshots" occupies an identifier position and
+// keeps its ordinary routes.
+func malformedSessionSnapshotsPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	// The CRDT namespace ("crdt" immediately past the document identifier)
+	// has its own guard; "snapshots" there is an ordinary identifier, not
+	// this collection's keyword.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "snapshots" {
+		return false
+	}
+	// Keyword position reached. The collection is exactly
+	// {sessionId}/documents/{documentId}/snapshots; anything past it is a
+	// malformed 400.
+	return !(len(segs) == 4 && segs[0] != "" && segs[2] != "")
 }

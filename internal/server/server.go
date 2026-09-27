@@ -240,6 +240,17 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleSubscribe(s, w, r)
 	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionExportSnapshots(s, w, r)
+	})
+	// Non-GET verbs on the session snapshot collection path: the exact GET
+	// pattern above is more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of the subtree's
+	// unknown-path JSON 404. The collection is read-only — the interval
+	// export is its only read form.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCRDTState(s, w, r)
 	})
@@ -417,7 +428,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionSnapshotsPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
