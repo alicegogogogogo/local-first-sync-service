@@ -136,6 +136,14 @@ func (a *App) ReplayChanges(documentID string, changes []events.Change) ([]event
 	return a.events.ReplayChanges(documentID, changes)
 }
 
+// PostSessionChanges commits a batch whose device identity was resolved from
+// a session by the HTTP layer, delegating to the change event service's
+// gated commit: the registration/permission verdict is taken inside the same
+// serialized transaction as the write, so a revoked device commits nothing.
+func (a *App) PostSessionChanges(documentID string, changes []events.Change) ([]events.Result, error) {
+	return a.events.CommitAuthorized(documentID, changes)
+}
+
 // MergeChange delegates to the change event service.
 func (a *App) MergeChange(documentID string, baseCursor int64, c events.Change) (events.MergeResult, error) {
 	return a.events.MergeChange(documentID, baseCursor, c)

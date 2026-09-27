@@ -90,12 +90,21 @@ func (s *Service) PostChanges(documentID string, changes []Change) ([]Result, er
 }
 
 // ReplayChanges commits a retried offline batch with exactly the same change
-// semantics as PostChanges, but enforces the gate (registration then
-// permission) first in the same transaction: an unregistered device yields
-// store.ErrDeviceNotFound (404) and a revoked device yields
-// ErrPermissionDenied (403). None of those outcomes writes anything or
-// exposes change content.
+// semantics as PostChanges. It is the document-level replay entry of
+// CommitAuthorized: the device id travels in the request body there.
 func (s *Service) ReplayChanges(documentID string, changes []Change) ([]Result, error) {
+	return s.CommitAuthorized(documentID, changes)
+}
+
+// CommitAuthorized validates and commits one batch atomically with exactly the
+// same change semantics as PostChanges, but enforces the gate (registration
+// then permission) first in the same transaction: an unregistered device
+// yields store.ErrDeviceNotFound and a revoked device yields
+// ErrPermissionDenied. None of those outcomes writes anything or exposes
+// change content. It is shared by the offline replay and the session-scoped
+// commit, whose device identity is resolved from the session before the
+// call.
+func (s *Service) CommitAuthorized(documentID string, changes []Change) ([]Result, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err

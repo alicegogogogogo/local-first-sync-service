@@ -74,6 +74,10 @@ type sessionRequest struct {
 	SessionID string `json:"sessionId"`
 }
 
+type sessionPostRequest struct {
+	Changes []changeIn `json:"changes"`
+}
+
 type replayRequest struct {
 	DeviceID   string     `json:"deviceId"`
 	Operations []changeIn `json:"operations"`
@@ -229,11 +233,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
-	// Non-GET verbs on the session change collection path: the exact GET
-	// pattern above is more specific, so only other verbs reach this
-	// method-less pattern and get a JSON 400 instead of the subtree's
-	// unknown-path JSON 404. The collection is read-only — the paged read and
-	// the interval export share its exact GET path.
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionPostChanges(s, w, r)
+	})
+	// Verbs other than GET/POST on the session change collection path: the
+	// exact GET and POST patterns above are more specific, so only other
+	// verbs reach this method-less pattern and get a JSON 400 instead of the
+	// subtree's unknown-path JSON 404. The paged read and the interval export
+	// share the GET pattern's exact path; the batch commit owns POST.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
@@ -1150,6 +1157,94 @@ func handleSessionChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeChangesPage(w, changes, nextCursor)
+}
+
+// handleSessionPostChanges is the session-scoped batch commit over the same
+// change collection the session reads page:
+//
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/changes
+//
+// The request body carries only the changes array — the calling device is the
+// session's owning device, resolved with the same identity rule as the
+// session reads, exports and subscriptions; no new credential is introduced
+// and no device id travels in the body. Per-element semantics and the success
+// body are byte-identical to the document-level commit: results arrive in
+// request order, each naming its id, whether it was created and the cursor it
+// was assigned. The checks run in the fixed order request shape (400),
+// session existence (404), document permission (403) — the permission verdict
+// is taken inside the commit transaction, so a revoked device writes nothing —
+// and a payload/device mismatch against an existing id is a 409 reporting the
+// conflicting id. Every rejection leaves the log untouched.
+func handleSessionPostChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	var req sessionPostRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if len(req.Changes) == 0 {
+		writeError(w, http.StatusBadRequest, "changes must be a non-empty array")
+		return
+	}
+
+	changes := make([]events.Change, len(req.Changes))
+	seen := make(map[string]struct{}, len(req.Changes))
+	for i, c := range req.Changes {
+		if c.ID == "" {
+			writeError(w, http.StatusBadRequest, "each change must have a non-empty string id")
+			return
+		}
+		if len(c.Payload) == 0 {
+			writeError(w, http.StatusBadRequest, "each change must carry a JSON payload")
+			return
+		}
+		if _, dup := seen[c.ID]; dup {
+			writeError(w, http.StatusBadRequest, "duplicate change id within batch: "+c.ID)
+			return
+		}
+		seen[c.ID] = struct{}{}
+		changes[i] = events.Change{ID: c.ID, Payload: c.Payload}
+	}
+
+	// Request shape is settled; only now does the session lookup run, so a
+	// malformed batch against an unknown session is still a 400.
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+	for i := range changes {
+		changes[i].DeviceID = deviceID
+	}
+
+	results, err := s.PostSessionChanges(documentID, changes)
+	if err != nil {
+		var conflict *events.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			// The session's device was deregistered between the lookup and
+			// the commit; its cascade removed the session too, so the
+			// identity the caller used no longer exists.
+			writeError(w, http.StatusNotFound, "session not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.As(err, &conflict):
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "change id already exists with different deviceId or payload",
+				"conflictId": conflict.ID,
+			})
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to commit changes")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
 // parseChangesQuery parses the shared after/limit pagination parameters,
