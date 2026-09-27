@@ -607,6 +607,26 @@ func TestSessionPostChangesHTTPDocumentPostUnchanged(t *testing.T) {
 	}
 }
 
+// An extra deviceId field in the body is ignored: the calling device is
+// always the session's owning device, never a body field.
+func TestSessionPostChangesHTTPExtraDeviceFieldIgnored(t *testing.T) {
+	h, _ := newTestHandler(t)
+	createSessionViaHTTP(t, h, "dev", "sess")
+
+	w, _ := postSessionChanges(t, h, "sess", "doc1", map[string]any{
+		"deviceId": "intruder",
+		"changes":  []any{map[string]any{"id": "a", "payload": 1}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	_, list := doRequest(t, h, http.MethodGet, "/v1/documents/doc1/changes")
+	row := list["changes"].([]any)[0].(map[string]any)
+	if row["deviceId"] != "dev" {
+		t.Fatalf("stored device = %v, want the session device dev", row["deviceId"])
+	}
+}
+
 // The session commit's success body is byte-identical to the document-level
 // commit's for the same batch.
 func TestSessionPostChangesHTTPSuccessShapeMatchesDocumentPost(t *testing.T) {
