@@ -312,16 +312,23 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCRDTOps(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/compact", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionCRDTCompact(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTStateSubscribe(s, w, r)
 	})
 	// Non-GET verbs on the session CRDT state path and non-POST verbs on the
-	// session CRDT ops path get a JSON 400 rather than ServeMux's plain-text
-	// 405: the state read is GET-only and the batch commit is POST-only.
+	// session CRDT ops and compaction paths get a JSON 400 rather than
+	// ServeMux's plain-text 405: the state read is GET-only and the batch
+	// commit and compaction are POST-only.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/ops", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/compact", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
@@ -615,17 +622,18 @@ func malformedSubscribePath(p string) bool {
 }
 
 // malformedSessionCRDTPath reports whether p targets the session-scoped CRDT
-// namespace but is not at one of its three exact locations:
+// namespace but is not at one of its four exact locations:
 //
 //	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops
 //	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/compact
 //	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
 //
-// a missing "ops"/"state"/"subscribe" segment, an extra segment, or a "crdt"
-// segment in the keyword position (immediately past the document identifier)
-// short of one of the registered shapes. ServeMux would answer those with a
-// plain-text 404/405; every failure of these endpoints must be a JSON 400
-// instead. Empty segments are already rejected by the guard itself.
+// a missing "ops"/"state"/"compact"/"subscribe" segment, an extra segment, or
+// a "crdt" segment in the keyword position (immediately past the document
+// identifier) short of one of the registered shapes. ServeMux would answer
+// those with a plain-text 404/405; every failure of these endpoints must be a
+// JSON 400 instead. Empty segments are already rejected by the guard itself.
 //
 // "crdt" is treated as the endpoint keyword only in the fourth segment (index
 // 3, right after the document identifier); a session or document identifier
@@ -640,8 +648,9 @@ func malformedSessionCRDTPath(p string) bool {
 	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "crdt" {
 		return false
 	}
-	// Keyword position reached. The batch commit and the state read are both
-	// exactly {sessionId}/documents/{documentId}/crdt/{ops,state}; the
+	// Keyword position reached. The batch commit, the state read and the
+	// compaction are all exactly
+	// {sessionId}/documents/{documentId}/crdt/{ops,state,compact}; the
 	// subscription adds one trailing "subscribe" segment.
 	validOps := len(segs) == 5 &&
 		segs[0] != "" &&
@@ -651,12 +660,16 @@ func malformedSessionCRDTPath(p string) bool {
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state"
+	validCompact := len(segs) == 5 &&
+		segs[0] != "" &&
+		segs[2] != "" &&
+		segs[4] == "compact"
 	validSubscribe := len(segs) == 6 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state" &&
 		segs[5] == "subscribe"
-	return !(validOps || validState || validSubscribe)
+	return !(validOps || validState || validCompact || validSubscribe)
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use

@@ -313,6 +313,17 @@ func (a *App) CompactCRDT(documentID, deviceID string) (crdt.Snapshot, error) {
 	return a.crdt.Compact(documentID, deviceID)
 }
 
+// CompactSessionCRDT compacts a document's CRDT state layer for a caller whose
+// device identity was resolved from a session by the HTTP layer, delegating to
+// the CRDT state service's gated compaction: the registration/permission
+// verdict is taken inside the same serialized transaction as the trim, so a
+// revoked device trims nothing and a rejected request observes no state
+// content. It is the session counterpart to CompactCRDT; the trimming rule,
+// retained identities and persistence semantics are identical.
+func (a *App) CompactSessionCRDT(documentID, deviceID string) (crdt.Snapshot, error) {
+	return a.crdt.Compact(documentID, deviceID)
+}
+
 // GetCRDTSnapshot delegates to the CRDT state service.
 func (a *App) GetCRDTSnapshot(documentID string) (crdt.Snapshot, error) {
 	return a.crdt.GetSnapshot(documentID)
