@@ -50,6 +50,16 @@ type mergeRequest struct {
 	Change     *mergeChangeIn  `json:"change"`
 }
 
+// sessionMergeRequest is the session-scoped merge body: only the base cursor
+// and the single change travel in the request. The calling device is the
+// session's owning device resolved from the path, so a stray deviceId is
+// decoded and ignored like every other unknown field, exactly as on the
+// session batch commit and replay.
+type sessionMergeRequest struct {
+	BaseCursor json.RawMessage `json:"baseCursor"`
+	Change     *mergeChangeIn  `json:"change"`
+}
+
 type snapshotPostRequest struct {
 	Cursor json.RawMessage `json:"cursor"`
 	State  json.RawMessage `json:"state"`
@@ -261,15 +271,22 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/replay", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionReplay(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionMerge(s, w, r)
+	})
 	// Non-GET verbs on the session long-poll path and non-POST verbs on the
 	// session replay path: the exact GET/POST patterns above are more specific,
 	// so only other verbs reach these method-less patterns and get a JSON 400
 	// instead of the subtree's unknown-path JSON 404. The poll is a read-only
-	// wait entry (GET, no body); the replay is a batch commit (POST).
+	// wait entry (GET, no body); the replay and merge entries are batch commits
+	// (POST).
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/replay", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, r *http.Request) {
@@ -466,7 +483,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionSnapshotsPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionSnapshotsPath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1377,6 +1394,99 @@ func handleSessionReplay(s *app.App, w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+// handleSessionMerge is the session-scoped single-change merge entry, the
+// session view's counterpart to POST /v1/documents/{documentID}/merge,
+// mounted one segment below the change collection:
+//
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/changes/merge
+//
+// The body carries only the base cursor and the one change (a non-empty id
+// and a JSON object payload); the calling device is the session's owning
+// device resolved from the path with the same identity rule as the session
+// reads, exports, commits, replays, polls and subscriptions — no new
+// credential is introduced, and a stray deviceId in the body is ignored like
+// any other unknown field. The success body and the three outcomes
+// (idempotent with the original result, applied, merged) are byte-identical
+// to the document-level merge. The checks run in the fixed order request
+// shape (400), session existence (404), document permission (403) — the
+// permission verdict is taken inside the merge transaction, so a revoked
+// device writes nothing — and a payload/source mismatch, a top-level key
+// collision or a non-object payload after the base cursor is a 409. Every
+// rejection leaves the log untouched.
+func handleSessionMerge(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	var req sessionMergeRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	// baseCursor must be present and a non-negative integer (no fractions,
+	// strings, booleans or null).
+	if len(req.BaseCursor) == 0 {
+		writeError(w, http.StatusBadRequest, "baseCursor must be a non-negative integer")
+		return
+	}
+	baseCursor, ok := parseNonNegativeInt(req.BaseCursor)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "baseCursor must be a non-negative integer")
+		return
+	}
+	if req.Change == nil {
+		writeError(w, http.StatusBadRequest, "change must be an object")
+		return
+	}
+	if req.Change.ID == "" {
+		writeError(w, http.StatusBadRequest, "change.id must be a non-empty string")
+		return
+	}
+	if len(req.Change.Payload) == 0 || !isJSONObject(req.Change.Payload) {
+		writeError(w, http.StatusBadRequest, "change.payload must be a JSON object")
+		return
+	}
+
+	// Request shape is settled; only now does the session lookup run, so a
+	// malformed merge against an unknown session is still a 400.
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+
+	result, err := s.MergeSessionChange(documentID, baseCursor, events.Change{
+		ID:       req.Change.ID,
+		DeviceID: deviceID,
+		Payload:  req.Change.Payload,
+	})
+	if err != nil {
+		var conflict *events.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			// The session's device was deregistered between the lookup and the
+			// merge; its cascade removed the session too, so the identity the
+			// caller used no longer exists.
+			writeError(w, http.StatusNotFound, "session not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.Is(err, events.ErrStaleCursor):
+			writeError(w, http.StatusBadRequest, "baseCursor is unknown or greater than the current cursor")
+		case errors.Is(err, events.ErrCompactedBase):
+			writeError(w, http.StatusBadRequest, "baseCursor is below the compaction boundary")
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, "merge conflicts with existing changes: "+conflict.ID)
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to merge change")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }
 
 // parseChangesQuery parses the shared after/limit pagination parameters,

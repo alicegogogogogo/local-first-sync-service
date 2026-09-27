@@ -233,11 +233,39 @@ func appendPending(tx *sql.Tx, documentID string, changes []Change, pending []in
 // completed. An unknown document with baseCursor 0 accepts the first change as
 // "applied".
 func (s *Service) MergeChange(documentID string, baseCursor int64, c Change) (MergeResult, error) {
+	return s.mergeChange(documentID, baseCursor, c, false)
+}
+
+// MergeChangeAuthorized is MergeChange with the registration/permission gate
+// enforced first in the same serialized transaction: an unregistered device
+// yields store.ErrDeviceNotFound and a revoked device yields
+// store.ErrPermissionDenied, both before any change id or payload is read, so
+// neither outcome writes anything or exposes change content. It is the
+// session-scoped merge's commit path: the device identity is resolved from the
+// session before the call, exactly as the session batch commit and replay do.
+func (s *Service) MergeChangeAuthorized(documentID string, baseCursor int64, c Change) (MergeResult, error) {
+	return s.mergeChange(documentID, baseCursor, c, true)
+}
+
+// mergeChange runs the merge in one serialized transaction, optionally taking
+// the gate verdict in that same transaction first. The merge rules and the
+// notification after a committing append are shared verbatim by the
+// document-level and session-scoped entries, so the two paths cannot drift.
+func (s *Service) mergeChange(documentID string, baseCursor int64, c Change, gated bool) (MergeResult, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return MergeResult{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Gate first, exactly like CommitAuthorized: the device row and the
+	// permission row are read before the cursor or any change id, so a
+	// rejected merge cannot reveal change content.
+	if gated && s.gate != nil {
+		if err := s.gate.DeviceAuthorizedTx(tx, documentID, c.DeviceID); err != nil {
+			return MergeResult{}, err
+		}
+	}
 
 	// Current cursor is the document's high-water mark (0 when unknown); it
 	// never drops below the compaction boundary.

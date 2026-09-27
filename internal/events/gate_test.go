@@ -129,3 +129,70 @@ func TestServiceStandaloneReplayIdempotent(t *testing.T) {
 		t.Fatalf("idempotent results = %+v", results)
 	}
 }
+
+// A gate denial (unregistered device) rejects the gated merge with 404
+// semantics and writes nothing, even though the id is new.
+func TestServiceStandaloneMergeGateNotFound(t *testing.T) {
+	kernel, _ := store.Open("")
+	defer func() { _ = kernel.Close() }()
+	svc, _ := events.New(kernel, fakeGate{err: store.ErrDeviceNotFound})
+
+	_, err := svc.MergeChangeAuthorized("doc", 0, events.Change{
+		ID: "c1", DeviceID: "ghost", Payload: []byte(`{"n":1}`),
+	})
+	if !errors.Is(err, store.ErrDeviceNotFound) {
+		t.Fatalf("merge err = %v, want ErrDeviceNotFound", err)
+	}
+	if ok, _ := svc.DocumentExists("doc"); ok {
+		t.Fatal("rejected merge wrote change content")
+	}
+}
+
+// A revoked gate rejects the gated merge with 403 semantics and writes
+// nothing.
+func TestServiceStandaloneMergeGateRevoked(t *testing.T) {
+	kernel, _ := store.Open("")
+	defer func() { _ = kernel.Close() }()
+	svc, _ := events.New(kernel, fakeGate{err: store.ErrPermissionDenied})
+
+	_, err := svc.MergeChangeAuthorized("doc", 0, events.Change{
+		ID: "c1", DeviceID: "dev", Payload: []byte(`{"n":1}`),
+	})
+	if !errors.Is(err, store.ErrPermissionDenied) {
+		t.Fatalf("merge err = %v, want ErrPermissionDenied", err)
+	}
+	if ok, _ := svc.DocumentExists("doc"); ok {
+		t.Fatal("rejected merge wrote change content")
+	}
+}
+
+// The gated merge through an allowing gate appends like the ungated one and
+// reports the merge outcome; the gate is consulted before any change id.
+func TestServiceStandaloneMergeAuthorizedApplies(t *testing.T) {
+	kernel, _ := store.Open("")
+	defer func() { _ = kernel.Close() }()
+	svc, _ := events.New(kernel, fakeGate{})
+
+	r, err := svc.MergeChangeAuthorized("doc", 0, events.Change{
+		ID: "c1", DeviceID: "dev", Payload: []byte(`{"a":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Outcome != "applied" || r.Cursor != 1 || r.Result != nil {
+		t.Fatalf("applied = %+v", r)
+	}
+
+	// An existing id through the gated merge with matching device and payload
+	// is idempotent and carries the original result.
+	r, err = svc.MergeChangeAuthorized("doc", 1, events.Change{
+		ID: "c1", DeviceID: "dev", Payload: []byte(`{"a":1}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Outcome != "idempotent" || r.Cursor != 1 || r.Result == nil ||
+		r.Result.Created || r.Result.Cursor != 1 {
+		t.Fatalf("idempotent = %+v", r)
+	}
+}

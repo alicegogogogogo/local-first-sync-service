@@ -157,6 +157,16 @@ func (a *App) MergeChange(documentID string, baseCursor int64, c events.Change) 
 	return a.events.MergeChange(documentID, baseCursor, c)
 }
 
+// MergeSessionChange merges one change whose device identity was resolved from
+// a session by the HTTP layer, delegating to the change event service's gated
+// merge: the registration/permission verdict is taken inside the same
+// serialized transaction as the merge, so a revoked device writes nothing. It
+// is the session counterpart to MergeChange and follows the merge's same
+// three-outcome rules and contiguous cursor space.
+func (a *App) MergeSessionChange(documentID string, baseCursor int64, c events.Change) (events.MergeResult, error) {
+	return a.events.MergeChangeAuthorized(documentID, baseCursor, c)
+}
+
 // PutSnapshot delegates to the change event service.
 func (a *App) PutSnapshot(documentID string, cursor int64, state json.RawMessage) (bool, error) {
 	return a.events.PutSnapshot(documentID, cursor, state)
