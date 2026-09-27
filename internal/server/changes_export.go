@@ -156,13 +156,13 @@ func handleSessionExportChanges(s *app.App, w http.ResponseWriter, r *http.Reque
 // (/v1/documents/{documentID}/changes): a trailing slash (an empty trailing
 // segment) or extra path segments past the collection. The paged read and
 // this export share that exact collection path; its terminal subresources
-// (poll, compact, subscribe under the session family) have their own keyword
-// guards, so only a genuinely unrecognized suffix reaches this check.
-// ServeMux would answer it with a redirect or a plain-text 404/405; the
-// change surface promises a JSON error and never a redirect. Empty segments
-// are already rejected by the guard itself. The keyword is matched only past
-// the documentID position, so a document literally named "changes" keeps its
-// ordinary routes.
+// (poll, compact and the document-level push subscription) have their own
+// keyword guards/exact routes, so only a genuinely unrecognized suffix reaches
+// this check. ServeMux would answer it with a redirect or a plain-text
+// 404/405; the change surface promises a JSON error and never a redirect.
+// Empty segments are already rejected by the guard itself. The keyword is
+// matched only past the documentID position, so a document literally named
+// "changes" keeps its ordinary routes.
 func malformedChangeExportPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -174,12 +174,14 @@ func malformedChangeExportPath(p string) bool {
 			continue
 		}
 		// Keyword position reached. The collection is exactly
-		// {documentID}/changes; the poll and compact subresources are their own
-		// endpoints and keep their own guards. Anything else (a trailing slash,
-		// an unrecognized extra segment) is a malformed 400.
+		// {documentID}/changes; the long poll, the compaction and the
+		// document-level change subscription are each exactly one terminal
+		// segment. Anything else (a trailing slash, a fourth segment, an
+		// unrecognized word) is a malformed 400.
 		if i == 1 {
 			collection := len(segs) == 2 && segs[0] != ""
-			knownSubresource := len(segs) >= 3 && (segs[2] == "poll" || segs[2] == "compact")
+			knownSubresource := len(segs) == 3 && segs[0] != "" &&
+				(segs[2] == "poll" || segs[2] == "compact" || segs[2] == "subscribe")
 			return !(collection || knownSubresource)
 		}
 		return false

@@ -380,6 +380,17 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/changes/poll", func(w http.ResponseWriter, r *http.Request) {
 		handlePollChanges(s, w, r)
 	})
+	// The document-level change subscription (push-only WebSocket). The
+	// calling device declares itself via the deviceId query parameter; the
+	// handler enforces the cursor/handshake shape (400), device existence
+	// (404) and permission (403) order before the upgrade. Every other verb
+	// gets a JSON 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("GET /v1/documents/{documentID}/changes/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleDocumentSubscribe(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Non-GET verbs on the poll path: the exact GET pattern above is more
 	// specific, so only other verbs reach this method-less pattern and get a
 	// JSON 400 instead of ServeMux's plain-text 405.
@@ -453,6 +464,17 @@ func NewHandler(s *app.App) http.Handler {
 	})
 	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTState(s, w, r)
+	})
+	// The document-level CRDT state subscription (push-only WebSocket). The
+	// calling device declares itself via the deviceId query parameter; the
+	// handler enforces the handshake shape (400), device existence (404) and
+	// permission (403) order before the upgrade. Every other verb gets a JSON
+	// 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		handleDocumentCRDTStateSubscribe(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/state/subscribe", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/compact", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTCompact(s, w, r)

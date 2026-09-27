@@ -107,6 +107,128 @@ func parseSubscribeCursor(w http.ResponseWriter, r *http.Request) (int64, bool) 
 	return cursor, true
 }
 
+// resolveSubscribeDevice is the document-level subscription's identity stage:
+// the calling device is declared by the deviceId query parameter, with no new
+// authentication. The fixed validation order is handshake/parameter shape
+// (already checked by the caller, hence 400s never leave this helper), then
+// device existence — a missing or unregistered deviceId is a 404 JSON error —
+// and finally document permission, a revoked device being a 403 JSON error.
+// Every failure happens before the upgrade and exposes no change content.
+// Returns ("", false) after writing the response.
+func resolveSubscribeDevice(s *app.App, w http.ResponseWriter, r *http.Request, documentID string) (string, bool) {
+	// A missing declaration (no deviceId parameter at all) and an empty one
+	// are both "the declared identity is absent" and answer 404, exactly like
+	// an id that was never registered.
+	deviceID := r.URL.Query().Get("deviceId")
+	exists, err := s.DeviceExists(deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up device")
+		return "", false
+	}
+	if !exists {
+		writeError(w, http.StatusNotFound, "device not found")
+		return "", false
+	}
+	authorized, err := s.DocumentAuthorized(documentID, deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to look up permission")
+		return "", false
+	}
+	if !authorized {
+		writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		return "", false
+	}
+	return deviceID, true
+}
+
+// handleDocumentSubscribe is the document-level WebSocket change subscription
+// for clients that do not go through a session:
+//
+//	GET /v1/documents/{documentID}/changes/subscribe?cursor=N&deviceId=D
+//
+// It is the document-view counterpart of handleSubscribe and differs only in
+// how identity is established: instead of resolving a session's owner, the
+// calling device declares itself through the deviceId query parameter; no new
+// authentication is introduced. Validation happens entirely before the 101
+// handshake and writes nothing, in the fixed order:
+//
+//  1. the mandatory cursor and the upgrade handshake shape (400 JSON),
+//  2. the declared device's existence (missing or unregistered: 404 JSON),
+//  3. its current permission for the document (revoked: 403 JSON).
+//
+// Everything after the upgrade — cursor-ordered catch-up of the online log,
+// seamless live pushes from every write path, the read-and-discard push-only
+// data frames, the sticky 4403 revoke close and the 1001 shutdown close — is
+// byte-for-byte the session subscription's behavior via serveSubscription.
+func handleDocumentSubscribe(s *app.App, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	// Parameter/handshake shape first: a bad cursor is a 400 even when the
+	// device or handshake is also bad, matching the session-view ordering.
+	cursor, ok := parseSubscribeCursor(w, r)
+	if !ok {
+		return
+	}
+	if !checkWebSocketUpgrade(r) {
+		writeError(w, http.StatusBadRequest, "a WebSocket upgrade handshake is required")
+		return
+	}
+
+	deviceID, ok := resolveSubscribeDevice(s, w, r, documentID)
+	if !ok {
+		return
+	}
+
+	conn, err := upgradeWebSocket(w, r)
+	if err != nil {
+		// The 101 response could not be written and the connection has been
+		// hijacked (or is gone), so no JSON error can be produced. Nothing
+		// was registered or written to the store.
+		return
+	}
+
+	serveSubscription(r, s, conn, documentID, deviceID, cursor)
+}
+
+// handleDocumentCRDTStateSubscribe is the document-level WebSocket CRDT state
+// subscription for clients that do not go through a session:
+//
+//	GET /v1/documents/{documentID}/crdt/state/subscribe?deviceId=D
+//
+// It is the document-view counterpart of handleCRDTStateSubscribe and differs
+// only in identity: the calling device declares itself with the deviceId query
+// parameter rather than inheriting a session's owner, with no new
+// authentication. The pre-upgrade validation order is handshake shape
+// (400 JSON), device existence (missing or unregistered: 404 JSON) and the
+// device's permission for the document (revoked: 403 JSON). Post-upgrade
+// behavior is the session subscription's via serveCRDTStateSubscription: the
+// current merged state first (silence until the first state when the document
+// has no CRDT operation yet), one text frame per real merge change, push-only
+// inbound frames, sticky 4403 on revoke and 1001 on shutdown.
+func handleDocumentCRDTStateSubscribe(s *app.App, w http.ResponseWriter, r *http.Request) {
+	documentID := r.PathValue("documentID") // route pattern + guard guarantee non-empty
+
+	if !checkWebSocketUpgrade(r) {
+		writeError(w, http.StatusBadRequest, "a WebSocket upgrade handshake is required")
+		return
+	}
+
+	deviceID, ok := resolveSubscribeDevice(s, w, r, documentID)
+	if !ok {
+		return
+	}
+
+	conn, err := upgradeWebSocket(w, r)
+	if err != nil {
+		// The 101 could not be written and the connection has been hijacked
+		// (or is gone); no JSON error can be produced and nothing was
+		// registered.
+		return
+	}
+
+	serveCRDTStateSubscription(r, s, conn, documentID, deviceID)
+}
+
 // serveSubscription runs one upgraded connection to completion. It registers
 // before the first log read (a commit landing during catch-up is therefore
 // never missed), then alternates a flush phase — drain every page of changes

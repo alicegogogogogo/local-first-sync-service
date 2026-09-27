@@ -350,18 +350,20 @@ func marshalCRDTState(state crdt.State) []byte {
 }
 
 // malformedCRDTPath reports whether p targets the CRDT namespace but is not at
-// one of the four exact endpoints:
+// one of its exact endpoints:
 //
 //	POST     /v1/documents/{documentID}/crdt/ops
 //	GET      /v1/documents/{documentID}/crdt/state
 //	POST     /v1/documents/{documentID}/crdt/compact
 //	GET      /v1/documents/{documentID}/crdt/snapshot
+//	GET      /v1/documents/{documentID}/crdt/state/subscribe
 //
 // A missing/empty document id, a trailing slash, extra path segments, or a
-// "crdt" segment in any position short of that shape is a malformed 400 rather
-// than ServeMux's redirect or plain-text 404/405, so the new endpoints never
-// redirect or emit HTML. The keyword is matched only past the documentID
-// position, so a document literally named "crdt" keeps its ordinary routes.
+// "crdt" segment in any position short of one of those shapes is a malformed
+// 400 rather than ServeMux's redirect or plain-text 404/405, so the new
+// endpoints never redirect or emit HTML. The keyword is matched only past the
+// documentID position, so a document literally named "crdt" keeps its ordinary
+// routes.
 func malformedCRDTPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -370,11 +372,19 @@ func malformedCRDTPath(p string) bool {
 	segs := strings.Split(rest, "/")
 	for i, seg := range segs {
 		if seg == "crdt" && i > 0 {
-			if len(segs) != 3 || segs[0] == "" {
+			if segs[0] == "" {
 				return true
 			}
-			switch segs[2] {
-			case "ops", "state", "compact", "snapshot":
+			switch {
+			case len(segs) == 3:
+				switch segs[2] {
+				case "ops", "state", "compact", "snapshot":
+					return false
+				default:
+					return true
+				}
+			case len(segs) == 4 && segs[2] == "state" && segs[3] == "subscribe":
+				// The document-level CRDT state push subscription.
 				return false
 			default:
 				return true
