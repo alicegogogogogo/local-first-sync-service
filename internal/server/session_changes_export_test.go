@@ -312,7 +312,6 @@ func TestSessionExportChangesHTTPRejectsBadMethodAndPath(t *testing.T) {
 	seedDoc(t, h, "doc1", 1)
 
 	for _, c := range []struct{ method, path string }{
-		{http.MethodPost, "/v1/sessions/sess/documents/doc1/changes?from=0"},
 		{http.MethodPut, "/v1/sessions/sess/documents/doc1/changes?from=0"},
 		{http.MethodDelete, "/v1/sessions/sess/documents/doc1/changes?from=0"},
 		{http.MethodPatch, "/v1/sessions/sess/documents/doc1/changes?from=0"},

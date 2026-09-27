@@ -229,11 +229,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionChanges(s, w, r)
 	})
-	// Non-GET verbs on the session change collection path: the exact GET
-	// pattern above is more specific, so only other verbs reach this
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionPostChanges(s, w, r)
+	})
+	// Non-GET/POST verbs on the session change collection path: the exact GET
+	// and POST patterns above are more specific, so only other verbs reach this
 	// method-less pattern and get a JSON 400 instead of the subtree's
-	// unknown-path JSON 404. The collection is read-only — the paged read and
-	// the interval export share its exact GET path.
+	// unknown-path JSON 404. GET serves the paged read and the interval export;
+	// POST is the session-scoped batch commit.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
