@@ -31,15 +31,24 @@ import (
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
-// CompactChanges moves every change of documentID whose cursor is at or below
-// the compaction boundary out of the online log, in one serialized
+// CompactChanges is the document-level compaction entry of
+// CompactChangesAuthorized: the device id travels in the request body there,
+// while the session-scoped entry has it resolved from the session before the
+// call. Both share one gated transaction.
+func (s *Service) CompactChanges(documentID, deviceID string) (boundary, removed int64, err error) {
+	return s.CompactChangesAuthorized(documentID, deviceID)
+}
+
+// CompactChangesAuthorized moves every change of documentID whose cursor is at
+// or below the compaction boundary out of the online log, in one serialized
 // transaction, and returns the boundary together with the number of changes
 // removed by this call.
 //
 // The boundary is the greatest cursor with a saved snapshot, or zero when the
 // document has no snapshot — compacting a snapshot-less or unknown document
-// succeeds and removes nothing. The gate is enforced before any content is
-// observed, exactly as in ReplayChanges: an unregistered device yields
+// succeeds and removes nothing. The gate (registration then permission) is
+// enforced first inside the same transaction, before any snapshot cursor or
+// change content is observed: an unregistered device yields
 // store.ErrDeviceNotFound and a revoked device yields store.ErrPermissionDenied,
 // and neither touches any state.
 //
@@ -48,21 +57,57 @@ import (
 // differing re-post stays a conflict. Compaction is idempotent: a repeat finds
 // the same boundary, trims nothing and reports zero removed. It commits no
 // change row, allocates no cursor and notifies no waiter or subscriber.
-func (s *Service) CompactChanges(documentID, deviceID string) (boundary, removed int64, err error) {
+func (s *Service) CompactChangesAuthorized(documentID, deviceID string) (boundary, removed int64, err error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Registration and permission are enforced before any change content is
-	// observed, so a rejected compaction cannot reveal anything.
+	// Gate first: the device row and the permission row are read before any
+	// snapshot cursor or change content is observed, so a rejected compaction
+	// cannot reveal anything.
 	if s.gate != nil {
 		if err := s.gate.DeviceAuthorizedTx(tx, documentID, deviceID); err != nil {
 			return 0, 0, err
 		}
 	}
 
+	return s.compactInTx(tx, documentID)
+}
+
+// compactInTx runs the trimming of documentID inside the caller's serialized
+// transaction and commits it, returning the reported boundary together with
+// the number of changes this call removed. It is the shared core of the
+// document-level and session-scoped entries.
+func (s *Service) compactInTx(tx *sql.Tx, documentID string) (boundary, removed int64, err error) {
+	boundary, removed, err = compactChangesTx(tx, documentID)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	// Compaction is not a change: no waiter is woken and no subscriber is
+	// signaled, because no new change exists to observe.
+	return boundary, removed, nil
+}
+
+// compactChangesTx moves every change of documentID whose cursor is at or
+// below the compaction boundary out of the online log, inside the caller's
+// serialized transaction (without committing), and returns the boundary to
+// report together with the number of changes this call removed.
+//
+// The boundary is the greatest cursor with a saved snapshot, or zero when the
+// document has none (an unknown document included). A repeat — the stored
+// boundary already reaches the snapshot boundary — reports the standing
+// boundary and removes nothing.
+//
+// Each trimmed id keeps its canonical summary (device, payload digest, restore
+// provenance and first cursor) so re-posting it stays idempotent and a
+// differing re-post stays a conflict. The summary never participates in reads,
+// and compaction allocates no cursor.
+func compactChangesTx(tx *sql.Tx, documentID string) (boundary, removed int64, err error) {
 	// The boundary is the greatest cursor with a saved snapshot, 0 when the
 	// document has none (an unknown document included).
 	if err := tx.QueryRow(
@@ -78,7 +123,7 @@ func (s *Service) CompactChanges(documentID, deviceID string) (boundary, removed
 	if boundary <= stored {
 		// Nothing new to trim (a repeat compaction, or a snapshot-less
 		// document): report the standing boundary and remove nothing.
-		return stored, 0, tx.Commit()
+		return stored, 0, nil
 	}
 
 	// Collect the rows leaving the online log before deleting them: each one
@@ -161,11 +206,6 @@ func (s *Service) CompactChanges(documentID, deviceID string) (boundary, removed
 		return 0, 0, err
 	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, 0, err
-	}
-	// Compaction is not a change: no waiter is woken and no subscriber is
-	// signaled, because no new change exists to observe.
 	return boundary, int64(len(dropping)), nil
 }
 

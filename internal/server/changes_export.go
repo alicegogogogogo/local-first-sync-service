@@ -222,13 +222,16 @@ func malformedSessionChangesPath(p string) bool {
 	// poll adds one trailing "poll" segment and keeps its own guard; the
 	// offline replay adds one trailing "replay" segment and keeps its own
 	// guard; the single-change merge adds one trailing "merge" segment and
-	// keeps its own guard. Anything else past the keyword is a malformed 400.
+	// keeps its own guard; the change-log compaction adds one trailing
+	// "compact" segment and keeps its own guard. Anything else past the
+	// keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
 	replay := len(segs) == 5 && segs[4] == "replay"
 	merge := len(segs) == 5 && segs[4] == "merge"
-	return !(collection || subscribe || poll || replay || merge)
+	compact := len(segs) == 5 && segs[4] == "compact"
+	return !(collection || subscribe || poll || replay || merge || compact)
 }
 
 // malformedSessionPollPath reports whether p targets the session-scoped

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 )
 
 // compactSeed commits three changes and a snapshot at cursor 2, so a
@@ -150,6 +151,70 @@ func TestCompactGateAndUnknownDocument(t *testing.T) {
 	}
 	if _, _, err := s.CompactChanges("doc", "dev-1"); err == nil {
 		t.Fatal("revoked device compacted without error")
+	}
+}
+
+// CompactSessionChanges (the gated, session-scoped compaction) shares the
+// document-level trim core: it trims to the same boundary, is idempotent, but
+// enforces registration and permission inside the transaction even though the
+// device identity was resolved by the HTTP layer.
+func TestCompactAuthorizedSharesSemanticsAndGate(t *testing.T) {
+	s, err := app.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	compactSeed(t, s) // three changes, snapshot at cursor 2
+
+	// An unregistered device is rejected by the gate before anything is read.
+	if _, _, err := s.CompactSessionChanges("doc", "ghost"); err == nil {
+		t.Fatal("unregistered device compacted without error")
+	}
+
+	// The authorized compaction trims exactly like the document-level entry.
+	boundary, removed, err := s.CompactSessionChanges("doc", "dev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary != 2 || removed != 2 {
+		t.Fatalf("compact = boundary %d removed %d, want 2/2", boundary, removed)
+	}
+
+	// The retained summaries answer idempotency after the session-scoped trim.
+	results, err := s.PostSessionChanges("doc", []events.Change{
+		{ID: "c1", DeviceID: "dev-1", Payload: json.RawMessage(`{"n":1}`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[0].Created || results[0].Cursor != 1 {
+		t.Fatalf("trimmed idempotent re-post = %+v", results[0])
+	}
+
+	// A repeat through the session entry reports the same boundary, zero
+	// removed.
+	boundary, removed, err = s.CompactSessionChanges("doc", "dev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if boundary != 2 || removed != 0 {
+		t.Fatalf("re-compact = boundary %d removed %d, want 2/0", boundary, removed)
+	}
+
+	// A revoked device is denied inside the compaction transaction and the
+	// standing boundary is left in place.
+	if _, err := s.SetDocumentPermission("doc", "dev-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.CompactSessionChanges("doc", "dev-1"); err == nil {
+		t.Fatal("revoked device compacted without error")
+	}
+	list, next, err := s.ListChanges("doc", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || next != 3 {
+		t.Fatalf("list after denied compact = %v next %d, want the surviving tail", list, next)
 	}
 }
 
