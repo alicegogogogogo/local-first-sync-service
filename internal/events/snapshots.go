@@ -156,9 +156,70 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	result, err := restoreSnapshotTx(tx, documentID, deviceID, changeID, snapshotCursor)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RestoreResult{}, err
+	}
+	// A genuinely new restore appended a change and is the only outcome that
+	// wakes the long polls and pushes to subscribers; an idempotent repeat
+	// appended nothing and notifies nothing.
+	if result.Created {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
+// RestoreSnapshotAuthorized is the session-scoped restore: it has exactly the
+// restore semantics of RestoreSnapshot, but enforces the gate (registration
+// then permission) first in the same serialized transaction: an unregistered
+// device yields store.ErrDeviceNotFound and a revoked device yields
+// ErrPermissionDenied. None of those outcomes writes anything or observes
+// snapshot or change content. The device identity is resolved from the session
+// by the HTTP layer before the call.
+func (s *Service) RestoreSnapshotAuthorized(documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Gate first: the device row and the permission row are read before the
+	// snapshot is looked up or any change content is observed, so a rejected
+	// restore cannot reveal anything.
+	if s.gate != nil {
+		if err := s.gate.DeviceAuthorizedTx(tx, documentID, deviceID); err != nil {
+			return RestoreResult{}, err
+		}
+	}
+
+	result, err := restoreSnapshotTx(tx, documentID, deviceID, changeID, snapshotCursor)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RestoreResult{}, err
+	}
+	if result.Created {
+		s.notifyWaiters(documentID)
+	}
+	return result, nil
+}
+
+// restoreSnapshotTx runs the snapshot lookup, the idempotency/conflict
+// resolution and the single append inside the caller's serialized
+// transaction. It is shared by the document-level restore and the
+// session-scoped authorized restore so the two paths cannot drift: both take
+// their snapshot miss (ErrSnapshotNotFound), conflict (*ErrRestoreConflict)
+// and append decisions from one code path. The result's Created flag tells
+// the caller whether a change-bearing transaction just committed and the push
+// channels therefore need waking.
+func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
 	// The snapshot must exist; its state is the payload to append.
 	var state []byte
-	err = tx.QueryRow(
+	err := tx.QueryRow(
 		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
 		documentID, snapshotCursor,
 	).Scan(&state)
@@ -263,11 +324,6 @@ func (s *Service) RestoreSnapshot(documentID, deviceID, changeID string, snapsho
 	); err != nil {
 		return RestoreResult{}, err
 	}
-
-	if err := tx.Commit(); err != nil {
-		return RestoreResult{}, err
-	}
-	s.notifyWaiters(documentID)
 	return RestoreResult{
 		ID:           changeID,
 		Created:      true,

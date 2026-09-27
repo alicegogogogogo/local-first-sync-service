@@ -187,6 +187,16 @@ func (a *App) RestoreSnapshot(documentID, deviceID, changeID string, snapshotCur
 	return a.events.RestoreSnapshot(documentID, deviceID, changeID, snapshotCursor)
 }
 
+// RestoreSessionSnapshot restores a snapshot as an ordinary change whose
+// device identity was resolved from a session by the HTTP layer, delegating to
+// the change event service's gated restore: the registration/permission
+// verdict is taken inside the same serialized transaction as the snapshot
+// lookup and the append, so a revoked device writes nothing and a rejected
+// request observes no snapshot or change content.
+func (a *App) RestoreSessionSnapshot(documentID, deviceID, changeID string, snapshotCursor int64) (events.RestoreResult, error) {
+	return a.events.RestoreSnapshotAuthorized(documentID, deviceID, changeID, snapshotCursor)
+}
+
 // ListChanges delegates to the change event service.
 func (a *App) ListChanges(documentID string, after, limit int64) ([]events.ListedChange, int64, error) {
 	return a.events.ListChanges(documentID, after, limit)

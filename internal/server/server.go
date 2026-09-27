@@ -264,6 +264,9 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionMergeChange(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/restore", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionRestore(s, w, r)
+	})
 	// Non-GET verbs on the session long-poll path and non-POST verbs on the
 	// session replay/merge paths: the exact GET/POST patterns above are more
 	// specific, so only other verbs reach these method-less patterns and get a
@@ -277,6 +280,13 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Non-POST verbs on the session restore path: the exact POST pattern above
+	// is more specific, so only other verbs reach this method-less pattern and
+	// get a JSON 400 instead of the subtree's unknown-path JSON 404. The
+	// restore is a single change-bearing commit (POST).
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/restore", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, r *http.Request) {
@@ -380,6 +390,11 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleMergeChange(s, w, r)
 	})
+	// Non-POST verbs on the exact merge path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the merge endpoint only accepts POST.
+	mux.HandleFunc("/v1/documents/{documentID}/merge", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
 		handlePostSnapshot(s, w, r)
 	})
@@ -402,6 +417,11 @@ func NewHandler(s *app.App) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleRestore(s, w, r)
+	})
+	// Non-POST verbs on the exact restore path get a JSON 400 rather than
+	// ServeMux's plain-text 405: the restore endpoint only accepts POST.
+	mux.HandleFunc("/v1/documents/{documentID}/restore", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/permissions", func(w http.ResponseWriter, r *http.Request) {
 		handleSetPermission(s, w, r)
@@ -473,7 +493,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionSnapshotsPath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -482,16 +502,16 @@ func emptyIDGuard(next http.Handler) http.Handler {
 }
 
 // malformedNewDocumentPath reports whether p targets one of the new
-// long-poll/replay/compaction endpoints but is not that endpoint's exact
-// location: a missing/empty segment, a trailing slash, extra segments, or a
-// "poll"/"replay"/"compact" segment in a position short of the registered
-// shape. ServeMux would answer those with a 301 redirect or a plain-text
-// 404/405; the new endpoints promise a JSON error and never a redirect, so
-// every such path is a malformed 400.
+// long-poll/replay/merge/restore/compaction endpoints but is not that
+// endpoint's exact location: a missing/empty segment, a trailing slash, extra
+// segments, or a "poll"/"replay"/"merge"/"restore"/"compact" segment in a
+// position short of the registered shape. ServeMux would answer those with a
+// 301 redirect or a plain-text 404/405; the new endpoints promise a JSON error
+// and never a redirect, so every such path is a malformed 400.
 //
 // Keywords are matched only past the documentID position, so documents that
-// happen to be named "poll", "replay" or "compact" keep their ordinary
-// merge/snapshot/changes routes.
+// happen to be named "poll", "replay", "merge", "restore" or "compact" keep
+// their ordinary merge/snapshot/changes routes.
 func malformedNewDocumentPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -511,6 +531,17 @@ func malformedNewDocumentPath(p string) bool {
 	for i, seg := range segs {
 		if seg == "replay" && i > 0 {
 			return !(len(segs) == 2 && segs[0] != "")
+		}
+	}
+	// Merge and restore endpoints: each keyword must be exactly the second
+	// segment, after a non-empty documentID (they are document-item
+	// subresources, unlike poll/compact which sit below the change
+	// collection).
+	for _, keyword := range []string{"merge", "restore"} {
+		for i, seg := range segs {
+			if seg == keyword && i > 0 {
+				return !(len(segs) == 2 && segs[0] != "")
+			}
 		}
 	}
 	// Compaction endpoint: "compact" must be exactly the third segment, after
