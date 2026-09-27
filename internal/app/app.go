@@ -144,6 +144,14 @@ func (a *App) PostSessionChanges(documentID string, changes []events.Change) ([]
 	return a.events.CommitAuthorized(documentID, changes)
 }
 
+// ReplaySessionChanges replays an offline batch whose device identity was
+// resolved from a session by the HTTP layer; it is the session counterpart
+// to ReplayChanges and commits through the same gated transaction the
+// session-scoped batch commit uses, so the two paths cannot drift.
+func (a *App) ReplaySessionChanges(documentID string, changes []events.Change) ([]events.Result, error) {
+	return a.events.CommitAuthorized(documentID, changes)
+}
+
 // MergeChange delegates to the change event service.
 func (a *App) MergeChange(documentID string, baseCursor int64, c events.Change) (events.MergeResult, error) {
 	return a.events.MergeChange(documentID, baseCursor, c)

@@ -219,12 +219,14 @@ func malformedSessionChangesPath(p string) bool {
 	// Keyword position reached. The collection is exactly
 	// {sessionId}/documents/{documentId}/changes; the subscribe subresource
 	// adds one trailing "subscribe" segment and keeps its own guard; the long
-	// poll adds one trailing "poll" segment and keeps its own guard. Anything
-	// else past the keyword is a malformed 400.
+	// poll adds one trailing "poll" segment and keeps its own guard; the
+	// offline replay adds one trailing "replay" segment and keeps its own
+	// guard. Anything else past the keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
-	return !(collection || subscribe || poll)
+	replay := len(segs) == 5 && segs[4] == "replay"
+	return !(collection || subscribe || poll || replay)
 }
 
 // malformedSessionPollPath reports whether p targets the session-scoped
@@ -264,6 +266,55 @@ func malformedSessionPollPath(p string) bool {
 		// Endpoint keyword position: the fifth segment must be exactly "poll"
 		// with the documents/changes scaffolding around it, and no segment may
 		// follow. Any other occurrence is a malformed path.
+		if i == 4 && len(segs) == 5 &&
+			segs[0] != "" &&
+			segs[1] == "documents" &&
+			segs[2] != "" &&
+			segs[3] == "changes" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// malformedSessionReplayPath reports whether p targets the session-scoped
+// offline replay endpoint but is not at its exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/changes/replay): a missing
+// "documents"/"changes" segment, an extra segment, or a "replay" segment in a
+// position short of the registered shape. ServeMux would answer those with a
+// plain-text 404 (or a redirect for an empty segment); every failure of this
+// endpoint must be a JSON 400 instead. Empty segments are already rejected by
+// the guard itself.
+//
+// "replay" is treated as the endpoint keyword only in its terminal segment
+// position (the fifth segment, index 4); a session or document identifier
+// literally named "replay" occupies an identifier position (index 0 or 2) and
+// is therefore left to the ordinary changes routes like any other id.
+func malformedSessionReplayPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	// The CRDT namespace ("crdt" immediately past the document identifier)
+	// has its own guard; "replay" there is an ordinary identifier, not the
+	// changes-replay keyword.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	for i, seg := range segs {
+		if seg != "replay" {
+			continue
+		}
+		// Identifier positions: sessionId (0) and documentId (2). A value of
+		// "replay" there is an ordinary identifier, not the endpoint word.
+		if i == 0 || i == 2 {
+			continue
+		}
+		// Endpoint keyword position: the fifth segment must be exactly
+		// "replay" with the documents/changes scaffolding around it, and no
+		// segment may follow. Any other occurrence is a malformed path.
 		if i == 4 && len(segs) == 5 &&
 			segs[0] != "" &&
 			segs[1] == "documents" &&
