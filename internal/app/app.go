@@ -223,6 +223,17 @@ func (a *App) CompactChanges(documentID, deviceID string) (boundary, removed int
 	return a.events.CompactChanges(documentID, deviceID)
 }
 
+// CompactSessionChanges compacts a document's change log for a caller whose
+// device identity was resolved from a session by the HTTP layer, delegating to
+// the change event service's gated compaction: the registration/permission
+// verdict is taken inside the same serialized transaction as the trim, so a
+// revoked device removes nothing and a rejected request observes no change
+// content. It is the session counterpart to CompactChanges; the boundary,
+// retained summaries and persistence semantics are identical.
+func (a *App) CompactSessionChanges(documentID, deviceID string) (boundary, removed int64, err error) {
+	return a.events.CompactChanges(documentID, deviceID)
+}
+
 // AddSubscription delegates to the change event service.
 func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-chan struct{}, func()) {
 	return a.events.AddSubscription(documentID, deviceID)

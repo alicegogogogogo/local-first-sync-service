@@ -222,13 +222,65 @@ func malformedSessionChangesPath(p string) bool {
 	// poll adds one trailing "poll" segment and keeps its own guard; the
 	// offline replay adds one trailing "replay" segment and keeps its own
 	// guard; the single-change merge adds one trailing "merge" segment and
-	// keeps its own guard. Anything else past the keyword is a malformed 400.
+	// keeps its own guard; the change-log compaction adds one trailing
+	// "compact" segment and keeps its own guard. Anything else past the
+	// keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
 	replay := len(segs) == 5 && segs[4] == "replay"
 	merge := len(segs) == 5 && segs[4] == "merge"
-	return !(collection || subscribe || poll || replay || merge)
+	compact := len(segs) == 5 && segs[4] == "compact"
+	return !(collection || subscribe || poll || replay || merge || compact)
+}
+
+// malformedSessionCompactPath reports whether p targets the session-scoped
+// change-log compaction endpoint but is not at its exact location
+// (/v1/sessions/{sessionId}/documents/{documentId}/changes/compact): a missing
+// "documents"/"changes" segment, an extra segment, or a "compact" segment in a
+// position short of the registered shape. ServeMux would answer those with a
+// plain-text 404 (or a redirect for an empty segment); every failure of this
+// endpoint must be a JSON 400 instead. Empty segments are already rejected by
+// the guard itself.
+//
+// "compact" is treated as the endpoint keyword only in its terminal segment
+// position (the fifth segment, index 4); a session or document identifier
+// literally named "compact" occupies an identifier position (index 0 or 2) and
+// is therefore left to the ordinary changes routes like any other id.
+func malformedSessionCompactPath(p string) bool {
+	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
+	if !ok {
+		return false
+	}
+	segs := strings.Split(rest, "/")
+	// The CRDT namespace ("crdt" immediately past the document identifier)
+	// has its own guard; "compact" there is the CRDT compaction keyword, not
+	// the change-log one.
+	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	for i, seg := range segs {
+		if seg != "compact" {
+			continue
+		}
+		// Identifier positions: sessionId (0) and documentId (2). A value of
+		// "compact" there is an ordinary identifier, not the endpoint word.
+		if i == 0 || i == 2 {
+			continue
+		}
+		// Endpoint keyword position: the fifth segment must be exactly
+		// "compact" with the documents/changes scaffolding around it, and no
+		// segment may follow. Any other occurrence is a malformed path.
+		if i == 4 && len(segs) == 5 &&
+			segs[0] != "" &&
+			segs[1] == "documents" &&
+			segs[2] != "" &&
+			segs[3] == "changes" {
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // malformedSessionPollPath reports whether p targets the session-scoped

@@ -264,15 +264,18 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionMergeChange(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionCompactChanges(s, w, r)
+	})
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionRestore(s, w, r)
 	})
 	// Non-GET verbs on the session long-poll path and non-POST verbs on the
-	// session replay/merge paths: the exact GET/POST patterns above are more
-	// specific, so only other verbs reach these method-less patterns and get a
-	// JSON 400 instead of the subtree's unknown-path JSON 404. The poll is a
-	// read-only wait entry (GET, no body); the replay and merge are batch
-	// commits (POST).
+	// session replay/merge/compaction paths: the exact GET/POST patterns above
+	// are more specific, so only other verbs reach these method-less patterns
+	// and get a JSON 400 instead of the subtree's unknown-path JSON 404. The
+	// poll is a read-only wait entry (GET, no body); the replay, merge and
+	// compaction are batch commits (POST).
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/poll", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
@@ -280,6 +283,9 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/merge", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Non-POST verbs on the session restore path: the exact POST pattern above
@@ -493,7 +499,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
