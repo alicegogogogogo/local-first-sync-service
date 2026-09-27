@@ -31,6 +31,24 @@ type crdtOpsRequest struct {
 	Ops      []crdtOpIn `json:"ops"`
 }
 
+// sessionCRDTOpsRequest is the body of the session-scoped CRDT batch commit:
+// only the declared type and the ops array. The calling device is the
+// session's owning device and never travels in the body.
+type sessionCRDTOpsRequest struct {
+	Type string     `json:"type"`
+	Ops  []crdtOpIn `json:"ops"`
+}
+
+// validCRDTType reports whether t names one of the four document types a
+// batch may declare.
+func validCRDTType(t string) bool {
+	switch t {
+	case crdt.TypeCounter, crdt.TypeGSet, crdt.TypeRegister, crdt.TypeORSet:
+		return true
+	}
+	return false
+}
+
 // handleCRDTOps accepts a batch of CRDT operations for a document.
 //
 // The batch declares the document's type; the first accepted batch fixes it
@@ -57,35 +75,73 @@ func handleCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "deviceId must be a non-empty string")
 		return
 	}
-	if req.Type != crdt.TypeCounter && req.Type != crdt.TypeGSet && req.Type != crdt.TypeRegister && req.Type != crdt.TypeORSet {
+	if !validCRDTType(req.Type) {
 		writeError(w, http.StatusBadRequest, `type must be "counter", "gset", "register" or "orset"`)
 		return
 	}
-	if len(req.Ops) == 0 {
-		writeError(w, http.StatusBadRequest, "ops must be a non-empty array")
+
+	ops, ok := parseCRDTOps(w, req.Type, req.Ops)
+	if !ok {
+		return
+	}
+	for i := range ops {
+		ops[i].DeviceID = req.DeviceID
+	}
+
+	results, err := s.SubmitCRDTOps(documentID, req.Type, ops)
+	if err != nil {
+		var conflict *crdt.ErrConflict
+		switch {
+		case errors.Is(err, store.ErrDeviceNotFound):
+			writeError(w, http.StatusNotFound, "device not found")
+		case errors.Is(err, store.ErrPermissionDenied):
+			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
+		case errors.As(err, &conflict):
+			writeError(w, http.StatusConflict, conflict.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to commit crdt ops")
+		}
 		return
 	}
 
-	ops := make([]crdt.Op, len(req.Ops))
-	seen := make(map[string]struct{}, len(req.Ops))
-	for i, op := range req.Ops {
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+// parseCRDTOps validates one inbound CRDT batch against the declared type and
+// builds the service operations, writing the documented 400 on any violation:
+// an empty batch, a missing, empty or duplicated op id, or type-incorrect
+// content (counter: an integer value; gset: an elements array; register: any
+// JSON value — null included — plus a non-negative integer version; orset:
+// action "add" or "remove" plus a non-empty string element). The returned ops
+// carry no device yet: each caller stamps its own calling device — the body
+// deviceId at the document-level entry, the session's owning device at the
+// session-scoped entry.
+func parseCRDTOps(w http.ResponseWriter, declaredType string, in []crdtOpIn) ([]crdt.Op, bool) {
+	if len(in) == 0 {
+		writeError(w, http.StatusBadRequest, "ops must be a non-empty array")
+		return nil, false
+	}
+
+	ops := make([]crdt.Op, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for i, op := range in {
 		if op.ID == "" {
 			writeError(w, http.StatusBadRequest, "each op must have a non-empty string id")
-			return
+			return nil, false
 		}
 		if _, dup := seen[op.ID]; dup {
 			writeError(w, http.StatusBadRequest, "duplicate op id within batch: "+op.ID)
-			return
+			return nil, false
 		}
 		seen[op.ID] = struct{}{}
 
-		crdtOp := crdt.Op{ID: op.ID, DeviceID: req.DeviceID}
-		switch req.Type {
+		crdtOp := crdt.Op{ID: op.ID}
+		switch declaredType {
 		case crdt.TypeCounter:
 			v, ok := parseNonNegativeInt(op.Value)
 			if !ok {
 				writeError(w, http.StatusBadRequest, "each counter op must carry an integer value >= 0")
-				return
+				return nil, false
 			}
 			// Re-marshal the canonical integer so idempotency compares the
 			// decoded value rather than the client's literal formatting.
@@ -94,12 +150,12 @@ func handleCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
 		case crdt.TypeGSet:
 			if len(op.Elements) == 0 {
 				writeError(w, http.StatusBadRequest, "each gset op must add at least one element")
-				return
+				return nil, false
 			}
 			for _, element := range op.Elements {
 				if element == "" {
 					writeError(w, http.StatusBadRequest, "gset elements must be non-empty strings")
-					return
+					return nil, false
 				}
 			}
 			crdtOp.Elements = op.Elements
@@ -109,28 +165,77 @@ func handleCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
 			// "null") is a missing field. The value is stored verbatim.
 			if op.Value == nil {
 				writeError(w, http.StatusBadRequest, "each register op must carry a value")
-				return
+				return nil, false
 			}
 			v, ok := parseNonNegativeInt(op.Version)
 			if !ok {
 				writeError(w, http.StatusBadRequest, "each register op must carry an integer version >= 0")
-				return
+				return nil, false
 			}
 			crdtOp.Value = op.Value
 			crdtOp.Version = v
 		case crdt.TypeORSet:
 			if op.Action != crdt.ORSetAdd && op.Action != crdt.ORSetRemove {
 				writeError(w, http.StatusBadRequest, `each orset op must carry action "add" or "remove"`)
-				return
+				return nil, false
 			}
 			if op.Element == "" {
 				writeError(w, http.StatusBadRequest, "each orset op must carry a non-empty string element")
-				return
+				return nil, false
 			}
 			crdtOp.Action = op.Action
 			crdtOp.Element = op.Element
 		}
 		ops[i] = crdtOp
+	}
+	return ops, true
+}
+
+// handleSessionCRDTOps is the session-scoped CRDT batch commit:
+//
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops
+//
+// The request body carries only the declared type and the ops array — the
+// calling device is the session's owning device, resolved with the same
+// identity rule as the session reads, exports and subscriptions; no new
+// credential is introduced and no device id travels in the body. Per-element
+// semantics and the success body are byte-identical to the document-level
+// commit: results arrive in request order, each naming its id and whether it
+// was created. The checks run in the fixed order request shape (400), session
+// existence (404), document permission (403) — the permission verdict is taken
+// inside the commit transaction, so a revoked device writes nothing — and a
+// type, regression or id conflict is a 409. Every rejection leaves the CRDT
+// state untouched.
+func handleSessionCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("sessionId")   // route pattern + guard guarantee non-empty
+	documentID := r.PathValue("documentId") // route pattern + guard guarantee non-empty
+
+	var req sessionCRDTOpsRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if !validCRDTType(req.Type) {
+		writeError(w, http.StatusBadRequest, `type must be "counter", "gset", "register" or "orset"`)
+		return
+	}
+	ops, ok := parseCRDTOps(w, req.Type, req.Ops)
+	if !ok {
+		return
+	}
+
+	// Request shape is settled; only now does the session lookup run, so a
+	// malformed batch against an unknown session is still a 400.
+	deviceID, err := s.SessionDevice(sessionID)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to look up session")
+		return
+	}
+	for i := range ops {
+		ops[i].DeviceID = deviceID
 	}
 
 	results, err := s.SubmitCRDTOps(documentID, req.Type, ops)
@@ -138,7 +243,10 @@ func handleCRDTOps(s *app.App, w http.ResponseWriter, r *http.Request) {
 		var conflict *crdt.ErrConflict
 		switch {
 		case errors.Is(err, store.ErrDeviceNotFound):
-			writeError(w, http.StatusNotFound, "device not found")
+			// The session's device was deregistered between the lookup and
+			// the commit; its cascade removed the session too, so the
+			// identity the caller used no longer exists.
+			writeError(w, http.StatusNotFound, "session not found")
 		case errors.Is(err, store.ErrPermissionDenied):
 			writeError(w, http.StatusForbidden, "device permission for this document has been revoked")
 		case errors.As(err, &conflict):

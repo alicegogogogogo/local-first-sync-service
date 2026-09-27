@@ -261,13 +261,20 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCRDTState(s, w, r)
 	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionCRDTOps(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTStateSubscribe(s, w, r)
 	})
-	// Non-GET verbs on the session CRDT paths get a JSON 400 rather than
-	// ServeMux's plain-text 405: the state read and the subscription are
-	// GET-only.
+	// Non-GET verbs on the session CRDT read paths and verbs other than POST
+	// on the session CRDT ops path get a JSON 400 rather than ServeMux's
+	// plain-text 405: the state read and the subscription are GET-only, the
+	// batch commit is POST-only.
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/ops", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
@@ -540,14 +547,15 @@ func malformedSubscribePath(p string) bool {
 }
 
 // malformedSessionCRDTPath reports whether p targets the session-scoped CRDT
-// namespace but is not at one of its two exact locations:
+// namespace but is not at one of its three exact locations:
 //
-//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
-//	GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
+//	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
+//	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops
 //
-// a missing "state"/"subscribe" segment, an extra segment, or a "crdt" segment
-// in the keyword position (immediately past the document identifier) short of
-// one of the registered shapes. ServeMux would answer those with a
+// a missing "state"/"ops"/"subscribe" segment, an extra segment, or a "crdt"
+// segment in the keyword position (immediately past the document identifier)
+// short of one of the registered shapes. ServeMux would answer those with a
 // plain-text 404/405; every failure of these endpoints must be a JSON 400
 // instead. Empty segments are already rejected by the guard itself.
 //
@@ -566,17 +574,22 @@ func malformedSessionCRDTPath(p string) bool {
 	}
 	// Keyword position reached. The state read is exactly
 	// {sessionId}/documents/{documentId}/crdt/state; the subscription adds
-	// one trailing "subscribe" segment.
+	// one trailing "subscribe" segment; the batch commit swaps the terminal
+	// segment for "ops".
 	validState := len(segs) == 5 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state"
+	validOps := len(segs) == 5 &&
+		segs[0] != "" &&
+		segs[2] != "" &&
+		segs[4] == "ops"
 	validSubscribe := len(segs) == 6 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state" &&
 		segs[5] == "subscribe"
-	return !(validState || validSubscribe)
+	return !(validState || validOps || validSubscribe)
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use
