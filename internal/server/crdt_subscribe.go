@@ -7,6 +7,7 @@ import (
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/push"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -96,8 +97,13 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		_ = conn.NetClose()
 		return
 	}
+	// The management-plane record makes this connection listable and
+	// cancelable by its owning device. A state subscription carries no
+	// starting cursor, so the recorded cursor is 0.
+	managed := s.RegisterPush(deviceID, documentID, push.KindState, 0)
 	defer func() {
 		unregister()
+		s.UnregisterPush(managed.Info().ID)
 		_ = conn.NetClose()
 	}()
 
@@ -120,13 +126,20 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		}
 	}()
 
-	// endNow maps a closing store to 1001 and a sticky revoke to 4403, waiting
-	// briefly for the peer's close echo. Termination takes precedence over a
-	// racing revoke. It returns true when the subscription must end.
+	// endNow maps a closing store to 1001, an active device cancel to 4410
+	// and a sticky revoke to 4403, waiting briefly for the peer's close echo.
+	// Termination takes precedence over a racing cancel or revoke. It returns
+	// true when the subscription must end.
 	endNow := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
 			return true
+		}
+		select {
+		case <-managed.Canceled():
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+			return true
+		default:
 		}
 		select {
 		case <-sub.Revoked():
@@ -199,6 +212,13 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		select {
 		case <-sub.Wake():
 			// A coalescing "drain now" signal; loop and flush the whole queue.
+		case <-managed.Canceled():
+			if s.Closing() {
+				endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+				return
+			}
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+			return
 		case <-sub.Revoked():
 			if s.Closing() {
 				endSubscription(conn, clientGone, wsCloseGoingAway, "going away")

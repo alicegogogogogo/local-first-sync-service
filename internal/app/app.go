@@ -26,6 +26,7 @@ import (
 	"github.com/alicegogogogogo/local-first-sync-service/internal/authz"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/push"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -36,6 +37,11 @@ type App struct {
 
 	events *events.Service
 	crdt   *crdt.Service
+
+	// pushSubs is the process-wide, in-memory registry of the live push
+	// connections across both channels. It backs the device-scoped
+	// subscription management endpoints and holds no durable state.
+	pushSubs *push.Registry
 
 	// Authz is the permission service. It is exposed so the HTTP layer can
 	// grant/revoke and read authorization directly; the other services reach
@@ -78,10 +84,11 @@ func Open(path string) (*App, error) {
 	permissions.AddRevokeSink(crdtService)
 
 	return &App{
-		Store:  kernel,
-		events: eventService,
-		crdt:   crdtService,
-		Authz:  permissions,
+		Store:    kernel,
+		events:   eventService,
+		crdt:     crdtService,
+		Authz:    permissions,
+		pushSubs: push.NewRegistry(),
 	}, nil
 }
 
@@ -338,4 +345,30 @@ func (a *App) OpenCRDTSubscription(documentID, deviceID string) (*crdt.State, *c
 // AddCRDTSubscription delegates to the CRDT state service.
 func (a *App) AddCRDTSubscription(documentID, deviceID string) (*crdt.Subscription, func()) {
 	return a.crdt.AddSubscription(documentID, deviceID)
+}
+
+// RegisterPush records one freshly established push connection in the
+// process-wide in-memory registry. The returned subscription carries the
+// server-allocated id and the one-shot active-cancel signal; the connection
+// layer removes it when the connection ends.
+func (a *App) RegisterPush(deviceID, documentID string, kind push.Kind, cursor int64) *push.Subscription {
+	return a.pushSubs.Register(deviceID, documentID, kind, cursor)
+}
+
+// UnregisterPush removes an ended push connection.
+func (a *App) UnregisterPush(subscriptionID string) {
+	a.pushSubs.Unregister(subscriptionID)
+}
+
+// ListPushSubscriptions returns the device's live push connections across
+// both channels in establishment order. It is a pure memory view.
+func (a *App) ListPushSubscriptions(deviceID string) []push.Info {
+	return a.pushSubs.List(deviceID)
+}
+
+// CancelPushSubscription actively ends one of the device's live push
+// connections. It returns false when the id is unknown, already gone, or owned
+// by another device; those cases are one indistinguishable 404 at the edge.
+func (a *App) CancelPushSubscription(deviceID, subscriptionID string) bool {
+	return a.pushSubs.Cancel(deviceID, subscriptionID)
 }

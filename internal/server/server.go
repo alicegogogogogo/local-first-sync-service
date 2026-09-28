@@ -151,6 +151,32 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
 	})
+	// Device-scoped subscription management: a read-only list of the device's
+	// live push connections and a DELETE that actively cancels one of them.
+	// The path device id is the only identity, exactly like the session
+	// routes above it.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/subscriptions", func(w http.ResponseWriter, r *http.Request) {
+		handleListDeviceSubscriptions(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/subscriptions/{subscriptionId}", func(w http.ResponseWriter, r *http.Request) {
+		handleCancelDeviceSubscription(s, w, r)
+	})
+	// The collection path accepts only GET and the item path only DELETE;
+	// every other verb on either exact shape gets a JSON 400 rather than
+	// ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions/{subscriptionId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Extra segments past either management path are a malformed path and
+	// answer a JSON 400 instead of the subtree's unknown-path 404; the exact
+	// item pattern above still wins for its exact shape. Empty segments and a
+	// trailing slash are already a 400 via emptyIDGuard.
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "subscription path is malformed")
+	})
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateAttachment(s, w, r)
 	})

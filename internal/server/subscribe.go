@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/push"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/store"
 )
 
@@ -121,8 +122,13 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 	// return immediately — no wake is lost. The revoked channel closes once
 	// if access is withdrawn, and that event survives a racing re-grant.
 	wakeCh, revokedCh, unregister := s.AddSubscription(documentID, deviceID)
+	// The management-plane record makes this connection listable and
+	// cancelable by its owning device. It is pure memory: removal is the only
+	// teardown and it neither writes nor advances anything.
+	managed := s.RegisterPush(deviceID, documentID, push.KindChanges, cursor)
 	defer func() {
 		unregister()
+		s.UnregisterPush(managed.Info().ID)
 		_ = conn.NetClose()
 	}()
 
@@ -145,14 +151,21 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 		}
 	}()
 
-	// checkEnd non-blockingly maps a closing store to 1001 and a sticky
-	// revoke to 4403; it returns true when the subscription must end. A
-	// termination signal takes precedence: SIGTERM must end every
-	// subscription with 1001 even if a revoke is also pending.
+	// checkEnd non-blockingly maps a closing store to 1001, an active device
+	// cancel to 4410 and a sticky revoke to 4403; it returns true when the
+	// subscription must end. A termination signal takes precedence: SIGTERM
+	// must end every subscription with 1001 even if a cancel or a revoke is
+	// also pending.
 	checkEnd := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
 			return true
+		}
+		select {
+		case <-managed.Canceled():
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+			return true
+		default:
 		}
 		select {
 		case <-revokedCh:
@@ -179,6 +192,13 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 				case <-wakeCh:
 				default:
 				}
+			case <-managed.Canceled():
+				if s.Closing() {
+					endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+					return
+				}
+				endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+				return
 			case <-revokedCh:
 				if s.Closing() {
 					endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
