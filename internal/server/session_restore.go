@@ -130,6 +130,12 @@ func malformedSessionRestorePath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The snapshot named-version subtree owns its own shape guard; the
+	// terminal "restore" of .../versions/{name}/restore and a version named
+	// "restore" are ordinary identifiers there, not this endpoint's keyword.
+	if inSessionSnapshotsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "restore" {
 			continue

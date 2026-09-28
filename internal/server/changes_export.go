@@ -264,6 +264,9 @@ func malformedSessionCompactPath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	if inSessionSnapshotsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "compact" {
 			continue
@@ -311,6 +314,9 @@ func malformedSessionPollPath(p string) bool {
 	// has its own guard; "poll" there is an ordinary identifier, not the
 	// changes-poll keyword.
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	if inSessionSnapshotsSubtree(segs) {
 		return false
 	}
 	for i, seg := range segs {
@@ -362,6 +368,9 @@ func malformedSessionMergePath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	if inSessionSnapshotsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "merge" {
 			continue
@@ -407,6 +416,9 @@ func malformedSessionReplayPath(p string) bool {
 	// has its own guard; "replay" there is an ordinary identifier, not the
 	// changes-replay keyword.
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	if inSessionSnapshotsSubtree(segs) {
 		return false
 	}
 	for i, seg := range segs {

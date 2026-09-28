@@ -146,6 +146,12 @@ func malformedSessionQueryPath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The snapshot named-version subtree owns its own shape guard; a version
+	// named "query" is an ordinary identifier there, not this endpoint's
+	// keyword.
+	if inSessionSnapshotsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "query" {
 			continue

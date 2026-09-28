@@ -164,18 +164,21 @@ func malformedSnapshotPath(p string) bool {
 }
 
 // malformedSessionSnapshotsPath reports whether p targets the session-scoped
-// snapshot collection's shape but is not the collection's exact location
-// (/v1/sessions/{sessionId}/documents/{documentId}/snapshots): extra path
-// segments past the collection (the session view has no single-snapshot
-// item, so a trailing cursor segment is malformed too). ServeMux would answer
-// those with a plain-text 404; the snapshot surface promises a JSON 400 and
-// never a redirect. Empty segments (doubled slashes, a trailing slash) are
-// already rejected by the guard itself.
+// snapshot namespace but is not at one of its exact locations:
 //
-// "snapshots" is treated as the collection keyword only in the fourth
-// segment, right after the document identifier; a session or document
-// identifier literally named "snapshots" occupies an identifier position and
-// keeps its ordinary routes.
+//	GET  /v1/sessions/{sessionId}/documents/{documentId}/snapshots                    (the batch export)
+//	*    /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions          (named versions)
+//	*    /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}
+//	POST /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}/restore
+//
+// A trailing slash (an empty cursor, name or restore segment, including the
+// collection path with a trailing slash), extra path segments, or a "snapshots"
+// segment in any keyword position short of one of those shapes is a malformed
+// 400 rather than ServeMux's redirect or plain-text 404/405: the snapshot
+// surface promises a JSON error and never a redirect. Empty segments are
+// already rejected by the guard itself. The keyword is matched only past the
+// documentID position, so a session or document identifier literally named
+// "snapshots" occupies an identifier position and keeps its ordinary routes.
 func malformedSessionSnapshotsPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
 	if !ok {
@@ -192,7 +195,27 @@ func malformedSessionSnapshotsPath(p string) bool {
 		return false
 	}
 	// Keyword position reached. The collection is exactly
-	// {sessionId}/documents/{documentId}/snapshots; anything past it is a
+	// {sessionId}/documents/{documentId}/snapshots; the named-version subtree
+	// adds the versions collection, one non-empty name segment, and optionally
+	// a trailing restore segment. The session view has no single-snapshot
+	// item, so a cursor segment alone (or anything past the shapes below) is a
 	// malformed 400.
-	return !(len(segs) == 4 && segs[0] != "" && segs[2] != "")
+	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
+	versionsCollection := len(segs) == 5 && segs[0] != "" && segs[2] != "" && segs[4] == "versions"
+	versionsItem := len(segs) == 6 && segs[0] != "" && segs[2] != "" && segs[4] == "versions" && segs[5] != ""
+	versionsRestore := len(segs) == 7 && segs[0] != "" && segs[2] != "" && segs[4] == "versions" && segs[5] != "" && segs[6] == "restore"
+	return !(collection || versionsCollection || versionsItem || versionsRestore)
+}
+
+// inSessionSnapshotsSubtree reports whether segs (the path split after
+// /v1/sessions/) targets the session snapshot namespace — the collection or
+// its named-version subtree. That subtree owns its whole shape verdict through
+// malformedSessionSnapshotsPath, so the keyword guards for the change
+// collection (subscribe, poll, replay, merge, compact, query) and the document
+// restore endpoint must not judge a keyword that legitimately appears there:
+// the terminal "restore" segment of .../versions/{name}/restore and a version
+// name such as "query" or "subscribe" are ordinary identifiers inside this
+// subtree, not their endpoint keywords.
+func inSessionSnapshotsSubtree(segs []string) bool {
+	return len(segs) >= 4 && segs[1] == "documents" && segs[3] == "snapshots"
 }

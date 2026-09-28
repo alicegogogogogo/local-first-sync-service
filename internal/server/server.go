@@ -344,6 +344,44 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	// Session-scoped named snapshot versions: the session view's counterpart
+	// to the document-level versions subtree. POST registers a name, GET lists,
+	// and the item path reads (GET), renames (PUT) and deletes (DELETE) one
+	// marker; a final restore segment restores the named snapshot as an
+	// ordinary change. The calling device is the session's owning device
+	// resolved from the path, so no device id or new credential travels with
+	// these requests. The method-less dispatch patterns answer a wrong verb
+	// with a JSON 400 (matching the rest of the session surface) and missing or
+	// extra segments are a JSON 400 via malformedSessionSnapshotsPath.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			handleSessionPutSnapshotVersion(s, w, r)
+		case http.MethodGet:
+			handleSessionListSnapshotVersions(s, w, r)
+		default:
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+		}
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			handleSessionGetSnapshotVersion(s, w, r)
+		case http.MethodPut:
+			handleSessionRebindSnapshotVersion(s, w, r)
+		case http.MethodDelete:
+			handleSessionDeleteSnapshotVersion(s, w, r)
+		default:
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+		}
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+			return
+		}
+		handleSessionRestoreSnapshotVersion(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCRDTState(s, w, r)
 	})
@@ -752,6 +790,12 @@ func malformedSubscribePath(p string) bool {
 	// has its own guard; "subscribe" there is not the changes-subscribe
 	// keyword.
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	// The snapshot named-version subtree owns its own shape guard; a version
+	// named "subscribe" and .../versions/{name}/restore are ordinary
+	// identifiers there, not this endpoint's keyword.
+	if inSessionSnapshotsSubtree(segs) {
 		return false
 	}
 	for i, seg := range segs {
