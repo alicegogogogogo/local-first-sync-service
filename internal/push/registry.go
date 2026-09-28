@@ -45,8 +45,9 @@ type Info struct {
 
 // Subscription is one live registry entry. Its one-shot Canceled channel is
 // closed exactly when the device actively cancels this connection through the
-// management endpoint; a revoke, a shutdown and a client disconnect never
-// close it.
+// management endpoint; a revoke, a document deletion, a shutdown and a client
+// disconnect never close it — those end the connection through their own
+// service channels while CloseDocument/Unregister simply drop the entry.
 type Subscription struct {
 	info       Info
 	cancel     chan struct{}
@@ -146,6 +147,27 @@ func (r *Registry) Cancel(deviceID, id string) bool {
 
 	sub.cancelOnce.Do(func() { close(sub.cancel) })
 	return true
+}
+
+// CloseDocument drops every live entry — across both push channels and every
+// owning device — subscribed to documentID, so those connections vanish from
+// every subscription-management list at once. The connections themselves are
+// ended through their own service channels (the document-deleted signal that
+// carries the fixed close code), not through the active-cancel signal; this
+// registry owns no durable state and holds no close code. Entries on other
+// documents are untouched.
+func (r *Registry) CloseDocument(documentID string) {
+	r.mu.Lock()
+	var ids []string
+	for id, sub := range r.live {
+		if sub.info.DocumentID == documentID {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range ids {
+		delete(r.live, id)
+	}
+	r.mu.Unlock()
 }
 
 // formatID renders the monotonic sequence as the subscription id. The prefix

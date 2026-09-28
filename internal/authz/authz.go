@@ -200,6 +200,37 @@ func (s *Service) DeleteDevicePermissionsTx(q store.DBTX, deviceID string) error
 	return err
 }
 
+// DocumentHasRowsTx reports whether the ledger holds any row (a grant or a
+// revoke deviation) for documentID. It is part of document existence: a
+// document whose only durable trace is a permission deviation still exists and
+// can be deleted so that the same id is later a brand-new document with no
+// inherited authorization state.
+func (s *Service) DocumentHasRowsTx(q store.DBTX, documentID string) (bool, error) {
+	var exists bool
+	if err := q.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM document_permissions WHERE document_id = ?)`,
+		documentID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// DeleteDocumentPermissionsTx removes every permission-ledger row that names
+// documentID, inside the caller's transaction: the per-device grant/revoke
+// deviations of a deleted document vanish with it, so when the same id is
+// created again every pair starts from the default (authorized) with no
+// inherited ledger state. It is the permission service's share of document
+// deletion, run in the same serialized transaction as the change-event and
+// CRDT cascades, so the row removals and the document deletion commit as one
+// judgment.
+func (s *Service) DeleteDocumentPermissionsTx(q store.DBTX, documentID string) error {
+	_, err := q.Exec(
+		`DELETE FROM document_permissions WHERE document_id = ?`, documentID,
+	)
+	return err
+}
+
 // DocumentAuthorized reports whether deviceID currently holds permission for
 // documentID. Devices start authorized, so an absent row means authorized.
 func (s *Service) DocumentAuthorized(documentID, deviceID string) (bool, error) {

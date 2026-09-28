@@ -168,7 +168,10 @@ func (s *Service) WaitForChanges(ctx context.Context, documentID string, after, 
 
 	select {
 	case <-ch:
-		// Woken by a committed change or by InterruptWaits.
+		// Woken by a committed change, a whole-document deletion, or
+		// InterruptWaits. A deleted document is an unknown document now: answer
+		// an empty page at cursor 0 with timedOut=false rather than reporting a
+		// deadline expiry. Any other empty re-read keeps the old timeout shape.
 		s.mu.Lock()
 		closing := s.closed
 		s.mu.Unlock()
@@ -176,6 +179,18 @@ func (s *Service) WaitForChanges(ctx context.Context, documentID string, after, 
 			return nil, 0, false, ErrStoreClosing
 		}
 		changes, nextCursor, err = s.ListChanges(documentID, after, limit)
+		if err != nil {
+			return nil, 0, false, err
+		}
+		if len(changes) == 0 {
+			known, knownErr := s.DocumentExists(documentID)
+			if knownErr != nil {
+				return nil, 0, false, knownErr
+			}
+			if !known {
+				return changes, 0, false, nil
+			}
+		}
 		return changes, nextCursor, len(changes) == 0, err
 	case <-timer.C:
 		// Timeout with no new rows: echo the caller's cursor without

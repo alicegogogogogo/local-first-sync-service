@@ -38,6 +38,13 @@ type Subscription struct {
 	// revoked while this subscription is live. Closing is sticky.
 	revoked       chan struct{}
 	revokedClosed bool
+	// deleted is closed once, when the keyed document is deleted as a whole
+	// while this subscription is live. The connection then ends with the
+	// document-deleted close code; closing is sticky, so a document later
+	// re-created under the same id never reopens a subscription the deletion
+	// already ended.
+	deleted       chan struct{}
+	deletedClosed bool
 }
 
 // Wake returns the coalescing drain signal.
@@ -45,6 +52,9 @@ func (x *Subscription) Wake() <-chan struct{} { return x.wakes }
 
 // Revoked returns the one-shot revoke signal.
 func (x *Subscription) Revoked() <-chan struct{} { return x.revoked }
+
+// Deleted returns the one-shot document-deleted signal.
+func (x *Subscription) Deleted() <-chan struct{} { return x.deleted }
 
 // Drain removes and returns every queued merged state in commit order. It
 // returns nil when the queue is empty.
@@ -85,6 +95,7 @@ func (s *Service) AddSubscription(documentID, deviceID string) (*Subscription, f
 	sub := &Subscription{
 		wakes:   make(chan struct{}, 1),
 		revoked: make(chan struct{}),
+		deleted: make(chan struct{}),
 	}
 	key := crdtSubKey{document: documentID, device: deviceID}
 
@@ -216,6 +227,33 @@ func (s *Service) SignalDeviceDeregistered(deviceID string) {
 
 	for _, sub := range targets {
 		close(sub.revoked)
+	}
+}
+
+// SignalDocumentDeleted ends every live CRDT subscription open on documentID,
+// across every device, after the document's deletion transaction committed:
+// its CRDT state is already gone, so each connection closes immediately with
+// the document-deleted code, stickily — a document later re-created under the
+// same id never reopens these subscriptions. Other documents' subscriptions
+// are untouched.
+func (s *Service) SignalDocumentDeleted(documentID string) {
+	s.subMu.Lock()
+	var targets []*Subscription
+	for key, set := range s.subs {
+		if key.document != documentID {
+			continue
+		}
+		for _, sub := range set {
+			if !sub.deletedClosed {
+				sub.deletedClosed = true
+				targets = append(targets, sub)
+			}
+		}
+	}
+	s.subMu.Unlock()
+
+	for _, sub := range targets {
+		close(sub.deleted)
 	}
 }
 

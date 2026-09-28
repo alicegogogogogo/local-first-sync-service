@@ -126,10 +126,11 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		}
 	}()
 
-	// endNow maps a closing store to 1001, an active device cancel to 4410
-	// and a sticky revoke to 4403, waiting briefly for the peer's close echo.
-	// Termination takes precedence over a racing cancel or revoke. It returns
-	// true when the subscription must end.
+	// endNow maps a closing store to 1001, an active device cancel to 4410, a
+	// whole-document deletion to 4420 and a sticky revoke to 4403, waiting
+	// briefly for the peer's close echo. Termination takes precedence over a
+	// racing cancel, deletion or revoke. It returns true when the subscription
+	// must end.
 	endNow := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
@@ -138,6 +139,12 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		select {
 		case <-managed.Canceled():
 			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+			return true
+		default:
+		}
+		select {
+		case <-sub.Deleted():
+			endSubscription(conn, clientGone, wsCloseDocumentDeleted, "document deleted")
 			return true
 		default:
 		}
@@ -212,6 +219,13 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		select {
 		case <-sub.Wake():
 			// A coalescing "drain now" signal; loop and flush the whole queue.
+		case <-sub.Deleted():
+			if s.Closing() {
+				endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+				return
+			}
+			endSubscription(conn, clientGone, wsCloseDocumentDeleted, "document deleted")
+			return
 		case <-managed.Canceled():
 			if s.Closing() {
 				endSubscription(conn, clientGone, wsCloseGoingAway, "going away")

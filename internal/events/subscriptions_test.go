@@ -54,7 +54,7 @@ func TestSubscriptionWakesOnAllCommitPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch, _, unregister := s.AddSubscription("doc", "dev-1")
+	ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
 	drainWait(ch)
 
@@ -114,7 +114,7 @@ func TestSubscriptionIdempotentWritesDoNotWake(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch, _, unregister := s.AddSubscription("doc", "dev-1")
+	ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
 	drainWait(ch)
 
@@ -135,11 +135,11 @@ func TestSubscriptionCommitScopedToDocument(t *testing.T) {
 	s, _ := app.Open("")
 	defer func() { _ = s.Close() }()
 
-	chA, _, unregA := s.AddSubscription("docA", "dev-1")
+	chA, _, _, unregA := s.AddSubscription("docA", "dev-1")
 	defer unregA()
-	chAOther, _, unregOther := s.AddSubscription("docA", "other")
+	chAOther, _, _, unregOther := s.AddSubscription("docA", "other")
 	defer unregOther()
-	chB, _, unregB := s.AddSubscription("docB", "dev-1")
+	chB, _, _, unregB := s.AddSubscription("docB", "dev-1")
 	defer unregB()
 	for _, c := range []<-chan struct{}{chA, chAOther, chB} {
 		drainWait(c)
@@ -165,11 +165,11 @@ func TestSubscriptionRevokeScopedToPair(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	chTarget, revoked, unregTarget := s.AddSubscription("doc", "dev-1")
+	chTarget, revoked, _, unregTarget := s.AddSubscription("doc", "dev-1")
 	defer unregTarget()
-	chOtherDevice, _, unregOther := s.AddSubscription("doc", "other")
+	chOtherDevice, _, _, unregOther := s.AddSubscription("doc", "other")
 	defer unregOther()
-	chOtherDoc, _, unregOtherDoc := s.AddSubscription("other-doc", "dev-1")
+	chOtherDoc, _, _, unregOtherDoc := s.AddSubscription("other-doc", "dev-1")
 	defer unregOtherDoc()
 	for _, c := range []<-chan struct{}{chTarget, chOtherDevice, chOtherDoc} {
 		drainWait(c)
@@ -208,7 +208,7 @@ func TestSubscriptionUnregisterAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, unregister := s.AddSubscription("doc", "dev-1")
+	_, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	unregister()
 	unregister() // must not panic or double-decrement
 
@@ -223,7 +223,7 @@ func TestSubscriptionUnregisterAndClose(t *testing.T) {
 // InterruptWaits/Close wakes every live subscription and Closing reports it.
 func TestSubscriptionWokenByClose(t *testing.T) {
 	s, _ := app.Open("")
-	ch, _, unregister := s.AddSubscription("doc", "dev-1")
+	ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
 
 	go func() {
@@ -240,7 +240,7 @@ func TestSubscriptionWokenByClose(t *testing.T) {
 func TestSubscriptionAddedWhileClosing(t *testing.T) {
 	s, _ := app.Open("")
 	s.InterruptWaits()
-	ch, _, unregister := s.AddSubscription("doc", "dev-1")
+	ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	defer unregister()
 	waitWake(t, ch, "late subscription")
 }
@@ -255,7 +255,7 @@ func TestSubscriptionManyConcurrent(t *testing.T) {
 	unregs := make([]func(), n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
-		ch, _, unregister := s.AddSubscription("doc", "dev-1")
+		ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 		chs[i] = ch
 		unregs[i] = unregister
 		drainWait(ch)
@@ -293,7 +293,7 @@ func TestSubscriptionWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch, _, unregister := s.AddSubscription("doc", "dev-1")
+	ch, _, _, unregister := s.AddSubscription("doc", "dev-1")
 	drainWait(ch)
 	if _, err := s.PostChanges("doc", changes("c2")); err != nil {
 		t.Fatal(err)

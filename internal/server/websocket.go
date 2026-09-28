@@ -60,6 +60,10 @@ const (
 	// wsCloseSubscriptionCanceled (4410) ends a subscription its owning
 	// device actively canceled through the subscription management endpoint.
 	wsCloseSubscriptionCanceled = 4410
+	// wsCloseDocumentDeleted (4420) ends every live subscription — both push
+	// channels, across every owning device — after the subscribed document is
+	// deleted as a whole. Only that document's connections receive it.
+	wsCloseDocumentDeleted = 4420
 )
 
 // ErrWebSocketClosed is returned by ReadMessage when the peer sends a close

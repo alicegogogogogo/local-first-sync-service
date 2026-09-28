@@ -242,7 +242,7 @@ func (a *App) CompactSessionChanges(documentID, deviceID string) (boundary, remo
 }
 
 // AddSubscription delegates to the change event service.
-func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-chan struct{}, func()) {
+func (a *App) AddSubscription(documentID, deviceID string) (wakes <-chan struct{}, revoked <-chan struct{}, deleted <-chan struct{}, unregister func()) {
 	return a.events.AddSubscription(documentID, deviceID)
 }
 
@@ -283,6 +283,89 @@ func (a *App) DeregisterDevice(deviceID string) error {
 	// (404), so the connection cannot immediately re-establish itself.
 	a.events.SignalDeviceDeregistered(deviceID)
 	a.crdt.SignalDeviceDeregistered(deviceID)
+	return nil
+}
+
+// ---- Document-level deletion. ----
+
+// DeleteDocument removes a registered device's whole document in one
+// serialized, synchronously committed transaction. The calling device is
+// declared by deviceId — no new authentication is introduced.
+//
+// The fixed verdict order is taken inside the transaction, before any cleanup:
+//
+//   - an unregistered device yields store.ErrDeviceNotFound (404) and writes
+//     nothing;
+//   - a device whose permission for the document was revoked yields
+//     store.ErrPermissionDenied (403) and no cleanup runs;
+//   - a document with no durable data anywhere — never created or already
+//     deleted — yields events.ErrDocumentNotFound (404) and writes nothing.
+//
+// On success every row of the document is removed as one judgment: its online
+// and trimmed change log, the retained idempotency summaries, its snapshots,
+// its CRDT state and the per-document permission ledger. The same id is a
+// brand-new document afterward — the cursor space restarts at 1 — and
+// inherits no history. Concurrent deletes commit at most once because the
+// existence verdict and the deletions share one immediate transaction on the
+// single connection.
+//
+// Only after the commit is durable are the document's live subscriptions
+// ended (close code 4420 on both push channels) and dropped from the
+// management registry; other documents' and devices' connections are
+// untouched.
+func (a *App) DeleteDocument(documentID, deviceID string) error {
+	tx, err := a.Store.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Registration first, then permission, both before any document content
+	// is observed: a rejected delete reveals nothing and cleans nothing.
+	if err := a.Authz.AuthorizedTx(tx, documentID, deviceID); err != nil {
+		return err
+	}
+
+	eventsExist, err := a.events.DocumentDataExistsTx(tx, documentID)
+	if err != nil {
+		return err
+	}
+	crdtExist, err := a.crdt.DocumentDataExistsTx(tx, documentID)
+	if err != nil {
+		return err
+	}
+	// A ledger-only deviation row also counts as document data, so a document
+	// whose only durable trace is a grant/revoke still deletes cleanly and the
+	// re-created id inherits no authorization state.
+	ledgerExist, err := a.Authz.DocumentHasRowsTx(tx, documentID)
+	if err != nil {
+		return err
+	}
+	if !eventsExist && !crdtExist && !ledgerExist {
+		return events.ErrDocumentNotFound
+	}
+
+	if err := a.events.DeleteDocumentDataTx(tx, documentID); err != nil {
+		return err
+	}
+	if err := a.crdt.DeleteDocumentDataTx(tx, documentID); err != nil {
+		return err
+	}
+	if err := a.Authz.DeleteDocumentPermissionsTx(tx, documentID); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	// End the document's live subscriptions on both channels and drop them
+	// from the management registry only after the cleanup is durable: the
+	// close is one-shot per connection, so a client re-subscribing to the
+	// now-fresh id opens a new connection and never reopens the ended ones.
+	a.events.SignalDocumentDeleted(documentID)
+	a.crdt.SignalDocumentDeleted(documentID)
+	a.CloseDocumentPush(documentID)
 	return nil
 }
 
@@ -371,4 +454,11 @@ func (a *App) ListPushSubscriptions(deviceID string) []push.Info {
 // by another device; those cases are one indistinguishable 404 at the edge.
 func (a *App) CancelPushSubscription(deviceID, subscriptionID string) bool {
 	return a.pushSubs.Cancel(deviceID, subscriptionID)
+}
+
+// CloseDocumentPush ends every live push connection subscribed to documentID,
+// across both channels and every owning device, after its deletion committed.
+// Other documents' connections are untouched.
+func (a *App) CloseDocumentPush(documentID string) {
+	a.pushSubs.CloseDocument(documentID)
 }

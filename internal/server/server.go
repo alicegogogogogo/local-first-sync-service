@@ -389,6 +389,22 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusNotFound, "unknown session path")
 	})
 
+	// Document-level data cleanup: DELETE on the document item path removes the
+	// whole document. The caller is declared by the deviceId query parameter.
+	// It sits before the sub-resource routes but matches only the exact item.
+	mux.HandleFunc("DELETE /v1/documents/{documentID}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteDocument(s, w, r)
+	})
+	// The document item path accepts only DELETE; every other verb gets a JSON
+	// 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// A DELETE short of the document id misses the segment that names the
+	// document; answer a JSON 400 instead of the collection's unknown-path 404.
+	mux.HandleFunc("DELETE /v1/documents", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "document deletion path is malformed")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handlePostChanges(s, w, r)
 	})
@@ -556,7 +572,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
