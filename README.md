@@ -339,7 +339,7 @@ DELETE /v1/documents/doc-1?deviceId=device-1
 - 成功返回 `200`，正文是一行紧凑 JSON 加末尾一个换行，只给文档标识与删除标记两个字段：`{"deleted":true,"documentId":"doc-1"}`（键序按现有紧凑编码）。不新增其他字段。
 - 清理在单个序列化事务内完成并同步落盘，一并清掉该文档的：
   - 在线变更与被压缩裁掉的变更（含压缩保留的幂等摘要）以及恢复来源记录；
-  - 全部快照与变更压缩边界——边界一并删除，此后同一标识按全新文档重新从游标 1 分配；
+  - 全部快照、快照命名版本标记与变更压缩边界——边界一并删除，此后同一标识按全新文档重新从游标 1 分配；
   - CRDT 全部状态（固定类型、操作日志、计数器/集合/寄存器/orset 合并表、墓碑与压缩保留摘要）；
   - 该文档的权限台账（各设备的授权/撤回偏差行）。
 - 判定顺序固定为请求形状（`400`）→ 设备存在性（`404`）→ 文档权限（`403`）→ 文档存在性（`404`），前序失败优先返回，各类失败均零写入且不执行任何清理：
@@ -368,7 +368,7 @@ DELETE /v1/documents/doc-1?deviceId=device-1
 
 - `documentID`、`deviceId`、每个 change 的 `id` 均为非空字符串；`changes` 为非空数组，元素含非空 `id` 和任意 JSON `payload`。
 - 不合格式、字段类型错误或批内 `id` 重复返回 `400` JSON 错误（`{"error": "..."}`），整批零写入。
-- 同一文档内按 `id` 去重：新 `id` 获得递增 cursor；已存在的 `id` 仅当 `deviceId` 与解码后的 JSON 值都相同才幂等（`created=false`，cursor 为首次值），否则返回 `409` JSON 错误，整批零写入。
+- 同一文档内按 `id` 去重：新 `id` 获得递增 cursor；已存在的 `id` 仅当 `deviceId` 与解码后的 JSON 值都相同才幂等（`created=false`，cursor 为首次值），否则返回 `409` JSON 错误，正文为 `{"error": "...", "conflictId": "<冲突的变更 id>"}`，整批零写入。
 - 成功返回 `200`：`{"results":[{"id","created","cursor"}, ...]}`，顺序与请求一致。
 - 有效批次原子提交；并发批次不会重复分配 cursor，也不会丢记录。
 
@@ -615,6 +615,81 @@ Sec-WebSocket-Version: 13
 - 命中后在单事务内把该快照的 `state` 作为 payload，以 `deviceId`、`changeId` 追加一条普通 change；历史记录不变，文档 cursor 加一。成功返回 `200`：`{"id":changeId,"created":true,"cursor":N,"restoredFrom":snapshotCursor}`。
 - 同一文档同一 `changeId` 仅当 `deviceId`、`snapshotCursor` 与来源 state 都相同时才幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入。
 - 恢复来源随数据落盘，重启后幂等与冲突判定不变；并发恢复在序列化事务内分配唯一且连续的 cursor。
+
+### 快照命名版本
+
+命名版本给历史快照状态补一层稳定名字：客户端用文档内唯一的名字指向某个**已存在**的快照游标，随后即可按名字列出、读取或恢复，而不必记住游标。版本标记只登记名字与快照游标的对应关系，不复制也不改动任何快照本身，不占用变更游标、不产生变更记录或推送。全部入口沿用文档资源路径，调用设备由请求声明（写操作在 JSON 体内带 `deviceId`，只读与删除走查询参数 `deviceId`），不新增任何认证机制。
+
+所有版本入口共用固定的判定顺序：请求形状（`400`）→ 设备存在性（设备未注册为 `404`）→ 文档权限（权限被撤回为 `403`）→ 版本与快照存在性（版本名或目标快照不存在为 `404`）→ 绑定冲突（`409`）。前序失败优先返回，三类失败各自独立判定、都不暴露版本内容，也不重定向、不输出 HTML。形状非法、空标识、路径段缺失或多余、方法不匹配一律返回 `400` JSON 错误且零写入。
+
+#### `POST /v1/documents/{documentID}/snapshots/versions`
+
+把某个已存在的快照游标登记为版本名。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "name": "v1", "snapshotCursor": 2}
+```
+
+- `documentID`、`deviceId`、`name` 均为非空字符串；`snapshotCursor` 为正整数（拒绝小数、字符串、布尔、`null`、零、负数或缺失）。
+- 登记在单个序列化事务内完成：先做设备与权限判定，再校验目标快照存在（未知文档或游标无快照为 `404`），最后处理名字。
+- 名字在文档内唯一。首次登记成功返回 `200`，一行紧凑 JSON 加末尾换行，只给版本名与对应快照游标两个字段，键序固定：`{"name":"v1","snapshotCursor":2}`。
+- 同一版本名再次绑到**同一**游标算幂等：返回与首次登记逐字一致的正文（`200`，零写入）。
+- 把同一版本名改绑到别的快照游标、或目标名字已被其他游标占用时，返回 `409` JSON 错误且零写入，既有绑定不变。
+- 登记同步落盘；进程重启后名字与游标的对应、幂等与冲突判定不变。
+
+#### `GET /v1/documents/{documentID}/snapshots/versions?deviceId=D`
+
+列出文档的全部版本登记。无请求体，调用设备经查询参数 `deviceId` 声明。
+
+- 按版本名升序（字典序）给出全部登记，每项只有 `name` 与 `snapshotCursor` 两个键且键序固定；顶层键按 `versions`、`count` 的顺序固定，`count` 与数组长度一致。例如：
+
+```
+{"versions":[{"name":"alpha","snapshotCursor":2},{"name":"v1","snapshotCursor":1}],"count":2}
+```
+
+- 未知文档或没有任何登记时照样成功：返回 `200`，正文为空数组加零计数 `{"versions":[],"count":0}`，而不是错误。
+- 只读动作：不写入、不占用游标、不产生变更记录或推送。设备未注册返回 `404`，权限被撤回返回 `403`，两类失败都不返回任何版本内容。
+
+#### `GET /v1/documents/{documentID}/snapshots/versions/{name}?deviceId=D`
+
+按版本名读取所指快照的状态。无请求体。
+
+- 命中返回 `200`，正文与按游标读取（`GET .../snapshots/{cursor}`）**逐字一致**：一行紧凑 JSON、末尾换行，`{"cursor":N,"state":...}`，`state` 原样呈现创建时保存的 JSON 内容（可以是 `null`、数字、字符串、数组或对象）。
+- 版本名不存在（含未知文档）返回 `404` JSON 错误；设备未注册返回 `404`，权限被撤回返回 `403`，均不暴露状态内容。
+
+#### `PUT /v1/documents/{documentID}/snapshots/versions/{name}`
+
+改名：把已存在的版本名挪到另一个**已存在**的快照游标。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "snapshotCursor": 3}
+```
+
+- 判定顺序与登记一致：形状（`400`）→ 设备（`404`）→ 权限（`403`）→ 版本名存在性（名字未登记为 `404`）→ 目标快照存在性（游标无快照、含未知文档为 `404`）。
+- 成功把标记更新到新游标，返回 `200`，正文与登记一致：`{"name":name,"snapshotCursor":cursor}`。改绑到当前已指向的同一游标算幂等，正文一致、零写入。
+- 只移动名字，不改动任何快照本身。改名同步落盘，重启后对应关系不变。
+
+#### `DELETE /v1/documents/{documentID}/snapshots/versions/{name}?deviceId=D`
+
+删除一个版本标记。无请求体。
+
+- 命中返回 `200`，一行紧凑 JSON 加末尾换行，只给版本名与删除标记：`{"deleted":true,"name":"v1"}`。
+- 版本名不存在（含未知文档）或重复删除，一律返回 `404` JSON 错误且零写入；设备未注册返回 `404`，权限被撤回返回 `403`。
+- 删除只移除标记，不改动快照本身。删除提交后该名字即可重新登记复用。删除同步落盘，重启后重复删除仍为 `404`。
+
+#### `POST /v1/documents/{documentID}/snapshots/versions/{name}/restore`
+
+按版本名恢复：把名字所指快照的 state 当作一次普通变更写回文档。仅接受 `Content-Type: application/json`。请求体：
+
+```json
+{"deviceId": "device-1", "changeId": "change-9"}
+```
+
+- 来源快照由路径上的版本名解析，体内只带 `deviceId` 与非空 `changeId`；形状判定与既有恢复入口一致（类型头、JSON、尾随内容、空字段等均为 `400`）。
+- 判定顺序为形状（`400`）→ 设备（`404`）→ 权限（`403`）→ 版本名存在性（名字未登记为 `404`；所指快照已不存在同样为 `404`）→ 幂等与冲突判定。
+- 命中后在单事务内把所指快照的 `state` 作为 payload，以 `deviceId`、`changeId` 追加一条普通 change；历史记录不变，文档 cursor 加一。成功正文与按游标的恢复逐字一致：`{"id":changeId,"created":true,"cursor":N,"restoredFrom":snapshotCursor}`。
+- 幂等与冲突判定完全沿用既有恢复入口：同一 `changeId` 仅当 `deviceId`、来源快照游标与来源 state 都相同才幂等（`created=false`、首次 cursor）；该 id 已被普通变更占用，或任一条件不符，返回 `409` JSON 错误且零写入。
+- 恢复是一次普通变更：提交后唤醒长轮询并推送订阅方；幂等重复不产生新游标也不推送。并发恢复在序列化事务内分配唯一且连续的 cursor，恢复来源随数据落盘，重启后判定与正文不变。
 
 ### `POST /v1/devices/{deviceId}/attachments`
 

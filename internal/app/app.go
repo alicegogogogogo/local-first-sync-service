@@ -204,6 +204,43 @@ func (a *App) RestoreSessionSnapshot(documentID, deviceID, changeID string, snap
 	return a.events.RestoreSnapshotAuthorized(documentID, deviceID, changeID, snapshotCursor)
 }
 
+// PutSnapshotVersion binds an existing snapshot cursor to a stable version
+// name, delegating to the change event service's gated transaction: the
+// registration/permission verdict is taken before the snapshot and version
+// are observed, so a rejected request exposes neither.
+func (a *App) PutSnapshotVersion(documentID, deviceID, name string, cursor int64) (events.VersionResult, error) {
+	return a.events.PutSnapshotVersion(documentID, deviceID, name, cursor)
+}
+
+// ListSnapshotVersions delegates to the change event service.
+func (a *App) ListSnapshotVersions(documentID, deviceID string) ([]events.SnapshotVersion, error) {
+	return a.events.ListSnapshotVersions(documentID, deviceID)
+}
+
+// GetSnapshotVersionState delegates to the change event service, resolving a
+// version name to its snapshot cursor and stored state.
+func (a *App) GetSnapshotVersionState(documentID, deviceID, name string) (int64, json.RawMessage, error) {
+	return a.events.GetSnapshotVersionState(documentID, deviceID, name)
+}
+
+// RebindSnapshotVersion moves a version name onto another existing snapshot,
+// delegating to the change event service's gated transaction.
+func (a *App) RebindSnapshotVersion(documentID, deviceID, name string, cursor int64) (events.VersionResult, error) {
+	return a.events.RebindSnapshotVersion(documentID, deviceID, name, cursor)
+}
+
+// DeleteSnapshotVersion hard-deletes one version marker, delegating to the
+// change event service's gated transaction; the snapshot itself is untouched.
+func (a *App) DeleteSnapshotVersion(documentID, deviceID, name string) error {
+	return a.events.DeleteSnapshotVersion(documentID, deviceID, name)
+}
+
+// RestoreSnapshotVersion restores the snapshot a version name points at as an
+// ordinary change, delegating to the change event service's gated restore.
+func (a *App) RestoreSnapshotVersion(documentID, deviceID, changeID, name string) (events.RestoreResult, error) {
+	return a.events.RestoreSnapshotVersion(documentID, deviceID, changeID, name)
+}
+
 // ListChanges delegates to the change event service.
 func (a *App) ListChanges(documentID string, after, limit int64) ([]events.ListedChange, int64, error) {
 	return a.events.ListChanges(documentID, after, limit)
@@ -302,12 +339,12 @@ func (a *App) DeregisterDevice(deviceID string) error {
 //     deleted — yields events.ErrDocumentNotFound (404) and writes nothing.
 //
 // On success every row of the document is removed as one judgment: its online
-// and trimmed change log, the retained idempotency summaries, its snapshots,
-// its CRDT state and the per-document permission ledger. The same id is a
-// brand-new document afterward — the cursor space restarts at 1 — and
-// inherits no history. Concurrent deletes commit at most once because the
-// existence verdict and the deletions share one immediate transaction on the
-// single connection.
+// and trimmed change log, the retained idempotency summaries, its snapshots
+// and named snapshot-version markers, its CRDT state and the per-document
+// permission ledger. The same id is a brand-new document afterward — the
+// cursor space restarts at 1 — and inherits no history or version names.
+// Concurrent deletes commit at most once because the existence verdict and
+// the deletions share one immediate transaction on the single connection.
 //
 // Only after the commit is durable are the document's live subscriptions
 // ended (close code 4420 on both push channels) and dropped from the

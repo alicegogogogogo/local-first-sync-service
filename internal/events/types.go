@@ -127,6 +127,37 @@ type ExportedSnapshot struct {
 	State  json.RawMessage `json:"state"`
 }
 
+// ErrVersionConflict reports that a version registration or rename cannot be
+// applied: the version name is already bound to a different snapshot cursor,
+// or the requested bind would move an existing name (and zero writes is the
+// required outcome). The caller maps it to 409.
+type ErrVersionConflict struct {
+	Name string
+}
+
+func (e *ErrVersionConflict) Error() string {
+	return fmt.Sprintf("snapshot version %q is bound to another cursor", e.Name)
+}
+
+// ErrVersionNotFound reports that no snapshot version of the document carries
+// the requested name. The caller maps it to 404.
+var ErrVersionNotFound = errors.New("snapshot version not found")
+
+// SnapshotVersion is one row of a ListSnapshotVersions result: the version
+// name together with the snapshot cursor it points at.
+type SnapshotVersion struct {
+	Name   string `json:"name"`
+	Cursor int64  `json:"snapshotCursor"`
+}
+
+// VersionResult reports the outcome of registering or renaming a snapshot
+// version: the version name and the snapshot cursor it is bound to. An
+// idempotent registration returns the same body as the first registration.
+type VersionResult struct {
+	Name   string `json:"name"`
+	Cursor int64  `json:"snapshotCursor"`
+}
+
 // RestoreResult reports the outcome of an accepted RestoreSnapshot.
 type RestoreResult struct {
 	ID           string `json:"id"`
@@ -178,5 +209,11 @@ CREATE TABLE IF NOT EXISTS change_identities (
 	cursor        INTEGER NOT NULL,
 	restored_from INTEGER,
 	PRIMARY KEY (document_id, id)
+);
+CREATE TABLE IF NOT EXISTS snapshot_versions (
+	document_id TEXT NOT NULL,
+	name        TEXT NOT NULL,
+	cursor      INTEGER NOT NULL,
+	PRIMARY KEY (document_id, name)
 );
 `

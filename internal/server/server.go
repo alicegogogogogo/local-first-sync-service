@@ -475,13 +475,59 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
-	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
+	// The single-snapshot path is GET (the read); the same method-less pattern
+	// answers every other verb with a JSON 400 rather than ServeMux's
+	// plain-text 405. It is kept method-less (rather than a GET pattern plus a
+	// fallback) so the named-version subtree below can register its own
+	// method-less dispatch patterns without a method/path specificity conflict:
+	// a literal "versions" segment is more specific than {cursor} and wins.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, r *http.Request) {
+		// GET is the read; ServeMux's GET pattern also answered HEAD with the
+		// same response, so keep HEAD on the read. Every other verb is a JSON
+		// 400 rather than a plain-text 405.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+			return
+		}
 		handleGetSnapshot(s, w, r)
 	})
-	// Non-GET verbs on the single-snapshot path get a JSON 400 rather than
-	// ServeMux's plain-text 405: the read is GET-only.
-	mux.HandleFunc("/v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, _ *http.Request) {
-		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	// Named snapshot versions live in a versions subtree below the snapshot
+	// collection: POST registers a name, GET lists, and the item path reads
+	// (GET), renames (PUT) and deletes (DELETE) one marker; a final restore
+	// segment restores the named snapshot as an ordinary change. The subtree
+	// uses method-less dispatch patterns (one per shape) that answer wrong
+	// verbs with a JSON 400, matching the rest of the document surface and
+	// avoiding ServeMux's method/path specificity conflict against {cursor}.
+	// Every path carries the document resource and the device identity — no
+	// new authentication is introduced.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/versions", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			handlePutSnapshotVersion(s, w, r)
+		case http.MethodGet:
+			handleListSnapshotVersions(s, w, r)
+		default:
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+		}
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			handleGetSnapshotVersion(s, w, r)
+		case http.MethodPut:
+			handleRebindSnapshotVersion(s, w, r)
+		case http.MethodDelete:
+			handleDeleteSnapshotVersion(s, w, r)
+		default:
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+		}
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/versions/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+			return
+		}
+		handleRestoreSnapshotVersion(s, w, r)
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleRestore(s, w, r)
@@ -598,6 +644,15 @@ func malformedNewDocumentPath(p string) bool {
 	}
 	segs := strings.Split(rest, "/")
 
+	// The named-snapshot-version subtree ({documentID}/snapshots/versions/...)
+	// owns its whole shape verdict through malformedSnapshotPath. A version
+	// name may coincide with a change keyword ("poll", "merge", "restore",
+	// "subscribe", "compact"), so none of the keyword loops below may judge a
+	// path inside that subtree; leave it to the snapshot guard.
+	if len(segs) >= 3 && segs[0] != "" && segs[1] == "snapshots" && segs[2] == "versions" {
+		return false
+	}
+
 	// Poll endpoint: "poll" must be exactly the third segment, after a
 	// non-empty documentID and "changes".
 	for i, seg := range segs {
@@ -627,7 +682,8 @@ func malformedNewDocumentPath(p string) bool {
 	// Merge and restore endpoints: each keyword must be exactly the second
 	// segment, after a non-empty documentID (they are document-item
 	// subresources, unlike poll/compact which sit below the change
-	// collection).
+	// collection). A keyword used as a version name inside the versions
+	// subtree was excluded by the early return above.
 	for _, keyword := range []string{"merge", "restore"} {
 		for i, seg := range segs {
 			if seg == keyword && i > 0 {
@@ -930,7 +986,10 @@ func handlePostChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var conflict *events.ErrConflict
 		if errors.As(err, &conflict) {
-			writeError(w, http.StatusConflict, "change id already exists with different deviceId or payload: "+conflict.ID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "change id already exists with different deviceId or payload",
+				"conflictId": conflict.ID,
+			})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to commit changes")

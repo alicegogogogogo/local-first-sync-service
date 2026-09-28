@@ -122,18 +122,22 @@ func handleSessionExportSnapshots(s *app.App, w http.ResponseWriter, r *http.Req
 }
 
 // malformedSnapshotPath reports whether p targets the snapshot namespace but
-// is not at one of its two exact locations:
+// is not at one of its exact locations:
 //
-//	GET  /v1/documents/{documentID}/snapshots          (the batch export)
-//	GET  /v1/documents/{documentID}/snapshots/{cursor} (the single read)
+//	GET  /v1/documents/{documentID}/snapshots                    (the batch export)
+//	GET  /v1/documents/{documentID}/snapshots/{cursor}          (the single read)
+//	*    /v1/documents/{documentID}/snapshots/versions          (named versions)
+//	*    /v1/documents/{documentID}/snapshots/versions/{name}
+//	POST /v1/documents/{documentID}/snapshots/versions/{name}/restore
 //
-// A trailing slash (an empty cursor segment, including the collection path
-// with a trailing slash), extra path segments, or a "snapshots" segment in any
-// keyword position short of one of those shapes is a malformed 400 rather than
-// ServeMux's redirect or plain-text 404/405: the snapshot endpoints promise a
-// JSON error and never a redirect. Empty segments are already rejected by the
-// guard itself. The keyword is matched only past the documentID position, so a
-// document literally named "snapshots" keeps its ordinary routes.
+// A trailing slash (an empty cursor or name segment, including the collection
+// path with a trailing slash), extra path segments, or a "snapshots" segment
+// in any keyword position short of one of those shapes is a malformed 400
+// rather than ServeMux's redirect or plain-text 404/405: the snapshot
+// endpoints promise a JSON error and never a redirect. Empty segments are
+// already rejected by the guard itself. The keyword is matched only past the
+// documentID position, so a document literally named "snapshots" keeps its
+// ordinary routes.
 func malformedSnapshotPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/documents/")
 	if !ok {
@@ -146,11 +150,15 @@ func malformedSnapshotPath(p string) bool {
 		}
 		// Keyword position reached. The collection is exactly
 		// {documentID}/snapshots; the single read adds one non-empty cursor
-		// segment. Anything else (trailing slash, missing/extra segments) is
-		// malformed.
+		// segment; the named-version subtree adds the versions collection, one
+		// non-empty name segment, and optionally a trailing restore segment.
+		// Anything else (trailing slash, missing/extra segments) is malformed.
 		collection := len(segs) == 2 && segs[0] != ""
-		item := len(segs) == 3 && segs[0] != "" && segs[2] != ""
-		return !(collection || item)
+		cursorItem := len(segs) == 3 && segs[0] != "" && segs[2] != ""
+		versionsCollection := len(segs) == 3 && segs[0] != "" && segs[2] == "versions"
+		versionsItem := len(segs) == 4 && segs[0] != "" && segs[2] == "versions" && segs[3] != ""
+		versionsRestore := len(segs) == 5 && segs[0] != "" && segs[2] == "versions" && segs[3] != "" && segs[4] == "restore"
+		return !(collection || cursorItem || versionsCollection || versionsItem || versionsRestore)
 	}
 	return false
 }
