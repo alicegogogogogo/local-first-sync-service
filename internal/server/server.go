@@ -151,6 +151,34 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
 	})
+	// Device subscription management: a read-only live-subscription view and
+	// an active-cancel entry. The path device id is the only identity; no new
+	// authentication is introduced.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/subscriptions", func(w http.ResponseWriter, r *http.Request) {
+		handleListSubscriptions(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/subscriptions/{subscriptionId}", func(w http.ResponseWriter, r *http.Request) {
+		handleCancelSubscription(s, w, r)
+	})
+	// The subscription collection path accepts only GET: a DELETE short of
+	// the subscription id is a malformed cancel, and every other verb is a
+	// method mismatch; both are a JSON 400. The more specific exact GET above
+	// wins for the listing.
+	mux.HandleFunc("DELETE /v1/devices/{deviceId}/subscriptions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "subscription cancel path is malformed")
+	})
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// The subscription item path accepts only DELETE. Other verbs on the
+	// exact shape and any extra segment past it are a malformed path or
+	// method mismatch answered with a JSON 400 instead of the subtree 404.
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions/{subscriptionId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/devices/{deviceId}/subscriptions/{subscriptionId}/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "subscription path is malformed")
+	})
 	mux.HandleFunc("POST /v1/devices/{deviceId}/attachments", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateAttachment(s, w, r)
 	})

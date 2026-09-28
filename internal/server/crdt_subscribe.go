@@ -90,6 +90,14 @@ func handleCRDTStateSubscribe(s *app.App, w http.ResponseWriter, r *http.Request
 // returns when the client leaves, permission is revoked or the store starts
 // closing; the hijacked connection is closed on exit.
 func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, deviceID string) {
+	// The management registry row exists for the connection's lifetime: it
+	// makes the subscription listable by its owning device and lets the
+	// active-cancel entry end this one connection with 4410. A state
+	// subscription has no starting cursor, so the registered cursor is 0.
+	_, _, canceledCh, dropFromRegistry := s.RegisterPushSubscription(
+		deviceID, documentID, app.PushChannelState, 0)
+	defer dropFromRegistry()
+
 	initial, sub, unregister, err := s.OpenCRDTSubscription(documentID, deviceID)
 	if err != nil {
 		_ = conn.Close(wsCloseInternalError, "internal error")
@@ -120,9 +128,10 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		}
 	}()
 
-	// endNow maps a closing store to 1001 and a sticky revoke to 4403, waiting
-	// briefly for the peer's close echo. Termination takes precedence over a
-	// racing revoke. It returns true when the subscription must end.
+	// endNow maps a closing store to 1001, a sticky revoke to 4403 and an
+	// active cancellation to 4410, waiting briefly for the peer's close echo.
+	// Termination takes precedence over a racing revoke or cancel. It returns
+	// true when the subscription must end.
 	endNow := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
@@ -131,6 +140,12 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 		select {
 		case <-sub.Revoked():
 			endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+			return true
+		default:
+		}
+		select {
+		case <-canceledCh:
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
 			return true
 		default:
 		}
@@ -205,6 +220,20 @@ func serveCRDTStateSubscription(r *http.Request, s *app.App, conn *wsConn, docum
 				return
 			}
 			endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+			return
+		case <-canceledCh:
+			if s.Closing() {
+				endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+				return
+			}
+			// A sticky revoke racing the cancel keeps its 4403 verdict.
+			select {
+			case <-sub.Revoked():
+				endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+				return
+			default:
+			}
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
 			return
 		case <-clientGone:
 			return

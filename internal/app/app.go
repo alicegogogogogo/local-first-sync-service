@@ -37,6 +37,11 @@ type App struct {
 	events *events.Service
 	crdt   *crdt.Service
 
+	// pushSubs is the process-wide in-memory registry of the live push
+	// connections of both channels; it backs the device subscription
+	// management entries.
+	pushSubs *pushRegistry
+
 	// Authz is the permission service. It is exposed so the HTTP layer can
 	// grant/revoke and read authorization directly; the other services reach
 	// it through their gates rather than this field.
@@ -78,10 +83,11 @@ func Open(path string) (*App, error) {
 	permissions.AddRevokeSink(crdtService)
 
 	return &App{
-		Store:  kernel,
-		events: eventService,
-		crdt:   crdtService,
-		Authz:  permissions,
+		Store:    kernel,
+		events:   eventService,
+		crdt:     crdtService,
+		pushSubs: newPushRegistry(),
+		Authz:    permissions,
 	}, nil
 }
 

@@ -116,6 +116,14 @@ func parseSubscribeCursor(w http.ResponseWriter, r *http.Request) (int64, bool) 
 // returns when the client leaves, permission is revoked or the store starts
 // closing; the hijacked connection is closed on exit.
 func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, deviceID string, cursor int64) {
+	// The management registry row exists for the connection's lifetime: it
+	// makes the subscription listable by its owning device and lets the
+	// active-cancel entry end this one connection with 4410. Registration is
+	// in-memory only and consumes no change cursor.
+	_, _, canceledCh, dropFromRegistry := s.RegisterPushSubscription(
+		deviceID, documentID, app.PushChannelChanges, cursor)
+	defer dropFromRegistry()
+
 	// Registration precedes the first read: the wake channel is buffered, so
 	// a commit during a read leaves a pending wake that makes the next park
 	// return immediately — no wake is lost. The revoked channel closes once
@@ -145,10 +153,11 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 		}
 	}()
 
-	// checkEnd non-blockingly maps a closing store to 1001 and a sticky
-	// revoke to 4403; it returns true when the subscription must end. A
-	// termination signal takes precedence: SIGTERM must end every
-	// subscription with 1001 even if a revoke is also pending.
+	// checkEnd non-blockingly maps a closing store to 1001, a sticky revoke
+	// to 4403 and an active cancellation to 4410; it returns true when the
+	// subscription must end. A termination signal takes precedence: SIGTERM
+	// must end every subscription with 1001 even if a revoke or a cancel is
+	// also pending.
 	checkEnd := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
@@ -160,6 +169,12 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 			return true
 		default:
 		}
+		select {
+		case <-canceledCh:
+			endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
+			return true
+		default:
+		}
 		return false
 	}
 
@@ -167,9 +182,9 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 	first := true
 	for {
 		if !first {
-			// Park until a commit, a sticky revoke or the termination signal
-			// wakes us. r.Context() covers a non-shutdown cancel; the read
-			// pump covers a client disconnect.
+			// Park until a commit, a sticky revoke, an active cancellation or
+			// the termination signal wakes us. r.Context() covers a
+			// non-shutdown cancel; the read pump covers a client disconnect.
 			select {
 			case <-wakeCh:
 				// Drain any coalesced follow-up signal as well; the flush
@@ -185,6 +200,22 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 					return
 				}
 				endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+				return
+			case <-canceledCh:
+				if s.Closing() {
+					endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+					return
+				}
+				// A sticky revoke racing the cancel keeps its 4403 verdict:
+				// the permission withdrawal is durable, the cancel only
+				// targets this connection.
+				select {
+				case <-revokedCh:
+					endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+					return
+				default:
+				}
+				endSubscription(conn, clientGone, wsCloseSubscriptionCanceled, "subscription canceled")
 				return
 			case <-clientGone:
 				return

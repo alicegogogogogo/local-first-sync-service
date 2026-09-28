@@ -57,6 +57,10 @@ const (
 	// wsClosePermissionRevoked (4403) ends a subscription after its
 	// session's device loses permission for the document.
 	wsClosePermissionRevoked = 4403
+	// wsCloseSubscriptionCanceled (4410) ends the one subscription a device
+	// actively cancels through its subscription management entry. Other
+	// subscriptions are untouched.
+	wsCloseSubscriptionCanceled = 4410
 )
 
 // ErrWebSocketClosed is returned by ReadMessage when the peer sends a close
