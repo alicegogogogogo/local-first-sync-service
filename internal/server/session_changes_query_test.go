@@ -11,29 +11,35 @@ import (
 	"github.com/alicegogogogogo/local-first-sync-service/internal/app"
 )
 
-// queryChanges sends a raw POST to the batch lookup and returns the recorder.
-func queryChanges(t *testing.T, h http.Handler, doc, rawBody string) *httptest.ResponseRecorder {
+// sessionQueryPath is the session-scoped change-log batch lookup path.
+func sessionQueryPath(session, doc string) string {
+	return sessionChangesPath(session, doc) + "/query"
+}
+
+// querySessionChanges sends a raw POST to the session-scoped batch lookup and
+// returns the recorder.
+func querySessionChanges(t *testing.T, h http.Handler, session, doc, rawBody string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(http.MethodPost, "/v1/documents/"+doc+"/changes/query", strings.NewReader(rawBody))
+	r := httptest.NewRequest(http.MethodPost, sessionQueryPath(session, doc), strings.NewReader(rawBody))
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	return w
 }
 
-func TestQueryChangesHTTPSuccess(t *testing.T) {
+func TestSessionQueryChangesHTTPSuccess(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
-	postRawChanges(t, h, "doc1", "dev", `[
+	createSessionViaHTTP(t, h, "dev", "sess")
+	postSessionChanges(t, h, "sess", "doc1", `{"changes":[
 		{"id":"a","payload":{"k":"v"}},
 		{"id":"b","payload":42},
 		{"id":"c","payload":null}
-	]`)
+	]}`)
 
 	// Hits are answered in the order asked, each carrying source device,
 	// verbatim saved payload and cursor. The body is one compact line with
 	// top-level keys results,count and item keys id,status,deviceId,payload,cursor.
-	w := queryChanges(t, h, "doc1", `{"deviceId":"dev","ids":["c","a","nope","b"]}`)
+	w := querySessionChanges(t, h, "sess", "doc1", `{"ids":["c","a","nope","b"]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
@@ -53,13 +59,13 @@ func TestQueryChangesHTTPSuccess(t *testing.T) {
 
 // A payload is presented exactly as the JSON content saved at commit time:
 // key reordering and whitespace are normalized by the store, but the value is
-// otherwise byte-faithful.
-func TestQueryChangesHTTPPayloadVerbatim(t *testing.T) {
+// otherwise byte-faithful, regardless of which commit path wrote the row.
+func TestSessionQueryChangesHTTPPayloadVerbatim(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
+	createSessionViaHTTP(t, h, "dev", "sess")
 	postRawChanges(t, h, "doc1", "dev", `[{"id":"x","payload":{"arr":[1,true,null,"s"],"nested":{"z":1,"a":[{}]}}}]`)
 
-	w := queryChanges(t, h, "doc1", `{"deviceId":"dev","ids":["x"]}`)
+	w := querySessionChanges(t, h, "sess", "doc1", `{"ids":["x"]}`)
 	want := `{"results":[{"id":"x","status":"found","deviceId":"dev","payload":{"arr":[1,true,null,"s"],"nested":{"z":1,"a":[{}]}},"cursor":1}],"count":1}` + "\n"
 	if w.Body.String() != want {
 		t.Fatalf("body = %q\nwant %q", w.Body.String(), want)
@@ -69,12 +75,12 @@ func TestQueryChangesHTTPPayloadVerbatim(t *testing.T) {
 // Every queried id appears in the answer, including unknown ones: missing is
 // a normal answer with no content, not an error, and count matches the array
 // length even when the document has never existed.
-func TestQueryChangesHTTPMissingAndUnknownDocument(t *testing.T) {
+func TestSessionQueryChangesHTTPMissingAndUnknownDocument(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
+	createSessionViaHTTP(t, h, "dev", "sess")
 
 	for _, doc := range []string{"doc1", "never-heard-of-it"} {
-		w := queryChanges(t, h, doc, `{"deviceId":"dev","ids":["x","y"]}`)
+		w := querySessionChanges(t, h, "sess", doc, `{"ids":["x","y"]}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s status = %d body = %s", doc, w.Code, w.Body.String())
 		}
@@ -87,20 +93,20 @@ func TestQueryChangesHTTPMissingAndUnknownDocument(t *testing.T) {
 
 // A compacted-away id reports only its first cursor and trimmed status: no
 // device and no payload are restored, while the surviving online tail is
-// still found with full content.
-func TestQueryChangesHTTPCompacted(t *testing.T) {
+// still found with full content through the session view.
+func TestSessionQueryChangesHTTPCompacted(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev-1")
+	createSessionViaHTTP(t, h, "dev-1", "sess")
 	postDocChanges(t, h, "doc", "dev-1", 4)
 	w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 2, "state": map[string]any{"s": 1}})
 	if w.Code != http.StatusOK {
 		t.Fatalf("snapshot = %d %s", w.Code, w.Body.String())
 	}
-	if w := compactChanges(t, h, "doc", "dev-1"); w.Code != http.StatusOK {
+	if w := postSessionCompact(t, h, "sess", "doc", `{}`); w.Code != http.StatusOK {
 		t.Fatalf("compact = %d %s", w.Code, w.Body.String())
 	}
 
-	w = queryChanges(t, h, "doc", `{"deviceId":"dev-1","ids":["c1","c2","c3","gone-never"]}`)
+	w = querySessionChanges(t, h, "sess", "doc", `{"ids":["c1","c2","c3","gone-never"]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
@@ -116,11 +122,11 @@ func TestQueryChangesHTTPCompacted(t *testing.T) {
 }
 
 // Every request-shape violation is a 400 JSON error with zero writes, checked
-// before the device even exists.
-func TestQueryChangesHTTPRejectsBadShape(t *testing.T) {
+// before the session even exists.
+func TestSessionQueryChangesHTTPRejectsBadShape(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
-	url := "/v1/documents/doc1/changes/query"
+	createSessionViaHTTP(t, h, "dev", "sess")
+	url := sessionQueryPath("sess", "doc1")
 
 	send := func(contentType, raw string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, url, strings.NewReader(raw))
@@ -137,22 +143,19 @@ func TestQueryChangesHTTPRejectsBadShape(t *testing.T) {
 		contentType string
 		body        string
 	}{
-		{"wrong content type", "text/plain", `{"deviceId":"dev","ids":["a"]}`},
-		{"missing content type", "", `{"deviceId":"dev","ids":["a"]}`},
-		{"content type with json suffix", "application/vnd.api+json", `{"deviceId":"dev","ids":["a"]}`},
-		{"invalid json", "application/json", `{"deviceId":"dev","ids":[`},
-		{"trailing content", "application/json", `{"deviceId":"dev","ids":["a"]} junk`},
-		{"second json value", "application/json", `{"deviceId":"dev","ids":["a"]}{}`},
-		{"missing ids", "application/json", `{"deviceId":"dev"}`},
-		{"null ids", "application/json", `{"deviceId":"dev","ids":null}`},
-		{"empty ids", "application/json", `{"deviceId":"dev","ids":[]}`},
-		{"empty id element", "application/json", `{"deviceId":"dev","ids":["a",""]}`},
-		{"non-string id element", "application/json", `{"deviceId":"dev","ids":["a",1]}`},
-		{"ids not an array", "application/json", `{"deviceId":"dev","ids":"a"}`},
-		{"duplicate ids", "application/json", `{"deviceId":"dev","ids":["a","a"]}`},
-		{"missing deviceId", "application/json", `{"ids":["a"]}`},
-		{"empty deviceId", "application/json", `{"deviceId":"","ids":["a"]}`},
-		{"non-string deviceId", "application/json", `{"deviceId":7,"ids":["a"]}`},
+		{"wrong content type", "text/plain", `{"ids":["a"]}`},
+		{"missing content type", "", `{"ids":["a"]}`},
+		{"content type with json suffix", "application/vnd.api+json", `{"ids":["a"]}`},
+		{"invalid json", "application/json", `{"ids":[`},
+		{"trailing content", "application/json", `{"ids":["a"]} junk`},
+		{"second json value", "application/json", `{"ids":["a"]}{}`},
+		{"missing ids", "application/json", `{}`},
+		{"null ids", "application/json", `{"ids":null}`},
+		{"empty ids", "application/json", `{"ids":[]}`},
+		{"empty id element", "application/json", `{"ids":["a",""]}`},
+		{"non-string id element", "application/json", `{"ids":["a",1]}`},
+		{"ids not an array", "application/json", `{"ids":"a"}`},
+		{"duplicate ids", "application/json", `{"ids":["a","a"]}`},
 		{"non-object body", "application/json", `[1,2]`},
 	}
 	for _, tc := range cases {
@@ -170,36 +173,51 @@ func TestQueryChangesHTTPRejectsBadShape(t *testing.T) {
 		})
 	}
 
-	// A malformed body against an unregistered device is still a 400: shape
-	// validation precedes device existence.
-	w := send("application/json", `{"deviceId":"ghost","ids":[]}`)
+	// A stray deviceId is ignored like any other unknown field: it never
+	// overrides the session's owning device, so a query naming another device
+	// still answers as the session owner.
+	w := send("application/json", `{"deviceId":"someone-else","ids":["a"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stray deviceId = %d body = %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"deviceId":"someone-else"`) {
+		t.Fatalf("stray deviceId leaked into the answer: %s", w.Body.String())
+	}
+
+	// A malformed body against an unknown session is still a 400: shape
+	// validation precedes session existence.
+	r := httptest.NewRequest(http.MethodPost, sessionQueryPath("ghost", "doc1"), strings.NewReader(`{"ids":[]}`))
+	r.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("shape-before-existence = %d body = %s", w.Code, w.Body.String())
 	}
 }
 
-// Device existence and permission are enforced after shape validation, and a
-// failure exposes no change content.
-func TestQueryChangesHTTPGate(t *testing.T) {
+// Session existence and document permission are enforced after shape
+// validation, and a failure exposes no change content.
+func TestSessionQueryChangesHTTPGate(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
+	createSessionViaHTTP(t, h, "dev", "sess")
 	postRawChanges(t, h, "doc1", "dev", `[{"id":"a","payload":1}]`)
 
-	// Unregistered device: 404 with an error only.
-	w := queryChanges(t, h, "doc1", `{"deviceId":"ghost","ids":["a"]}`)
+	// Unknown session: 404 with an error only.
+	w := querySessionChanges(t, h, "ghost", "doc1", `{"ids":["a"]}`)
 	if w.Code != http.StatusNotFound {
-		t.Fatalf("unknown device = %d body = %s", w.Code, w.Body.String())
+		t.Fatalf("unknown session = %d body = %s", w.Code, w.Body.String())
 	}
 	if strings.Contains(w.Body.String(), `"results"`) || strings.Contains(w.Body.String(), `"payload"`) {
 		t.Fatalf("404 leaked change content: %s", w.Body.String())
 	}
 
-	// Revoked permission: 403 with an error only.
+	// Revoked permission of the session's owning device: 403 with an error
+	// only, regardless of the (ignored) deviceId the body happens to carry.
 	w, _ = postJSON(t, h, "/v1/documents/doc1/permissions", map[string]any{"deviceId": "dev", "action": "revoke"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("revoke = %d %s", w.Code, w.Body.String())
 	}
-	w = queryChanges(t, h, "doc1", `{"deviceId":"dev","ids":["a"]}`)
+	w = querySessionChanges(t, h, "sess", "doc1", `{"deviceId":"dev","ids":["a"]}`)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("revoked device = %d body = %s", w.Code, w.Body.String())
 	}
@@ -208,16 +226,32 @@ func TestQueryChangesHTTPGate(t *testing.T) {
 	}
 }
 
+// A hard-deleted session answers 404 like one that never existed.
+func TestSessionQueryChangesHTTPDeletedSession(t *testing.T) {
+	h, _ := newTestHandler(t)
+	createSessionViaHTTP(t, h, "dev", "sess")
+	postRawChanges(t, h, "doc1", "dev", `[{"id":"a","payload":1}]`)
+	w, _ := doRequest(t, h, http.MethodDelete, "/v1/devices/dev/sessions/sess")
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete session = %d %s", w.Code, w.Body.String())
+	}
+
+	w = querySessionChanges(t, h, "sess", "doc1", `{"ids":["a"]}`)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("deleted session = %d body = %s", w.Code, w.Body.String())
+	}
+}
+
 // The lookup is read-only: it allocates no cursor, so a later commit receives
 // the cursor it would have received without the queries, and it neither wakes
 // a parked long poll nor a push subscriber.
-func TestQueryChangesHTTPReadOnly(t *testing.T) {
+func TestSessionQueryChangesHTTPReadOnly(t *testing.T) {
 	h, s := newTestHandler(t)
-	registerDevice(t, h, "dev")
-	postRawChanges(t, h, "doc1", "dev", `[{"id":"a","payload":1}]`)
+	createSessionViaHTTP(t, h, "dev", "sess")
+	postSessionChanges(t, h, "sess", "doc1", `{"changes":[{"id":"a","payload":1}]}`)
 
-	// A parked long poll with a short wait must time out despite queries
-	// hitting the same document.
+	// A parked session long poll with a short wait must time out despite
+	// queries hitting the same document.
 	done := make(chan struct {
 		changes  int
 		timedOut bool
@@ -234,7 +268,7 @@ func TestQueryChangesHTTPReadOnly(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond) // let the poll park
 	for i := 0; i < 3; i++ {
-		if w := queryChanges(t, h, "doc1", `{"deviceId":"dev","ids":["a","missing"]}`); w.Code != http.StatusOK {
+		if w := querySessionChanges(t, h, "sess", "doc1", `{"ids":["a","missing"]}`); w.Code != http.StatusOK {
 			t.Fatalf("query %d = %d %s", i, w.Code, w.Body.String())
 		}
 	}
@@ -247,8 +281,8 @@ func TestQueryChangesHTTPReadOnly(t *testing.T) {
 		t.Fatalf("poll woken by a read-only query: %+v", got)
 	}
 
-	// The queries consumed no cursor: the next commit gets cursor 2.
-	postRawChanges(t, h, "doc1", "dev", `[{"id":"b","payload":2}]`)
+	// The queries consumed no cursor: the next session commit gets cursor 2.
+	postSessionChanges(t, h, "sess", "doc1", `{"changes":[{"id":"b","payload":2}]}`)
 	rows, next, err := s.ListChanges("doc1", 0, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -258,27 +292,32 @@ func TestQueryChangesHTTPReadOnly(t *testing.T) {
 	}
 }
 
-// Method and path shape: only POST at the exact .../changes/query location is
-// accepted; every other verb or shape is a JSON 400, never a redirect.
-func TestQueryChangesHTTPMethodAndPath(t *testing.T) {
+// Method and path shape: only POST at the exact session .../changes/query
+// location is accepted; every other verb or shape is a JSON 400, never a
+// redirect.
+func TestSessionQueryChangesHTTPMethodAndPath(t *testing.T) {
 	h, _ := newTestHandler(t)
+	createSessionViaHTTP(t, h, "dev", "sess")
 
 	cases := []struct {
 		method string
 		path   string
 	}{
-		{http.MethodGet, "/v1/documents/doc1/changes/query"},
-		{http.MethodPut, "/v1/documents/doc1/changes/query"},
-		{http.MethodDelete, "/v1/documents/doc1/changes/query"},
-		{http.MethodPost, "/v1/documents/doc1/changes/query/"},
-		{http.MethodPost, "/v1/documents/doc1/changes/query/extra"},
-		{http.MethodPost, "/v1/documents/doc1/changes/queryextra"},
-		{http.MethodPost, "/v1/documents//changes/query"},
-		{http.MethodPost, "/v1/documents/doc1/changesx/query"},
+		{http.MethodGet, "/v1/sessions/sess/documents/doc1/changes/query"},
+		{http.MethodPut, "/v1/sessions/sess/documents/doc1/changes/query"},
+		{http.MethodDelete, "/v1/sessions/sess/documents/doc1/changes/query"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/changes/query/"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/changes/query/extra"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/changes/queryextra"},
+		{http.MethodPost, "/v1/sessions//documents/doc1/changes/query"},
+		{http.MethodPost, "/v1/sessions/sess/documents//changes/query"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/changesx/query"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/query"},
+		{http.MethodPost, "/v1/sessions/sess/documents/doc1/query/changes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
-			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"deviceId":"dev","ids":["a"]}`))
+			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"ids":["a"]}`))
 			r.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			h.ServeHTTP(w, r)
@@ -295,29 +334,37 @@ func TestQueryChangesHTTPMethodAndPath(t *testing.T) {
 	}
 }
 
-// A document literally named "query" keeps its ordinary change routes; the
-// query keyword is only recognized in the terminal subresource position.
-func TestQueryChangesHTTPDocumentNamedQuery(t *testing.T) {
+// A session or document literally named "query" keeps its ordinary change
+// routes; the query keyword is only recognized in the terminal subresource
+// position.
+func TestSessionQueryChangesHTTPIdentifiersNamedQuery(t *testing.T) {
 	h, _ := newTestHandler(t)
-	registerDevice(t, h, "dev")
-	postRawChanges(t, h, "query", "dev", `[{"id":"z","payload":1}]`)
+	createSessionViaHTTP(t, h, "dev", "query")
+	postRawChanges(t, h, "doc1", "dev", `[{"id":"z","payload":1}]`)
 
-	// Ordinary paged read on the document named "query".
-	w, _ := doRequest(t, h, http.MethodGet, "/v1/documents/query/changes")
+	// Ordinary session paged read through a session named "query".
+	w, _ := doRequest(t, h, http.MethodGet, "/v1/sessions/query/documents/doc1/changes")
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"id":"z"`) {
-		t.Fatalf("paged read on doc named query = %d %s", w.Code, w.Body.String())
+		t.Fatalf("paged read with session named query = %d %s", w.Code, w.Body.String())
 	}
-	// The lookup subresource of that document answers normally too.
-	w = queryChanges(t, h, "query", `{"deviceId":"dev","ids":["z"]}`)
+	// The lookup subresource of that session answers normally too.
+	w = querySessionChanges(t, h, "query", "doc1", `{"ids":["z"]}`)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"found"`) {
-		t.Fatalf("query on doc named query = %d %s", w.Code, w.Body.String())
+		t.Fatalf("query with session named query = %d %s", w.Code, w.Body.String())
+	}
+
+	// A document named "query": the keyword sits in an identifier position
+	// and its lookup subresource answers normally.
+	w = querySessionChanges(t, h, "query", "query", `{"ids":["z"]}`)
+	if w.Code == http.StatusBadRequest {
+		t.Fatalf("query on document named query rejected: %s", w.Body.String())
 	}
 }
 
-// The query verdict derives solely from durable data: after a process
-// restart the same request yields the byte-identical body, including found,
-// missing and compacted answers.
-func TestQueryChangesHTTPRestartStable(t *testing.T) {
+// The query verdict derives solely from durable data: after a process restart
+// the same request yields the byte-identical body, including found, missing
+// and compacted answers.
+func TestSessionQueryChangesHTTPRestartStable(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "sync.db")
 
@@ -326,15 +373,15 @@ func TestQueryChangesHTTPRestartStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := NewHandler(st)
-	registerDevice(t, h, "dev-1")
+	createSessionViaHTTP(t, h, "dev-1", "sess")
 	postDocChanges(t, h, "doc", "dev-1", 3)
 	if w, _ := postJSON(t, h, "/v1/documents/doc/snapshots", map[string]any{"cursor": 1, "state": map[string]any{"s": 1}}); w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
-	if w := compactChanges(t, h, "doc", "dev-1"); w.Code != http.StatusOK {
+	if w := postSessionCompact(t, h, "sess", "doc", `{}`); w.Code != http.StatusOK {
 		t.Fatal(w.Body.String())
 	}
-	body := queryChanges(t, h, "doc", `{"deviceId":"dev-1","ids":["c1","c2","nope"]}`).Body.String()
+	body := querySessionChanges(t, h, "sess", "doc", `{"ids":["c1","c2","nope"]}`).Body.String()
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -345,10 +392,7 @@ func TestQueryChangesHTTPRestartStable(t *testing.T) {
 	}
 	defer func() { _ = st2.Close() }()
 	h2 := NewHandler(st2)
-	r := httptest.NewRequest(http.MethodPost, "/v1/documents/doc/changes/query", strings.NewReader(`{"deviceId":"dev-1","ids":["c1","c2","nope"]}`))
-	r.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	h2.ServeHTTP(w, r)
+	w := querySessionChanges(t, h2, "sess", "doc", `{"ids":["c1","c2","nope"]}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("after restart = %d %s", w.Code, w.Body.String())
 	}

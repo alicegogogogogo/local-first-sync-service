@@ -293,6 +293,13 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCompactChanges(s, w, r)
 	})
+	// The session view's read-only batch lookup lives one segment below the
+	// session change collection, alongside the replay, merge and compaction
+	// subresources: a strict JSON POST carrying only the change ids to answer;
+	// the calling device is the session's owning device.
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/query", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionQueryChanges(s, w, r)
+	})
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionRestore(s, w, r)
 	})
@@ -312,6 +319,11 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Non-POST verbs on the session batch-lookup path get the same JSON 400:
+	// the lookup is a POST with a JSON body.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/query", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Non-POST verbs on the session restore path: the exact POST pattern above
@@ -629,7 +641,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedChangeQueryPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedChangeQueryPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionQueryPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
