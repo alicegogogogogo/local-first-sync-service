@@ -398,6 +398,12 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/query", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionQueryCRDTOps(s, w, r)
 	})
+	// The read-only ordered listing sits one segment below the session
+	// document's CRDT namespace too: a GET with no body and limit/offset query
+	// parameters; the calling device is the session's owning device.
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/list", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionListCRDTOps(s, w, r)
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		handleCRDTStateSubscribe(s, w, r)
 	})
@@ -415,6 +421,11 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/query", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Non-GET verbs on the session CRDT listing path get a JSON 400: the
+	// listing is a GET with no body.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/crdt/list", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/subscribe", func(w http.ResponseWriter, _ *http.Request) {
@@ -649,6 +660,12 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/crdt/query", func(w http.ResponseWriter, r *http.Request) {
 		handleQueryCRDTOps(s, w, r)
 	})
+	// The read-only ordered listing lives one segment below the document's
+	// CRDT namespace too: a GET with no body, the calling device in the
+	// deviceId query parameter and limit/offset pagination.
+	mux.HandleFunc("GET /v1/documents/{documentID}/crdt/list", func(w http.ResponseWriter, r *http.Request) {
+		handleListCRDTOps(s, w, r)
+	})
 	// Other verbs on the CRDT endpoints get a JSON 400 (the ops and compact
 	// endpoints only accept POST; the state and snapshot endpoints only accept
 	// GET) rather than ServeMux's plain-text 405.
@@ -667,6 +684,11 @@ func NewHandler(s *app.App) http.Handler {
 	// Non-POST verbs on the CRDT batch lookup path get a JSON 400: the lookup
 	// is a POST with a JSON body.
 	mux.HandleFunc("/v1/documents/{documentID}/crdt/query", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Non-GET verbs on the CRDT ordered-listing path get a JSON 400: the
+	// listing is a GET with no body.
+	mux.HandleFunc("/v1/documents/{documentID}/crdt/list", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 
@@ -844,15 +866,16 @@ func malformedSubscribePath(p string) bool {
 }
 
 // malformedSessionCRDTPath reports whether p targets the session-scoped CRDT
-// namespace but is not at one of its five exact locations:
+// namespace but is not at one of its six exact locations:
 //
 //	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/ops
 //	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state
 //	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/compact
 //	POST /v1/sessions/{sessionId}/documents/{documentId}/crdt/query
+//	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/list
 //	GET  /v1/sessions/{sessionId}/documents/{documentId}/crdt/state/subscribe
 //
-// a missing "ops"/"state"/"compact"/"query"/"subscribe" segment, an extra
+// a missing "ops"/"state"/"compact"/"query"/"list"/"subscribe" segment, an extra
 // segment, or a "crdt" segment in the keyword position (immediately past the
 // document identifier) short of one of the registered shapes. ServeMux would
 // answer those with a plain-text 404/405; every failure of these endpoints
@@ -862,9 +885,9 @@ func malformedSubscribePath(p string) bool {
 // "crdt" is treated as the endpoint keyword only in the fourth segment (index
 // 3, right after the document identifier); a session or document identifier
 // literally named "crdt" occupies an identifier position (index 0 or 2) and
-// keeps its ordinary routes. Likewise "compact" and "query" are endpoint
-// keywords only in the fifth segment; a session or document literally named
-// either is an ordinary identifier.
+// keeps its ordinary routes. Likewise "compact", "query" and "list" are
+// endpoint keywords only in the fifth segment; a session or document literally
+// named any of them is an ordinary identifier.
 func malformedSessionCRDTPath(p string) bool {
 	rest, ok := strings.CutPrefix(p, "/v1/sessions/")
 	if !ok {
@@ -875,9 +898,9 @@ func malformedSessionCRDTPath(p string) bool {
 		return false
 	}
 	// Keyword position reached. The batch commit, the state read, the
-	// compaction and the batch lookup are all exactly
-	// {sessionId}/documents/{documentId}/crdt/{ops,state,compact,query}; the
-	// subscription adds one trailing "subscribe" segment.
+	// compaction, the batch lookup and the ordered listing are all exactly
+	// {sessionId}/documents/{documentId}/crdt/{ops,state,compact,query,list};
+	// the subscription adds one trailing "subscribe" segment.
 	validOps := len(segs) == 5 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
@@ -894,12 +917,16 @@ func malformedSessionCRDTPath(p string) bool {
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "query"
+	validList := len(segs) == 5 &&
+		segs[0] != "" &&
+		segs[2] != "" &&
+		segs[4] == "list"
 	validSubscribe := len(segs) == 6 &&
 		segs[0] != "" &&
 		segs[2] != "" &&
 		segs[4] == "state" &&
 		segs[5] == "subscribe"
-	return !(validOps || validState || validCompact || validQuery || validSubscribe)
+	return !(validOps || validState || validCompact || validQuery || validList || validSubscribe)
 }
 
 // Handler exposes the HTTP surface over a private in-memory store. Use

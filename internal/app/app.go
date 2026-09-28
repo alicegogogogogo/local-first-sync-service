@@ -471,6 +471,14 @@ func (a *App) GetCRDTOpsByIDs(documentID, deviceID string, ids []string) ([]crdt
 	return a.crdt.GetOpsByIDs(documentID, deviceID, ids)
 }
 
+// ListCRDTOps delegates to the CRDT state service's read-only ordered
+// listing: one limit/offset page of the document's online operations in
+// ascending id order plus the total number of operations compaction trimmed,
+// gated on the calling device's registration and document permission.
+func (a *App) ListCRDTOps(documentID, deviceID string, limit, offset int64) (crdt.OpList, error) {
+	return a.crdt.ListOps(documentID, deviceID, limit, offset)
+}
+
 // OpenCRDTSubscription delegates to the CRDT state service.
 func (a *App) OpenCRDTSubscription(documentID, deviceID string) (*crdt.State, *crdt.Subscription, func(), error) {
 	return a.crdt.OpenSubscription(documentID, deviceID)
