@@ -464,6 +464,13 @@ func (a *App) GetCRDTSnapshot(documentID string) (crdt.Snapshot, error) {
 	return a.crdt.GetSnapshot(documentID)
 }
 
+// GetCRDTOpsByIDs delegates to the CRDT state service's read-only batch
+// lookup: per-id found/compacted/missing answers in request order, gated on
+// the calling device's registration and document permission.
+func (a *App) GetCRDTOpsByIDs(documentID, deviceID string, ids []string) ([]crdt.OpLookup, error) {
+	return a.crdt.GetOpsByIDs(documentID, deviceID, ids)
+}
+
 // OpenCRDTSubscription delegates to the CRDT state service.
 func (a *App) OpenCRDTSubscription(documentID, deviceID string) (*crdt.State, *crdt.Subscription, func(), error) {
 	return a.crdt.OpenSubscription(documentID, deviceID)
