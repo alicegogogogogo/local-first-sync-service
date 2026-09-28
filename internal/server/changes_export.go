@@ -176,13 +176,14 @@ func malformedChangeExportPath(p string) bool {
 		// Keyword position reached. The collection is exactly
 		// {documentID}/changes; the poll and compact subresources are their own
 		// endpoints and keep their own guards; the document-level subscription
-		// adds one trailing "subscribe" segment and keeps its own endpoint.
-		// Anything else (a trailing slash, an unrecognized extra segment) is a
-		// malformed 400.
+		// adds one trailing "subscribe" segment and keeps its own endpoint; the
+		// by-id batch query adds one trailing "query" segment and keeps its own
+		// endpoint. Anything else (a trailing slash, an unrecognized extra
+		// segment) is a malformed 400.
 		if i == 1 {
 			collection := len(segs) == 2 && segs[0] != ""
 			knownSubresource := len(segs) >= 3 &&
-				(segs[2] == "poll" || segs[2] == "compact" || segs[2] == "subscribe")
+				(segs[2] == "poll" || segs[2] == "compact" || segs[2] == "subscribe" || segs[2] == "query")
 			return !(collection || knownSubresource)
 		}
 		return false

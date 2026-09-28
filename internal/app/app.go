@@ -252,6 +252,15 @@ func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.
 	return a.events.ExportChanges(documentID, from, to)
 }
 
+// FetchChanges returns one answer per requested change id, in the given
+// order, delegating to the change event service's gated read: the
+// registration/permission verdict is taken before any change content is read,
+// so an unregistered or revoked device observes nothing. The read creates no
+// change, allocates no cursor and notifies no waiter or subscriber.
+func (a *App) FetchChanges(documentID, deviceID string, ids []string) ([]events.FetchedChange, error) {
+	return a.events.FetchChangesAuthorized(documentID, deviceID, ids)
+}
+
 // WaitForChanges delegates to the change event service.
 func (a *App) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) ([]events.ListedChange, int64, bool, error) {
 	return a.events.WaitForChanges(ctx, documentID, after, limit, wait)

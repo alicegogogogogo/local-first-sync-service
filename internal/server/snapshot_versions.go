@@ -94,7 +94,10 @@ func versionDeviceFromQuery(w http.ResponseWriter, r *http.Request) (string, boo
 // endpoint onto their fixed status codes, returning true when err was handled.
 // The order mirrors the verdict order: device existence (404), permission
 // (403), version and snapshot existence (404), conflict (409); none of the
-// failure bodies exposes version content.
+// failure bodies exposes version content. A bind/rebind conflict carries the
+// offending version name in the structured conflictId field alongside the
+// error message, the same shape a change-commit conflict uses for its change
+// id, instead of embedding it only in the error text.
 func writeVersionGateError(w http.ResponseWriter, err error) bool {
 	var conflict *events.ErrVersionConflict
 	switch {
@@ -107,7 +110,10 @@ func writeVersionGateError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, events.ErrSnapshotNotFound):
 		writeError(w, http.StatusNotFound, "snapshot not found")
 	case errors.As(err, &conflict):
-		writeError(w, http.StatusConflict, "snapshot version is already bound to another cursor: "+conflict.Name)
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":      "snapshot version is already bound to another cursor",
+			"conflictId": conflict.Name,
+		})
 	default:
 		return false
 	}

@@ -449,6 +449,14 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/changes/query", func(w http.ResponseWriter, r *http.Request) {
+		handleQueryChanges(s, w, r)
+	})
+	// The by-id batch query accepts only POST; every other verb on its exact
+	// path gets a JSON 400 rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/query", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
 		handleReplay(s, w, r)
 	})
@@ -700,6 +708,15 @@ func malformedNewDocumentPath(p string) bool {
 			if len(segs) >= 2 && segs[1] == "crdt" {
 				return false
 			}
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// By-id batch query endpoint: "query" must be exactly the third segment,
+	// after a non-empty documentID and "changes" — a trailing slash, a missing
+	// segment or an extra segment past it is a malformed 400 rather than the
+	// mux's plain-text 404.
+	for i, seg := range segs {
+		if seg == "query" && i > 0 {
 			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
 		}
 	}
