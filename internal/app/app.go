@@ -442,6 +442,16 @@ func (a *App) GetCRDTState(documentID string) (crdt.State, error) {
 	return a.crdt.GetState(documentID)
 }
 
+// GetCRDTOpsByIDs delegates to the CRDT state service's read-only batch
+// lookup: per-id found/compacted/missing answers in request order, each found
+// answer carrying the originating device and the type-specific comparison
+// content saved with the row, gated on the calling device's registration and
+// document permission. A document with no committed CRDT operation yields
+// crdt.ErrNotFound.
+func (a *App) GetCRDTOpsByIDs(documentID, deviceID string, ids []string) ([]crdt.OpLookup, error) {
+	return a.crdt.GetOpsByIDs(documentID, deviceID, ids)
+}
+
 // CompactCRDT delegates to the CRDT state service.
 func (a *App) CompactCRDT(documentID, deviceID string) (crdt.Snapshot, error) {
 	return a.crdt.Compact(documentID, deviceID)
