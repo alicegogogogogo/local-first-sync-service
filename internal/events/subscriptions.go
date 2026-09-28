@@ -30,6 +30,11 @@ type subscription struct {
 	// revoked while this subscription is live. Closing is sticky.
 	revoked       chan struct{}
 	revokedClosed bool
+	// deleted is closed once, when the keyed document's durable data is
+	// deleted while this subscription is live. The close is document-scoped
+	// (it reaches every device subscribed to the document) and sticky.
+	deleted       chan struct{}
+	deletedClosed bool
 }
 
 // AddSubscription registers an in-memory subscription for documentID as seen
@@ -38,21 +43,24 @@ type subscription struct {
 //   - wakes: signaled (coalesceably) after every change commit on documentID;
 //   - revoked: closed once if/when permission for (documentID, deviceID) is
 //     revoked while the subscription is live;
+//   - deleted: closed once if/when documentID's durable data is deleted while
+//     the subscription is live; unlike revoked it is document-scoped, so every
+//     device's subscription on the document receives it;
 //   - unregister: idempotent removal; a client disconnect, a permission close
 //     and a service stop may all race to call it.
 //
 // If the service is already stopping the wake channel is signaled immediately
 // and unregister is a no-op, so a late subscriber parks on nothing.
-func (s *Service) AddSubscription(documentID, deviceID string) (wakes <-chan struct{}, revoked <-chan struct{}, unregister func()) {
+func (s *Service) AddSubscription(documentID, deviceID string) (wakes <-chan struct{}, revoked <-chan struct{}, deleted <-chan struct{}, unregister func()) {
 	ch := make(chan struct{}, 1)
-	sub := &subscription{wakes: ch, revoked: make(chan struct{})}
+	sub := &subscription{wakes: ch, revoked: make(chan struct{}), deleted: make(chan struct{})}
 	key := subKey{document: documentID, device: deviceID}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		close(ch)
-		return ch, sub.revoked, func() {}
+		return ch, sub.revoked, sub.deleted, func() {}
 	}
 	s.subWG.Add(1)
 	s.nextSub++
@@ -78,7 +86,7 @@ func (s *Service) AddSubscription(documentID, deviceID string) (wakes <-chan str
 		}
 		s.mu.Unlock()
 	}
-	return ch, sub.revoked, remove
+	return ch, sub.revoked, sub.deleted, remove
 }
 
 // signalSubscribers wakes every subscription open on documentID. It is called
@@ -154,6 +162,41 @@ func (s *Service) SignalDeviceDeregistered(deviceID string) {
 
 	for _, sub := range targets {
 		close(sub.revoked)
+	}
+}
+
+// SignalDocumentDeleted ends every live subscription open on documentID,
+// across every device, after the document's data-clearing transaction has
+// committed: its change log, snapshots and CRDT state are already hard-deleted,
+// so every connection on it closes immediately with the document-deleted code
+// — stickily, nothing can reopen it. Parked long polls are woken as well; they
+// re-read and find an unknown document, so they answer an empty page at once
+// instead of waiting out their deadline. Unlike SignalRevoked it is not scoped
+// to one device: other documents' subscriptions and polls are untouched, but
+// every device subscribed to this document is ended.
+func (s *Service) SignalDocumentDeleted(documentID string) {
+	s.mu.Lock()
+	set := s.waits[documentID]
+	delete(s.waits, documentID)
+	var targets []*subscription
+	for key, subs := range s.subs {
+		if key.document != documentID {
+			continue
+		}
+		for _, sub := range subs {
+			if !sub.deletedClosed {
+				sub.deletedClosed = true
+				targets = append(targets, sub)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, ch := range set {
+		close(ch)
+	}
+	for _, sub := range targets {
+		close(sub.deleted)
 	}
 }
 

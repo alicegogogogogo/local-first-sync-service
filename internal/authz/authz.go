@@ -200,6 +200,33 @@ func (s *Service) DeleteDevicePermissionsTx(q store.DBTX, deviceID string) error
 	return err
 }
 
+// DocumentExistsTx reports whether documentID has any permission ledger row,
+// evaluated inside the caller's transaction. A document whose every device
+// keeps the default authorization has no row and therefore reports false here;
+// it is the ledger's share of the document-level existence verdict.
+func (s *Service) DocumentExistsTx(q store.DBTX, documentID string) (bool, error) {
+	var exists bool
+	if err := q.QueryRow(
+		`SELECT EXISTS(SELECT 1 FROM document_permissions WHERE document_id = ?)`,
+		documentID,
+	).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// DeleteDocumentPermissionsTx removes every permission ledger row of
+// documentID, inside the caller's serialized transaction: grants and revokes
+// the document accumulated vanish with it. A same-named document created
+// afterward starts with the default authorization for every device and
+// inherits no prior grant or revoke.
+func (s *Service) DeleteDocumentPermissionsTx(q store.DBTX, documentID string) error {
+	_, err := q.Exec(
+		`DELETE FROM document_permissions WHERE document_id = ?`, documentID,
+	)
+	return err
+}
+
 // DocumentAuthorized reports whether deviceID currently holds permission for
 // documentID. Devices start authorized, so an absent row means authorized.
 func (s *Service) DocumentAuthorized(documentID, deviceID string) (bool, error) {

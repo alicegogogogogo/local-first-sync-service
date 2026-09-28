@@ -389,6 +389,35 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusNotFound, "unknown session path")
 	})
 
+	// Document-level data clearing. The item path accepts only DELETE; every
+	// other verb on it gets a JSON 400 rather than ServeMux's plain-text 405.
+	// A DELETE short of the document id segment is a malformed path (the
+	// trailing-slash shape /v1/documents/ is intercepted by emptyIDGuard), and
+	// a DELETE carrying any extra segments lands on the method-less subtree
+	// fallback below (recognized subresources keep their own method-less 400
+	// routes because they are more specific).
+	mux.HandleFunc("DELETE /v1/documents/{documentID}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteDocument(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("DELETE /v1/documents", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "document delete path is malformed")
+	})
+	// Last-resort fallback under the document item. It is dominated by every
+	// registered document route (all of which are more specific), so it only
+	// sees genuinely unrecognized suffixes. A DELETE with extra segments is a
+	// malformed document delete (400 JSON, never ServeMux's redirect or
+	// plain-text 404/405); other verbs on an unknown path are a JSON 404.
+	mux.HandleFunc("/v1/documents/{documentID}/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			writeError(w, http.StatusBadRequest, "document delete path is malformed")
+			return
+		}
+		writeError(w, http.StatusNotFound, "unknown document path")
+	})
+
 	mux.HandleFunc("POST /v1/documents/{documentID}/changes", func(w http.ResponseWriter, r *http.Request) {
 		handlePostChanges(s, w, r)
 	})
@@ -550,7 +579,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 
-		documentSegmentEmpty := strings.HasPrefix(p, "/v1/documents//")
+		documentSegmentEmpty := strings.HasPrefix(p, "/v1/documents//") || p == "/v1/documents/"
 		newFamilySegmentEmpty := false
 		if strings.HasPrefix(p, "/v1/devices/") || strings.HasPrefix(p, "/v1/sessions/") {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")

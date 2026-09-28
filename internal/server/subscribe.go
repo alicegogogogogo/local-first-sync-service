@@ -120,8 +120,10 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 	// Registration precedes the first read: the wake channel is buffered, so
 	// a commit during a read leaves a pending wake that makes the next park
 	// return immediately — no wake is lost. The revoked channel closes once
-	// if access is withdrawn, and that event survives a racing re-grant.
-	wakeCh, revokedCh, unregister := s.AddSubscription(documentID, deviceID)
+	// if access is withdrawn, and that event survives a racing re-grant. The
+	// deleted channel closes once for every device when the document's data
+	// is deleted.
+	wakeCh, revokedCh, deletedCh, unregister := s.AddSubscription(documentID, deviceID)
 	// The management-plane record makes this connection listable and
 	// cancelable by its owning device. It is pure memory: removal is the only
 	// teardown and it neither writes nor advances anything.
@@ -152,10 +154,10 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 	}()
 
 	// checkEnd non-blockingly maps a closing store to 1001, an active device
-	// cancel to 4410 and a sticky revoke to 4403; it returns true when the
-	// subscription must end. A termination signal takes precedence: SIGTERM
-	// must end every subscription with 1001 even if a cancel or a revoke is
-	// also pending.
+	// cancel to 4410, a sticky revoke to 4403 and a document deletion to 4420;
+	// it returns true when the subscription must end. A termination signal
+	// takes precedence: SIGTERM must end every subscription with 1001 even if
+	// a cancel, revoke or deletion is also pending.
 	checkEnd := func() bool {
 		if s.Closing() {
 			endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
@@ -170,6 +172,12 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 		select {
 		case <-revokedCh:
 			endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+			return true
+		default:
+		}
+		select {
+		case <-deletedCh:
+			endSubscription(conn, clientGone, wsCloseDocumentDeleted, "document deleted")
 			return true
 		default:
 		}
@@ -205,6 +213,13 @@ func serveSubscription(r *http.Request, s *app.App, conn *wsConn, documentID, de
 					return
 				}
 				endSubscription(conn, clientGone, wsClosePermissionRevoked, "permission revoked")
+				return
+			case <-deletedCh:
+				if s.Closing() {
+					endSubscription(conn, clientGone, wsCloseGoingAway, "going away")
+					return
+				}
+				endSubscription(conn, clientGone, wsCloseDocumentDeleted, "document deleted")
 				return
 			case <-clientGone:
 				return

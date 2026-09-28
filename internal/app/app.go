@@ -242,7 +242,7 @@ func (a *App) CompactSessionChanges(documentID, deviceID string) (boundary, remo
 }
 
 // AddSubscription delegates to the change event service.
-func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-chan struct{}, func()) {
+func (a *App) AddSubscription(documentID, deviceID string) (<-chan struct{}, <-chan struct{}, <-chan struct{}, func()) {
 	return a.events.AddSubscription(documentID, deviceID)
 }
 
