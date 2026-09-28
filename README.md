@@ -232,6 +232,7 @@ go test ./...
   - `idempotent`：`change.id` 已存在且**来源设备与解码后的负载都一致**时未新建，返回首次游标与 `result`；负载或来源不一致则 `409`。
   - `applied`：新 `id` 且 `baseCursor` 等于当前游标时直接追加，分配下一个游标。
   - `merged`：新 `id` 但 `baseCursor` 落后于当前游标——仅当 baseCursor 之后的每个负载都是对象、且其顶层字段与新负载的顶层字段均不重名时才追加；字段重名或其后存在非对象负载一律 `409` JSON 错误，零写入。
+- 上述合并 `409` 正文与文档级合并统一：`{"error": "...", "conflictId": "<引发冲突的变更 id>"}`。
 - 类型头不符、请求体不是合法 JSON、带尾随内容、`baseCursor` 非法（小数、布尔、负数、字符串、`null` 或缺失）、未知文档使用非零 `baseCursor`、或 `baseCursor` 大于当前游标，均返回 `400` JSON 错误且整批零写入；`baseCursor` 低于压缩边界时同样 `400`（冲突检查无法完成）。
 - 判定顺序固定为请求形状、会话存在性、文档权限，前序失败优先：会话不存在或已删除返回 `404` JSON 错误，会话所属设备对该文档的权限被撤回返回 `403` JSON 错误，两类失败都不暴露变更内容且零写入。
 - 段缺失、空标识、路径段多余（尾斜杠、额外段）或方法不匹配（非 POST）一律返回 `400` JSON 错误，不重定向也不输出 HTML；取名 `merge` 的会话或文档标识按普通标识处理，关键字只在端点段位置才被当作端点词。
@@ -445,6 +446,29 @@ DELETE /v1/documents/doc-1?deviceId=device-1
 - 合并的 `baseCursor` 小于压缩边界时无法完成冲突检查，返回 `400` JSON 且零写入。
 - 压缩在序列化事务内完成并同步落盘；重启后边界、摘要判定与读取结果一致。快照的创建、导出与恢复语义不变。
 
+### `POST /v1/documents/{documentID}/changes/query`
+
+按标识批量查询，让客户端用一次请求取回多个指定变更。挂在变更集合路径下再加 `query` 子段，仅接受 `POST` 与 `Content-Type: application/json`，请求体为紧凑 JSON：
+
+```json
+{"deviceId": "device-1", "ids": ["change-2", "change-1"]}
+```
+
+- 调用设备由请求体的 `deviceId` 声明，沿用文档级提交的设备判定，不引入任何新的认证机制。
+- `ids` 为一组非空变更标识，批内不得重复；结果严格按给出的顺序逐项作答。
+- 命中在线记录（`"status":"found"`）时返回来源设备 `deviceId`、原始负载 `payload` 与首次游标 `cursor`；`payload` 原样呈现提交时保存的 JSON 内容（可以是 `null`、数字、字符串、数组或对象）。
+- 标识从未出现（含整个文档未知）时标记为 `"status":"missing"`，已被压缩裁掉时标记为 `"status":"compacted"`，两者都不返回任何负载内容；被裁标识只凭保留摘要报告首次游标与裁剪状态，不恢复内容也不参与其他读取。
+- 查不到的标识照常出现在结果数组里并带缺失标记，这不是错误；正文是一行紧凑 JSON、末尾一个换行，顶层键按 `results`、`count` 的顺序固定，`count` 与数组长度（即请求标识个数）一致。命中项的键按 `id`、`status`、`deviceId`、`payload`、`cursor` 顺序固定；`missing` 项只有 `id`、`status`，`compacted` 项为 `id`、`status`、`cursor`。例如：
+
+```
+{"results":[{"id":"change-2","status":"found","deviceId":"device-1","payload":{"any":"json"},"cursor":2},{"id":"change-1","status":"missing"}],"count":2}
+```
+
+- 查询是只读动作：不创建变更、不占用游标，也不唤醒长轮询或推送订阅方。
+- 判定顺序固定：请求形状先于设备存在性——内容类型不符、JSON 非法、带尾随内容、`ids` 组缺失或为空、元素缺标识或类型错误、批内重复，以及 `deviceId` 缺失、为空或类型错误，一律 `400` 且零写入；随后未注册设备返回 `404`，该设备对该文档权限被撤回返回 `403`。`404` 与 `403` 都不返回任何变更内容。
+- `documentID` 为空、路径段缺失或多余（如尾斜杠、`changes/query/extra`）、方法不匹配（非 POST）同样返回 `400` JSON 错误，不重定向、不输出 HTML。
+- 查询结果随落盘数据保持稳定：进程重启后同一请求的正文与判定逐字不变。
+
 ### `GET /v1/documents/{documentID}/changes/subscribe?deviceId=D&cursor=N`
 
 文档级的 WebSocket 变更订阅（推送通道），让不走会话的客户端也能持续收到更新。客户端携带文档标识、调用设备标识与起始游标发起 RFC 6455 升级握手，服务端在握手通过后建立一条**只推不写**的长连接。调用设备经查询参数 `deviceId` 声明，不新增认证机制（与会话视角共用同一套设备与权限判定）。
@@ -560,6 +584,7 @@ Sec-WebSocket-Version: 13
   - `idempotent`：`change.id` 已存在且 `deviceId` 与解码后的 payload 都相同，返回首次 cursor，不新增记录；任一字段不同则 `409`。
   - `applied`：新 `id` 且 `baseCursor` 等于当前 cursor，直接追加，分配下一个 cursor。
   - `merged`：新 `id` 但 `baseCursor` 落后于当前 cursor——仅当 baseCursor 之后的每个 payload 都是对象、且其顶层字段与新 payload 的顶层字段均不重名时才追加；存在非对象 payload 或任一同名字段则 `409`，零写入。
+- 上述两类 `409` 的正文为统一的结构化 JSON：`{"error": "...", "conflictId": "<引发冲突的变更 id>"}`，冲突标识不再只嵌在错误文字里。
 - 未知文档以 `baseCursor: 0` 提交第一条变更时按 `applied` 处理。
 - 并发提交在序列化事务内完成，落后方无法绕过上述检查；提交同步落盘，重启后记录与 cursor 可读。
 
@@ -613,7 +638,7 @@ Sec-WebSocket-Version: 13
 - 类型头不符、JSON 非法、尾随内容、空 `documentID` 或任一字段无效均返回 `400` JSON 错误且零写入。
 - `snapshotCursor` 未命中该文档的快照（含未知文档）返回 `404` JSON 错误且零写入。
 - 命中后在单事务内把该快照的 `state` 作为 payload，以 `deviceId`、`changeId` 追加一条普通 change；历史记录不变，文档 cursor 加一。成功返回 `200`：`{"id":changeId,"created":true,"cursor":N,"restoredFrom":snapshotCursor}`。
-- 同一文档同一 `changeId` 仅当 `deviceId`、`snapshotCursor` 与来源 state 都相同时才幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入。
+- 同一文档同一 `changeId` 仅当 `deviceId`、`snapshotCursor` 与来源 state 都相同时才幂等：返回 `200`、`created=false`、首次 cursor；该 id 已被普通变更占用，或任一条件不符，均返回 `409` JSON 错误且零写入，正文为 `{"error": "...", "conflictId": "<引发冲突的变更 id>"}`。
 - 恢复来源随数据落盘，重启后幂等与冲突判定不变；并发恢复在序列化事务内分配唯一且连续的 cursor。
 
 ### 快照命名版本
@@ -634,7 +659,7 @@ Sec-WebSocket-Version: 13
 - 登记在单个序列化事务内完成：先做设备与权限判定，再校验目标快照存在（未知文档或游标无快照为 `404`），最后处理名字。
 - 名字在文档内唯一。首次登记成功返回 `200`，一行紧凑 JSON 加末尾换行，只给版本名与对应快照游标两个字段，键序固定：`{"name":"v1","snapshotCursor":2}`。
 - 同一版本名再次绑到**同一**游标算幂等：返回与首次登记逐字一致的正文（`200`，零写入）。
-- 把同一版本名改绑到别的快照游标、或目标名字已被其他游标占用时，返回 `409` JSON 错误且零写入，既有绑定不变。
+- 把同一版本名改绑到别的快照游标、或目标名字已被其他游标占用时，返回 `409` JSON 错误且零写入，正文为 `{"error": "...", "conflictName": "<引发冲突的版本名>"}`，既有绑定不变。
 - 登记同步落盘；进程重启后名字与游标的对应、幂等与冲突判定不变。
 
 #### `GET /v1/documents/{documentID}/snapshots/versions?deviceId=D`

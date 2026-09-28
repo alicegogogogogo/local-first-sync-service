@@ -92,7 +92,10 @@ func handleSessionRestore(s *app.App, w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, events.ErrSnapshotNotFound):
 			writeError(w, http.StatusNotFound, "snapshot not found")
 		case errors.As(err, &conflict):
-			writeError(w, http.StatusConflict, "change id already exists with a different deviceId, snapshotCursor or source state: "+req.ChangeID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "change id already exists with a different deviceId, snapshotCursor or source state",
+				"conflictId": conflict.ID,
+			})
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to restore snapshot")
 		}

@@ -218,7 +218,7 @@ func TestSessionRestoreHTTPConflicts(t *testing.T) {
 			if w.Code != http.StatusConflict {
 				t.Fatalf("status = %d, want 409, body = %s", w.Code, w.Body.String())
 			}
-			if body["error"] == nil || !strings.Contains(body["error"].(string), tc.body["changeId"].(string)) {
+			if body["error"] == nil || body["conflictId"] != tc.body["changeId"].(string) {
 				t.Fatalf("conflict body = %s", w.Body.String())
 			}
 			if body["id"] != nil || body["cursor"] != nil {

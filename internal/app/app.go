@@ -252,6 +252,13 @@ func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.
 	return a.events.ExportChanges(documentID, from, to)
 }
 
+// GetChangesByIDs delegates to the change event service's read-only batch
+// lookup: per-id found/compacted/missing answers in request order, gated on
+// the calling device's registration and document permission.
+func (a *App) GetChangesByIDs(documentID, deviceID string, ids []string) ([]events.ChangeLookup, error) {
+	return a.events.GetChangesByIDs(documentID, deviceID, ids)
+}
+
 // WaitForChanges delegates to the change event service.
 func (a *App) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) ([]events.ListedChange, int64, bool, error) {
 	return a.events.WaitForChanges(ctx, documentID, after, limit, wait)

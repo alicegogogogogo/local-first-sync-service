@@ -104,6 +104,9 @@ func TestSnapshotVersionRegisterConflictRebind(t *testing.T) {
 		t.Fatalf("rebind status = %d, want 409, body = %s", w.Code, w.Body.String())
 	}
 	assertJSONError(t, w)
+	if strings.TrimSpace(w.Body.String()) != `{"conflictName":"v1","error":"snapshot version is already bound to another cursor"}` {
+		t.Fatalf("rebind conflict body = %q, want structured conflictName", w.Body.String())
+	}
 
 	w, _ = doRequest(t, h, http.MethodGet, "/v1/documents/doc/snapshots/versions?deviceId=dev-1")
 	if !strings.Contains(w.Body.String(), `"name":"v1","snapshotCursor":1`) {

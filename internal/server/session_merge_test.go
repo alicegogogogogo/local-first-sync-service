@@ -147,7 +147,7 @@ func TestSessionMergeHTTPConflict(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("content type = %q", ct)
 	}
-	if body["error"] == nil || !strings.Contains(body["error"].(string), "x") {
+	if body["error"] == nil || body["conflictId"] != "x" {
 		t.Fatalf("conflict body = %s", w.Body.String())
 	}
 

@@ -498,13 +498,17 @@ func TestMergeHTTPOutcomes(t *testing.T) {
 		t.Fatalf("embedded result = %v", res)
 	}
 
-	// Same id, different payload -> 409.
-	w, _ = mergeBody(t, h, "doc", map[string]any{
+	// Same id, different payload -> 409 carrying the conflicting id in a
+	// structured conflictId field rather than embedded in the message.
+	w, conflictBody := mergeBody(t, h, "doc", map[string]any{
 		"deviceId": "dev", "baseCursor": 1,
 		"change": map[string]any{"id": "c1", "payload": map[string]any{"a": 2}},
 	})
 	if w.Code != http.StatusConflict {
 		t.Fatalf("conflict = %d body=%s", w.Code, w.Body.String())
+	}
+	if conflictBody["conflictId"] != "c1" || conflictBody["error"] == nil {
+		t.Fatalf("merge 409 body = %v, want error and conflictId=c1", conflictBody)
 	}
 
 	// Seed a second object {"b":2} at cursor 2.
@@ -967,8 +971,8 @@ func TestRestoreHTTPIdempotentAndConflict(t *testing.T) {
 			if w.Code != http.StatusConflict {
 				t.Fatalf("status = %d, want 409, body = %s", w.Code, w.Body.String())
 			}
-			if body["error"] == nil {
-				t.Fatalf("body = %s", w.Body.String())
+			if body["error"] == nil || body["conflictId"] != tc.body.(map[string]any)["changeId"] {
+				t.Fatalf("body = %s, want error and structured conflictId", w.Body.String())
 			}
 		})
 	}

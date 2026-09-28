@@ -444,9 +444,20 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
 		handleCompactChanges(s, w, r)
 	})
+	// The read-only batch lookup lives one segment below the change
+	// collection, alongside the poll and compaction subresources: a strict
+	// JSON POST naming the calling device and the change ids to answer.
+	mux.HandleFunc("POST /v1/documents/{documentID}/changes/query", func(w http.ResponseWriter, r *http.Request) {
+		handleQueryChanges(s, w, r)
+	})
 	// Non-POST verbs on the compaction path get a JSON 400 rather than
 	// ServeMux's plain-text 405: the endpoint only accepts POST.
 	mux.HandleFunc("/v1/documents/{documentID}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Non-POST verbs on the batch lookup path get the same JSON 400: the
+	// lookup is a POST with a JSON body.
+	mux.HandleFunc("/v1/documents/{documentID}/changes/query", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/replay", func(w http.ResponseWriter, r *http.Request) {
@@ -618,7 +629,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedChangeQueryPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -1063,7 +1074,10 @@ func handleMergeChange(s *app.App, w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "baseCursor is below the compaction boundary")
 			return
 		case errors.As(err, &conflict):
-			writeError(w, http.StatusConflict, "merge conflicts with existing changes: "+conflict.ID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "merge conflicts with existing changes",
+				"conflictId": conflict.ID,
+			})
 			return
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to merge change")
@@ -1195,7 +1209,10 @@ func handleRestore(s *app.App, w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "snapshot not found")
 			return
 		case errors.As(err, &conflict):
-			writeError(w, http.StatusConflict, "change id already exists with a different deviceId, snapshotCursor or source state: "+req.ChangeID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "change id already exists with a different deviceId, snapshotCursor or source state",
+				"conflictId": conflict.ID,
+			})
 			return
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to restore snapshot")
@@ -1669,7 +1686,10 @@ func handleSessionMergeChange(s *app.App, w http.ResponseWriter, r *http.Request
 		case errors.Is(err, events.ErrCompactedBase):
 			writeError(w, http.StatusBadRequest, "baseCursor is below the compaction boundary")
 		case errors.As(err, &conflict):
-			writeError(w, http.StatusConflict, "merge conflicts with existing changes: "+conflict.ID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "merge conflicts with existing changes",
+				"conflictId": conflict.ID,
+			})
 		default:
 			writeError(w, http.StatusInternalServerError, "failed to merge change")
 		}
