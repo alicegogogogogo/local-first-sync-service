@@ -89,7 +89,7 @@ func malformedDocumentDelete(method, p string) bool {
 		return false // doubled slash, already rejected upstream
 	}
 	switch segs[1] {
-	case "changes", "snapshots", "crdt", "permissions", "replay", "merge", "restore":
+	case "changes", "snapshots", "snapshot-versions", "crdt", "permissions", "replay", "merge", "restore":
 		return false
 	default:
 		return true

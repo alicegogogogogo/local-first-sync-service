@@ -26,9 +26,9 @@ var ErrDocumentNotFound = errors.New("document not found")
 
 // DocumentDataExistsTx reports whether the change event service holds any row
 // for documentID: an online change, a compaction boundary, a retained
-// trimmed-id summary, a snapshot or a restore record. It runs inside the
-// caller's transaction so the existence verdict is one judgment with the
-// deletion that follows it.
+// trimmed-id summary, a snapshot, a named snapshot version or a restore
+// record. It runs inside the caller's transaction so the existence verdict is
+// one judgment with the deletion that follows it.
 func (s *Service) DocumentDataExistsTx(q store.DBTX, documentID string) (bool, error) {
 	var exists bool
 	if err := q.QueryRow(
@@ -36,8 +36,9 @@ func (s *Service) DocumentDataExistsTx(q store.DBTX, documentID string) (bool, e
 		 OR EXISTS(SELECT 1 FROM change_boundaries WHERE document_id = ?)
 		 OR EXISTS(SELECT 1 FROM change_identities WHERE document_id = ?)
 		 OR EXISTS(SELECT 1 FROM snapshots WHERE document_id = ?)
+		 OR EXISTS(SELECT 1 FROM snapshot_versions WHERE document_id = ?)
 		 OR EXISTS(SELECT 1 FROM restores WHERE document_id = ?)`,
-		documentID, documentID, documentID, documentID, documentID,
+		documentID, documentID, documentID, documentID, documentID, documentID,
 	).Scan(&exists); err != nil {
 		return false, err
 	}
@@ -46,16 +47,17 @@ func (s *Service) DocumentDataExistsTx(q store.DBTX, documentID string) (bool, e
 
 // DeleteDocumentDataTx removes every change-event row of documentID inside the
 // caller's serialized transaction: the online log and restore records first
-// (the rows that reference cursors), then snapshots, the retained idempotency
-// summaries and finally the compaction boundary. With the boundary gone the
-// cursor space restarts from 1 when the id is created again. It does not
-// judge existence — the caller checks DocumentDataExistsTx (and the CRDT
-// service's equivalent) once before deleting — so it never returns
-// ErrDocumentNotFound on its own.
+// (the rows that reference cursors), then the named snapshot versions,
+// snapshots, the retained idempotency summaries and finally the compaction
+// boundary. With the boundary gone the cursor space restarts from 1 when the
+// id is created again. It does not judge existence — the caller checks
+// DocumentDataExistsTx (and the CRDT service's equivalent) once before
+// deleting — so it never returns ErrDocumentNotFound on its own.
 func (s *Service) DeleteDocumentDataTx(q store.DBTX, documentID string) error {
 	stmts := []string{
 		`DELETE FROM restores WHERE document_id = ?`,
 		`DELETE FROM changes WHERE document_id = ?`,
+		`DELETE FROM snapshot_versions WHERE document_id = ?`,
 		`DELETE FROM snapshots WHERE document_id = ?`,
 		`DELETE FROM change_identities WHERE document_id = ?`,
 		`DELETE FROM change_boundaries WHERE document_id = ?`,

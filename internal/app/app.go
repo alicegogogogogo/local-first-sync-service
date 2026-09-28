@@ -204,6 +204,69 @@ func (a *App) RestoreSessionSnapshot(documentID, deviceID, changeID string, snap
 	return a.events.RestoreSnapshotAuthorized(documentID, deviceID, changeID, snapshotCursor)
 }
 
+// RegisterSnapshotVersion delegates to the change event service.
+func (a *App) RegisterSnapshotVersion(documentID, name string, snapshotCursor int64) (events.SnapshotVersion, bool, error) {
+	return a.events.RegisterSnapshotVersion(documentID, name, snapshotCursor)
+}
+
+// RegisterSessionSnapshotVersion registers a named snapshot version for a
+// caller whose device identity was resolved from a session by the HTTP layer,
+// delegating to the change event service's gated registration: the
+// registration/permission verdict is taken inside the same serialized
+// transaction as the snapshot lookup and marker insert, so a revoked device
+// writes nothing and a rejected request observes no snapshot or version
+// content.
+func (a *App) RegisterSessionSnapshotVersion(documentID, deviceID, name string, snapshotCursor int64) (events.SnapshotVersion, bool, error) {
+	return a.events.RegisterSnapshotVersionAuthorized(documentID, deviceID, name, snapshotCursor)
+}
+
+// ListSnapshotVersions delegates to the change event service.
+func (a *App) ListSnapshotVersions(documentID string) ([]events.SnapshotVersion, error) {
+	return a.events.ListSnapshotVersions(documentID)
+}
+
+// GetSnapshotVersion delegates to the change event service.
+func (a *App) GetSnapshotVersion(documentID, name string) (events.SnapshotVersion, error) {
+	return a.events.GetSnapshotVersion(documentID, name)
+}
+
+// RenameSnapshotVersion delegates to the change event service.
+func (a *App) RenameSnapshotVersion(documentID, name string, snapshotCursor int64) (events.SnapshotVersion, bool, error) {
+	return a.events.RenameSnapshotVersion(documentID, name, snapshotCursor)
+}
+
+// RenameSessionSnapshotVersion moves a named version onto another snapshot
+// cursor for a caller whose device identity was resolved from a session by the
+// HTTP layer, delegating to the change event service's gated rename.
+func (a *App) RenameSessionSnapshotVersion(documentID, deviceID, name string, snapshotCursor int64) (events.SnapshotVersion, bool, error) {
+	return a.events.RenameSnapshotVersionAuthorized(documentID, deviceID, name, snapshotCursor)
+}
+
+// DeleteSnapshotVersion delegates to the change event service.
+func (a *App) DeleteSnapshotVersion(documentID, name string) error {
+	return a.events.DeleteSnapshotVersion(documentID, name)
+}
+
+// DeleteSessionSnapshotVersion removes a named version for a caller whose
+// device identity was resolved from a session by the HTTP layer, delegating to
+// the change event service's gated delete.
+func (a *App) DeleteSessionSnapshotVersion(documentID, deviceID, name string) error {
+	return a.events.DeleteSnapshotVersionAuthorized(documentID, deviceID, name)
+}
+
+// RestoreSnapshotVersion delegates to the change event service.
+func (a *App) RestoreSnapshotVersion(documentID, deviceID, changeID, name string) (events.RestoreResult, error) {
+	return a.events.RestoreSnapshotVersion(documentID, deviceID, changeID, name)
+}
+
+// RestoreSessionSnapshotVersion restores the snapshot a version name points at
+// as an ordinary change whose device identity was resolved from a session by
+// the HTTP layer, delegating to the change event service's gated named
+// restore.
+func (a *App) RestoreSessionSnapshotVersion(documentID, deviceID, changeID, name string) (events.RestoreResult, error) {
+	return a.events.RestoreSnapshotVersionAuthorized(documentID, deviceID, changeID, name)
+}
+
 // ListChanges delegates to the change event service.
 func (a *App) ListChanges(documentID string, after, limit int64) ([]events.ListedChange, int64, error) {
 	return a.events.ListChanges(documentID, after, limit)

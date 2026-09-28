@@ -16,6 +16,14 @@
 // snapshot's state, recording its provenance so a repeated restore after a
 // restart keeps the same idempotency/conflict decisions.
 //
+// A snapshot may also carry named versions: client-supplied names registered
+// against existing snapshot cursors, unique within a document. Registering a
+// name is idempotent when it already points at the same cursor; rebinding an
+// existing name to another cursor is a conflict at registration and is only
+// possible through the explicit rename. Deleting a marker frees the name.
+// Versions are a layer over snapshots — they never copy or modify snapshot
+// state, move no cursor — and disappear with the document that owns them.
+//
 // Reads page by cursor in ascending order. The session view and the document
 // view are the same read; the HTTP layer adds the session/permission checks.
 // Long polling and push subscriptions are in-memory observers of commits:
@@ -99,6 +107,21 @@ var ErrCompactedBase = errors.New("baseCursor is below the compaction boundary")
 // cursor. The caller maps it to 404.
 var ErrSnapshotNotFound = errors.New("snapshot not found")
 
+// ErrVersionNotFound reports that no snapshot version of the name exists for
+// the document. The caller maps it to 404; nothing is written.
+var ErrVersionNotFound = errors.New("snapshot version not found")
+
+// ErrVersionConflict reports that a version name is already registered to a
+// different snapshot cursor. The existing marker is left in place and nothing
+// is written; the caller maps it to 409.
+type ErrVersionConflict struct {
+	Name string
+}
+
+func (e *ErrVersionConflict) Error() string {
+	return fmt.Sprintf("snapshot version %q is bound to another cursor", e.Name)
+}
+
 // ErrSnapshotConflict reports that a snapshot already exists for the document
 // and cursor with a different state. The stored snapshot is left unchanged.
 type ErrSnapshotConflict struct {
@@ -125,6 +148,15 @@ func (e *ErrRestoreConflict) Error() string {
 type ExportedSnapshot struct {
 	Cursor int64           `json:"cursor"`
 	State  json.RawMessage `json:"state"`
+}
+
+// SnapshotVersion is one named marker over a document's snapshot collection:
+// the client-supplied version name together with the snapshot cursor it points
+// at. It carries no state of its own — the state is always read through the
+// cursor — so renaming or deleting a marker never touches a snapshot.
+type SnapshotVersion struct {
+	Name   string `json:"name"`
+	Cursor int64  `json:"cursor"`
 }
 
 // RestoreResult reports the outcome of an accepted RestoreSnapshot.
@@ -154,6 +186,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
 	cursor      INTEGER NOT NULL,
 	state       BLOB NOT NULL,
 	PRIMARY KEY (document_id, cursor)
+);
+CREATE TABLE IF NOT EXISTS snapshot_versions (
+	document_id TEXT NOT NULL,
+	name        TEXT NOT NULL,
+	cursor      INTEGER NOT NULL,
+	PRIMARY KEY (document_id, name),
+	FOREIGN KEY (document_id, cursor) REFERENCES snapshots(document_id, cursor)
 );
 CREATE TABLE IF NOT EXISTS restores (
 	document_id     TEXT NOT NULL,

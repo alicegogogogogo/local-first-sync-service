@@ -332,6 +332,41 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	// Session-scoped named snapshot versions: the same name/cursor layer as
+	// the document view over the session document prefix, with the session's
+	// owning device as the caller. Collection: POST register, GET list. Item:
+	// GET read, DELETE remove. Rename and restore are POST-only item
+	// subresources. Every other verb on an exact shape is a JSON 400.
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionRegisterSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionListSnapshotVersions(s, w, r)
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionGetSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionDeleteSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}/rename", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionRenameSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}/rename", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionRestoreSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/snapshot-versions/{name}/restore", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/crdt/state", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCRDTState(s, w, r)
 	})
@@ -483,6 +518,43 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/snapshots/{cursor}", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	// Named snapshot versions: a layer of stable names over the snapshot
+	// collection. The collection accepts POST (register a name against an
+	// existing snapshot cursor) and GET (list all names ascending); the item
+	// path accepts GET (read the named snapshot, byte-identical to the cursor
+	// read) and DELETE (remove the marker); rename and restore are POST-only
+	// subresources of the item. Every other verb on an exact shape is a JSON
+	// 400, and malformed shapes are rejected by the guard.
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshot-versions", func(w http.ResponseWriter, r *http.Request) {
+		handleRegisterSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/snapshot-versions", func(w http.ResponseWriter, r *http.Request) {
+		handleListSnapshotVersions(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshot-versions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("GET /v1/documents/{documentID}/snapshot-versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		handleGetSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("DELETE /v1/documents/{documentID}/snapshot-versions/{name}", func(w http.ResponseWriter, r *http.Request) {
+		handleDeleteSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshot-versions/{name}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshot-versions/{name}/rename", func(w http.ResponseWriter, r *http.Request) {
+		handleRenameSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshot-versions/{name}/rename", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshot-versions/{name}/restore", func(w http.ResponseWriter, r *http.Request) {
+		handleRestoreSnapshotVersion(s, w, r)
+	})
+	mux.HandleFunc("/v1/documents/{documentID}/snapshot-versions/{name}/restore", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	mux.HandleFunc("POST /v1/documents/{documentID}/restore", func(w http.ResponseWriter, r *http.Request) {
 		handleRestore(s, w, r)
 	})
@@ -572,7 +644,23 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty {
+			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
+			return
+		}
+		// Inside the named-version subtree the version guards own every shape
+		// judgment: a version name is free-form and may itself spell one of the
+		// other endpoints' keywords, so the older keyword-scanning guards must
+		// not run there.
+		if inSnapshotVersionsNamespace(p) {
+			if malformedSnapshotVersionPath(p) || malformedSessionSnapshotVersionsPath(p) {
+				writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+		if malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
@@ -930,7 +1018,10 @@ func handlePostChanges(s *app.App, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var conflict *events.ErrConflict
 		if errors.As(err, &conflict) {
-			writeError(w, http.StatusConflict, "change id already exists with different deviceId or payload: "+conflict.ID)
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error":      "change id already exists with different deviceId or payload",
+				"conflictId": conflict.ID,
+			})
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to commit changes")
