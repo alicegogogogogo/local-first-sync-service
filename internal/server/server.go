@@ -148,8 +148,36 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateSession(s, w, r)
 	})
+	// The read-only session listing shares the session collection path with
+	// session creation: GET lists the device's own sessions, POST creates one.
+	// The path device id is the caller's only identity, exactly like the
+	// routes around it.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, r *http.Request) {
+		handleListDeviceSessions(s, w, r)
+	})
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
+	})
+	// The session collection accepts GET (list) and POST (create); the session
+	// item path accepts only DELETE. Every other verb on either exact shape
+	// gets a JSON 400 rather than ServeMux's plain-text 405. A GET with a
+	// missing or extra segment past the collection path is a malformed list and
+	// answers a JSON 400; every other verb there keeps the subtree's
+	// pre-existing unknown-path JSON 404 (the over-long DELETE is pinned to
+	// 404). The wildcard is method-less on purpose — a method-specific one
+	// would conflict with the item fallback above.
+	mux.HandleFunc("/v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	mux.HandleFunc("/v1/devices/{deviceId}/sessions/{rest...}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			writeError(w, http.StatusBadRequest, "session list path is malformed")
+			return
+		}
+		writeError(w, http.StatusNotFound, "unknown device/session path")
 	})
 	// Device-scoped subscription management: a read-only list of the device's
 	// live push connections and a DELETE that actively cancels one of them.

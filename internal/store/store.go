@@ -573,6 +573,59 @@ func (s *Store) SessionDevice(sessionID string) (string, error) {
 	}
 }
 
+// ListDeviceSessions returns one page of the session ids currently owned by
+// deviceID, each at most once, ordered ascending by id in lexicographic
+// (dictionary) order and sliced by limit/offset over that order, so successive
+// pages neither repeat nor skip an id. An unregistered device yields
+// ErrDeviceNotFound and no listing. Hard-deleted sessions are gone from the
+// table and deregistration deletes a device's sessions in the same cascade, so
+// neither kind appears; a session id created again lists like any other live
+// id. The read runs in one serialized transaction and writes nothing: it moves
+// no cursor and changes no state, so its body is byte-for-byte stable across
+// repeated calls and process restarts.
+func (s *Store) ListDeviceSessions(deviceID string, limit, offset int64) ([]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	exists, err := DeviceExistsTx(tx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrDeviceNotFound
+	}
+
+	rows, err := tx.Query(
+		`SELECT id FROM sessions WHERE device_id = ?
+		 ORDER BY id ASC
+		 LIMIT ? OFFSET ?`,
+		deviceID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return ids, tx.Commit()
+}
+
 // JSONEqual reports whether two payloads are equal after JSON decoding, so
 // 1 and 1.0, or {"a":1,"b":2} and {"b":2,"a":1}, compare equal. It is shared
 // verbatim by the change event and CRDT services' idempotency judgments.
