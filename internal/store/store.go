@@ -410,6 +410,55 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 	return tx.Commit()
 }
 
+// ListSessions returns the page of live session ids owned by deviceID, each
+// appearing at most once, sorted lexicographically by id ascending and paged
+// by limit/offset as a slice over that fixed order — so with no intervening
+// create or delete, successive pages neither repeat nor skip an id, and an
+// offset past the end yields an empty (non-nil) slice and no error. An
+// unregistered device yields ErrDeviceNotFound and no listing. The read runs
+// in one serialized transaction and writes nothing; deleted sessions are
+// absent, and a device deregistration removes every session it owned first.
+func (s *Store) ListSessions(deviceID string, limit, offset int64) ([]string, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	exists, err := DeviceExistsTx(tx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrDeviceNotFound
+	}
+
+	rows, err := tx.Query(
+		`SELECT id FROM sessions WHERE device_id = ?
+		 ORDER BY id ASC LIMIT ? OFFSET ?`,
+		deviceID, limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	_ = rows.Close()
+
+	return ids, tx.Commit()
+}
+
 // DeleteDeviceTx deregisters deviceID and removes every record it owns, all
 // inside the caller's serialized transaction:
 //

@@ -148,6 +148,27 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, r *http.Request) {
 		handleCreateSession(s, w, r)
 	})
+	// The read-only session listing shares the collection path with session
+	// creation: GET pages the device's live sessions by id, limit/offset, the
+	// way the attachment listing pages uploads. The path device id is the
+	// caller's only identity and the request carries no body.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, r *http.Request) {
+		handleListSessions(s, w, r)
+	})
+	// The session collection path accepts GET (list) and POST (create); every
+	// other verb on its exact shape gets a JSON 400 rather than ServeMux's
+	// plain-text 405. The more specific GET/POST patterns above win.
+	mux.HandleFunc("/v1/devices/{deviceId}/sessions", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// A GET carrying a segment past the collection is a malformed list read
+	// and answers a JSON 400 instead of the subtree's unknown-path 404; the
+	// exact DELETE item pattern above still wins for its own shape. A device
+	// id literally named "sessions" stays an ordinary id — "sessions" is the
+	// endpoint word only in this collection segment.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/sessions/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "session list path is malformed")
+	})
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
 	})
