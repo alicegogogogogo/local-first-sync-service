@@ -130,6 +130,13 @@ func malformedSessionRestorePath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The named-snapshot-version subtree owns its whole shape verdict through
+	// malformedSessionSnapshotsPath: a version literally named "restore" and
+	// the by-name restore nested one segment below it are not the document
+	// restore keyword, whose only valid position is the fourth segment.
+	if inSessionSnapshotVersionsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "restore" {
 			continue

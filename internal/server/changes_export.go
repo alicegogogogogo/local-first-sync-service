@@ -264,6 +264,12 @@ func malformedSessionCompactPath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The named-snapshot-version subtree owns its whole shape verdict through
+	// malformedSessionSnapshotsPath; a version name coinciding with "compact"
+	// is an ordinary identifier there, not this keyword.
+	if inSessionSnapshotVersionsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "compact" {
 			continue
@@ -311,6 +317,11 @@ func malformedSessionPollPath(p string) bool {
 	// has its own guard; "poll" there is an ordinary identifier, not the
 	// changes-poll keyword.
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	// The named-snapshot-version subtree owns its whole shape verdict; a
+	// version name coinciding with "poll" is an ordinary identifier there.
+	if inSessionSnapshotVersionsSubtree(segs) {
 		return false
 	}
 	for i, seg := range segs {
@@ -362,6 +373,11 @@ func malformedSessionMergePath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The named-snapshot-version subtree owns its whole shape verdict; a
+	// version name coinciding with "merge" is an ordinary identifier there.
+	if inSessionSnapshotVersionsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "merge" {
 			continue
@@ -407,6 +423,11 @@ func malformedSessionReplayPath(p string) bool {
 	// has its own guard; "replay" there is an ordinary identifier, not the
 	// changes-replay keyword.
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
+		return false
+	}
+	// The named-snapshot-version subtree owns its whole shape verdict; a
+	// version name coinciding with "replay" is an ordinary identifier there.
+	if inSessionSnapshotVersionsSubtree(segs) {
 		return false
 	}
 	for i, seg := range segs {

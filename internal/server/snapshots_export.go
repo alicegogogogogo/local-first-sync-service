@@ -163,14 +163,36 @@ func malformedSnapshotPath(p string) bool {
 	return false
 }
 
+// inSessionSnapshotVersionsSubtree reports whether segs (the path split past
+// "/v1/sessions/") sits in the named-snapshot-version subtree: a "snapshots"
+// collection segment followed by a "versions" segment. The exact shape verdict
+// (collection, item, item/restore) belongs to malformedSessionSnapshotsPath;
+// every other session keyword guard yields to it so a version name that
+// coincides with a change keyword ("poll", "merge", "restore", "subscribe",
+// "compact", "query") keeps its version routes rather than being judged as a
+// malformed change path.
+func inSessionSnapshotVersionsSubtree(segs []string) bool {
+	return len(segs) >= 5 &&
+		segs[1] == "documents" &&
+		segs[3] == "snapshots" &&
+		segs[4] == "versions"
+}
+
 // malformedSessionSnapshotsPath reports whether p targets the session-scoped
-// snapshot collection's shape but is not the collection's exact location
-// (/v1/sessions/{sessionId}/documents/{documentId}/snapshots): extra path
-// segments past the collection (the session view has no single-snapshot
-// item, so a trailing cursor segment is malformed too). ServeMux would answer
-// those with a plain-text 404; the snapshot surface promises a JSON 400 and
-// never a redirect. Empty segments (doubled slashes, a trailing slash) are
-// already rejected by the guard itself.
+// snapshot namespace but is not at one of its exact locations:
+//
+//	GET    /v1/sessions/{sessionId}/documents/{documentId}/snapshots                       (batch export)
+//	POST   /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions              (register)
+//	GET    /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions              (list)
+//	GET    /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}       (read)
+//	PUT    /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}       (rename)
+//	DELETE /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}       (delete)
+//	POST   /v1/sessions/{sessionId}/documents/{documentId}/snapshots/versions/{name}/restore
+//
+// extra path segments past any of those shapes (the batch export has no
+// single-snapshot item, so a trailing cursor segment is malformed too) are a
+// JSON 400 rather than ServeMux's plain-text 404 or a redirect. Empty segments
+// (doubled slashes, a trailing slash) are already rejected by the guard itself.
 //
 // "snapshots" is treated as the collection keyword only in the fourth
 // segment, right after the document identifier; a session or document
@@ -191,8 +213,15 @@ func malformedSessionSnapshotsPath(p string) bool {
 	if len(segs) < 4 || segs[1] != "documents" || segs[3] != "snapshots" {
 		return false
 	}
-	// Keyword position reached. The collection is exactly
-	// {sessionId}/documents/{documentId}/snapshots; anything past it is a
-	// malformed 400.
-	return !(len(segs) == 4 && segs[0] != "" && segs[2] != "")
+	nonEmptyIDs := segs[0] != "" && segs[2] != ""
+	// Keyword position reached. The batch export is exactly the collection;
+	// the named-version subtree adds the versions collection, one non-empty
+	// name segment, and optionally a trailing restore segment. Anything past
+	// one of those shapes (a trailing cursor on the export, an extra segment,
+	// a trailing keyword other than restore) is a malformed 400.
+	collection := len(segs) == 4
+	versionsCollection := len(segs) == 5 && segs[4] == "versions"
+	versionsItem := len(segs) == 6 && segs[4] == "versions" && segs[5] != ""
+	versionsRestore := len(segs) == 7 && segs[4] == "versions" && segs[5] != "" && segs[6] == "restore"
+	return !nonEmptyIDs || !(collection || versionsCollection || versionsItem || versionsRestore)
 }

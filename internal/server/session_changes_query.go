@@ -146,6 +146,11 @@ func malformedSessionQueryPath(p string) bool {
 	if len(segs) >= 4 && segs[1] == "documents" && segs[3] == "crdt" {
 		return false
 	}
+	// The named-snapshot-version subtree owns its whole shape verdict; a
+	// version name coinciding with "query" is an ordinary identifier there.
+	if inSessionSnapshotVersionsSubtree(segs) {
+		return false
+	}
 	for i, seg := range segs {
 		if seg != "query" {
 			continue
