@@ -634,6 +634,19 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
+	// Snapshot retention pruning lives one prune segment below the snapshot
+	// collection: a strict JSON POST naming the calling device and a keep
+	// count in 1..1000 keeps the newest snapshots and hard-deletes the rest.
+	// The literal "prune" segment is more specific than {cursor}, so the
+	// single-snapshot read never sees it.
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots/prune", func(w http.ResponseWriter, r *http.Request) {
+		handlePruneSnapshots(s, w, r)
+	})
+	// The prune path accepts only POST; every other verb gets a JSON 400
+	// rather than ServeMux's plain-text 405.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/prune", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// The single-snapshot path is GET (the read); the same method-less pattern
 	// answers every other verb with a JSON 400 rather than ServeMux's
 	// plain-text 405. It is kept method-less (rather than a GET pattern plus a
@@ -882,6 +895,14 @@ func malformedNewDocumentPath(p string) bool {
 				return false
 			}
 			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// Snapshot-prune endpoint: "prune" must be exactly the third segment,
+	// after a non-empty documentID and "snapshots". A version name coinciding
+	// with "prune" was excluded by the versions-subtree early return above.
+	for i, seg := range segs {
+		if seg == "prune" && i > 0 {
+			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "snapshots")
 		}
 	}
 	return false

@@ -216,36 +216,30 @@ func (s *Service) RestoreSnapshotAuthorized(documentID, deviceID, changeID strin
 // and append decisions from one code path. The result's Created flag tells
 // the caller whether a change-bearing transaction just committed and the push
 // channels therefore need waking.
+//
+// A restore that already happened keeps its verdict from its stored
+// provenance — the restores row, or the retained summary when its change was
+// later compacted — even after the snapshot it came from has been pruned: the
+// same device and snapshot cursor stay idempotent and any mismatch stays a
+// conflict. Only a genuinely new id requires the snapshot to still exist; a
+// pruned or otherwise absent snapshot is then ErrSnapshotNotFound.
 func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
-	// The snapshot must exist; its state is the payload to append.
-	var state []byte
-	err := tx.QueryRow(
-		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
-		documentID, snapshotCursor,
-	).Scan(&state)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return RestoreResult{}, ErrSnapshotNotFound
-	case err != nil:
-		return RestoreResult{}, err
-	}
-
-	// Resolve the change id: an ordinary row, a prior restore and a
-	// compacted-away id's retained summary are handled differently, so consult
-	// all three.
+	// Resolve the change id first. Three prior states are possible: an online
+	// change, a change compaction trimmed into change_identities, or no row at
+	// all. An id with a recorded restore provenance (a restores row, or a
+	// retained summary whose restored_from is set) keeps its idempotency and
+	// conflict verdict from that provenance even when the snapshot it came
+	// from has since been pruned. An id occupied by an ordinary change keeps
+	// the established precedence — a missing snapshot is still a miss
+	// (ErrSnapshotNotFound) before the id conflict is reported.
 	var existingCursor int64
-	var existingDevice string
-	var existingPayload []byte
-	err = tx.QueryRow(
-		`SELECT cursor, device_id, payload FROM changes WHERE document_id = ? AND id = ?`,
+	err := tx.QueryRow(
+		`SELECT cursor FROM changes WHERE document_id = ? AND id = ?`,
 		documentID, changeID,
-	).Scan(&existingCursor, &existingDevice, &existingPayload)
+	).Scan(&existingCursor)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		// No online row: the id may belong to a change compaction trimmed.
-		// Its retained summary still decides — an idempotent restore needs the
-		// same device, snapshot cursor and source state; an id left by an
-		// ordinary trimmed change is a conflict, as is any mismatch.
+		// No online row: consult the retained summary compaction leaves behind.
 		var summaryDevice string
 		var summaryDigest []byte
 		var summaryCursor int64
@@ -257,24 +251,20 @@ func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapsh
 		).Scan(&summaryDevice, &summaryDigest, &summaryCursor, &restoredFrom)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			// Genuinely new id; fall through to append below.
+			// Genuinely new id: the snapshot must exist, then append below.
 		case err != nil:
 			return RestoreResult{}, err
 		default:
-			stateDigest, err := payloadDigest(state)
-			if err != nil {
-				return RestoreResult{}, err
-			}
-			if !restoredFrom.Valid || restoredFrom.Int64 != snapshotCursor ||
-				summaryDevice != deviceID || !bytes.Equal(summaryDigest, stateDigest) {
+			if !restoredFrom.Valid {
+				// An ordinary trimmed change. With the snapshot present the id
+				// is a conflict; a missing snapshot keeps its miss precedence.
+				if err := snapshotExistsTx(tx, documentID, snapshotCursor); err != nil {
+					return RestoreResult{}, err
+				}
 				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
 			}
-			return RestoreResult{
-				ID:           changeID,
-				Created:      false,
-				Cursor:       summaryCursor,
-				RestoredFrom: snapshotCursor,
-			}, nil
+			return recordedRestoreVerdictTx(tx, documentID, changeID, deviceID, summaryDevice,
+				snapshotCursor, summaryCursor, restoredFrom.Int64, summaryDigest)
 		}
 	case err != nil:
 		return RestoreResult{}, err
@@ -288,22 +278,36 @@ func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapsh
 		).Scan(&restDevice, &restSnapshotCursor, &restState)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			// The id belongs to an ordinary change (or a batch/merge change),
-			// not a restore: never treat it as an idempotent restore.
+			// The id belongs to an ordinary change, not a restore. With the
+			// snapshot present the id is a conflict; a missing snapshot keeps
+			// its miss precedence.
+			if err := snapshotExistsTx(tx, documentID, snapshotCursor); err != nil {
+				return RestoreResult{}, err
+			}
 			return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
 		case err != nil:
 			return RestoreResult{}, err
 		default:
-			if restDevice != deviceID || restSnapshotCursor != snapshotCursor || !store.JSONEqual(restState, state) {
-				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			digest, err := payloadDigest(restState)
+			if err != nil {
+				return RestoreResult{}, err
 			}
-			return RestoreResult{
-				ID:           changeID,
-				Created:      false,
-				Cursor:       existingCursor,
-				RestoredFrom: snapshotCursor,
-			}, nil
+			return recordedRestoreVerdictTx(tx, documentID, changeID, deviceID, restDevice,
+				snapshotCursor, existingCursor, restSnapshotCursor, digest)
 		}
+	}
+
+	// A genuinely new restore: the snapshot must exist; its state is the
+	// payload to append. A pruned or never-existing snapshot misses here.
+	var state []byte
+	if err := tx.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, snapshotCursor,
+	).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return RestoreResult{}, ErrSnapshotNotFound
+		}
+		return RestoreResult{}, err
 	}
 
 	nextCursor, err := currentCursorTx(tx, documentID)
@@ -330,4 +334,61 @@ func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapsh
 		Cursor:       nextCursor,
 		RestoredFrom: snapshotCursor,
 	}, nil
+}
+
+// recordedRestoreVerdictTx answers the idempotency/conflict question for an id
+// that already names a recorded restore, from its stored provenance:
+// originDevice is the recorded source device, firstCursor the cursor the
+// change was first assigned, recordedSnapshotCursor the snapshot the recorded
+// restore read and digest the canonical digest of the state that snapshot
+// carried when the restore happened (the retained summary stores that digest;
+// the online restores row stores the state, whose digest the caller passes).
+//
+// A different source device or snapshot cursor is a conflict. The same pair
+// means the same immutable source state, so the recorded verdict survives the
+// pruning of that snapshot and the caller repeats as idempotent with the first
+// cursor; when the snapshot still exists its live state is compared to the
+// recorded digest as well, exactly as a fresh restore would.
+func recordedRestoreVerdictTx(tx *sql.Tx, documentID, changeID, deviceID, originDevice string, snapshotCursor, firstCursor, recordedSnapshotCursor int64, digest []byte) (RestoreResult, error) {
+	if originDevice != deviceID || recordedSnapshotCursor != snapshotCursor {
+		return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+	}
+	if state, ok, err := snapshotStateIfExistsTx(tx, documentID, snapshotCursor); err != nil {
+		return RestoreResult{}, err
+	} else if ok {
+		liveDigest, err := payloadDigest(state)
+		if err != nil {
+			return RestoreResult{}, err
+		}
+		if !bytes.Equal(digest, liveDigest) {
+			return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+		}
+	}
+	return RestoreResult{
+		ID:           changeID,
+		Created:      false,
+		Cursor:       firstCursor,
+		RestoredFrom: snapshotCursor,
+	}, nil
+}
+
+// snapshotStateIfExistsTx returns the stored snapshot state at cursor and
+// ok=true when the snapshot exists. A pruned or never-existing snapshot
+// returns nil, false, nil; only a real lookup error fails. It lets a recorded
+// restore keep its verdict from stored provenance once the snapshot it came
+// from has been pruned, while still comparing the live state when present.
+func snapshotStateIfExistsTx(tx *sql.Tx, documentID string, cursor int64) ([]byte, bool, error) {
+	var state []byte
+	err := tx.QueryRow(
+		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
+		documentID, cursor,
+	).Scan(&state)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, err
+	default:
+		return state, true, nil
+	}
 }

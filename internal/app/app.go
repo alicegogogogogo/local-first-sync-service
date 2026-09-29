@@ -204,6 +204,19 @@ func (a *App) RestoreSessionSnapshot(documentID, deviceID, changeID string, snap
 	return a.events.RestoreSnapshotAuthorized(documentID, deviceID, changeID, snapshotCursor)
 }
 
+// PruneSnapshots keeps the keep highest snapshot cursors of a document and
+// hard-deletes every older snapshot, delegating to the change event service's
+// gated prune: the registration/permission verdict is taken inside the same
+// serialized transaction as the deletions, so an unregistered or revoked
+// caller removes nothing and a rejected request observes no snapshot content.
+// A snapshot-less or unknown document prunes successfully with a zero maximum
+// cursor and nothing deleted. The prune allocates no cursor, moves no
+// compaction boundary, leaves restore provenance and version markers and
+// notifies no waiter or subscriber.
+func (a *App) PruneSnapshots(documentID, deviceID string, keep json.RawMessage) (events.PruneSnapshotsResult, error) {
+	return a.events.PruneSnapshots(documentID, deviceID, keep)
+}
+
 // PutSnapshotVersion binds an existing snapshot cursor to a stable version
 // name, delegating to the change event service's gated transaction: the
 // registration/permission verdict is taken before the snapshot and version
