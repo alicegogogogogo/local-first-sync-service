@@ -182,7 +182,7 @@ func malformedChangeExportPath(p string) bool {
 		if i == 1 {
 			collection := len(segs) == 2 && segs[0] != ""
 			knownSubresource := len(segs) >= 3 &&
-				(segs[2] == "poll" || segs[2] == "compact" || segs[2] == "subscribe" || segs[2] == "query")
+				(segs[2] == "poll" || segs[2] == "compact" || segs[2] == "subscribe" || segs[2] == "query" || segs[2] == "status")
 			return !(collection || knownSubresource)
 		}
 		return false

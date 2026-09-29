@@ -275,6 +275,14 @@ func (a *App) GetChangesByIDs(documentID, deviceID string, ids []string) ([]even
 	return a.events.GetChangesByIDs(documentID, deviceID, ids)
 }
 
+// GetChangesStatus delegates to the change event service's read-only status
+// summary: the online change count, the saved-snapshot boundary, the greatest
+// online cursor and the trimmed identity count, gated on the calling device's
+// registration and document permission.
+func (a *App) GetChangesStatus(documentID, deviceID string) (events.ChangeStatus, error) {
+	return a.events.GetChangesStatus(documentID, deviceID)
+}
+
 // WaitForChanges delegates to the change event service.
 func (a *App) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) ([]events.ListedChange, int64, bool, error) {
 	return a.events.WaitForChanges(ctx, documentID, after, limit, wait)
