@@ -195,6 +195,27 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("/v1/devices/{deviceId}/documents/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "document list path is malformed")
 	})
+	// The read-only pending-change statistics hang one pending segment below
+	// the document collection: GET pages the per-document online change counts
+	// of the device, by document id and limit/offset, on the listing's exact
+	// order and scope. The path device id is the caller's only identity and the
+	// request carries no body.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/documents/pending", func(w http.ResponseWriter, r *http.Request) {
+		handleListPendingChanges(s, w, r)
+	})
+	// The pending path accepts only GET; every other verb on its exact shape
+	// gets a JSON 400 rather than ServeMux's plain-text 405. The more specific
+	// GET pattern above wins.
+	mux.HandleFunc("/v1/devices/{deviceId}/documents/pending", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Extra segments past pending are a malformed statistics read and answer a
+	// JSON 400 instead of the subtree's unknown-path 404, for every verb. A
+	// device id literally named "pending" stays an ordinary id — "pending" is
+	// the endpoint word only in this terminal segment.
+	mux.HandleFunc("/v1/devices/{deviceId}/documents/pending/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "document pending path is malformed")
+	})
 	// Device-scoped subscription management: a read-only list of the device's
 	// live push connections and a DELETE that actively cancels one of them.
 	// The path device id is the only identity, exactly like the session
