@@ -172,6 +172,29 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("DELETE /v1/devices/{deviceId}/sessions/{sessionId}", func(w http.ResponseWriter, r *http.Request) {
 		handleDeleteSession(s, w, r)
 	})
+	// The read-only document listing hangs off the device resource one
+	// collection next to sessions: GET pages the distinct documents the
+	// device's sessions have written changes into, by document id and
+	// limit/offset, with the attachment listing's exact pagination rules. The
+	// path device id is the caller's only identity and the request carries no
+	// body.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/documents", func(w http.ResponseWriter, r *http.Request) {
+		handleListDeviceDocuments(s, w, r)
+	})
+	// The document collection path accepts only GET; every other verb on its
+	// exact shape gets a JSON 400 rather than ServeMux's plain-text 405. The
+	// more specific GET pattern above wins for the read.
+	mux.HandleFunc("/v1/devices/{deviceId}/documents", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Any segment past the collection is a malformed list read and answers a
+	// JSON 400 instead of the subtree's unknown-path 404 — every verb alike.
+	// Empty segments and a trailing slash are already a 400 via emptyIDGuard.
+	// A device id literally named "documents" stays an ordinary id — the word
+	// is the endpoint word only in this collection segment.
+	mux.HandleFunc("/v1/devices/{deviceId}/documents/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "document list path is malformed")
+	})
 	// Device-scoped subscription management: a read-only list of the device's
 	// live push connections and a DELETE that actively cancels one of them.
 	// The path device id is the only identity, exactly like the session

@@ -246,6 +246,44 @@ func (a *App) ListChanges(documentID string, after, limit int64) ([]events.Liste
 	return a.events.ListChanges(documentID, after, limit)
 }
 
+// ListDeviceDocuments is the read-only device document listing: the distinct
+// documents that still carry an online change stamped with deviceID — the
+// stored attribution of every change committed under the device's name (a
+// session-scoped commit stamps the change with the session's owning device) —
+// each at most once, in ascending lexicographic document-id order, paged by
+// limit/offset over that fixed order. The device-existence verdict is taken
+// first in one serialized transaction: an unregistered or deregistered
+// device yields store.ErrDeviceNotFound and no listing content. Only the
+// online change log is consulted, so a wholly deleted document and one whose
+// changes were all cleared by compaction leave the listing, while a partially
+// trimmed document stays for as long as an online change remains. The read
+// writes nothing, allocates no cursor and notifies no waiter or subscriber;
+// the same request renders byte-for-byte the same page after a restart.
+func (a *App) ListDeviceDocuments(deviceID string, limit, offset int64) ([]string, error) {
+	tx, err := a.Store.DB().Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Request shape (the pagination values) is settled by the HTTP layer
+	// before this call; existence is the first judgment here, so an unknown
+	// device reveals no listing content.
+	exists, err := store.DeviceExistsTx(tx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, store.ErrDeviceNotFound
+	}
+
+	ids, err := a.events.ListDeviceDocumentsTx(tx, deviceID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	return ids, tx.Commit()
+}
+
 // ExportChanges delegates to the change event service. A nil to means the
 // interval has no upper bound.
 func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.ListedChange, error) {
