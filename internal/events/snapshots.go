@@ -216,16 +216,31 @@ func (s *Service) RestoreSnapshotAuthorized(documentID, deviceID, changeID strin
 // and append decisions from one code path. The result's Created flag tells
 // the caller whether a change-bearing transaction just committed and the push
 // channels therefore need waking.
+//
+// A snapshot retention prune hard-deletes snapshot rows while leaving every
+// accepted restore's recorded provenance intact, so a missing snapshot is not
+// treated as a miss until the change id is resolved: when the id names an
+// already-accepted restore (an online restores row, or a compaction-retained
+// summary carrying restore provenance), its idempotent (200) or conflict
+// (409) verdict is read from that record alone and is unchanged by the
+// snapshot's deletion. Every other case against a missing snapshot keeps the
+// pre-prune order and answers ErrSnapshotNotFound first — a genuinely new id,
+// an id held by an ordinary change and a compaction-retained summary of an
+// ordinary change all miss exactly as they did before prune existed.
 func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapshotCursor int64) (RestoreResult, error) {
-	// The snapshot must exist; its state is the payload to append.
+	// The snapshot supplies the state to append. A miss is not fatal yet: an
+	// already-accepted restore answers from its recorded provenance below even
+	// after a prune deleted the snapshot row; the miss only ends a genuinely
+	// new id's restore.
 	var state []byte
 	err := tx.QueryRow(
 		`SELECT state FROM snapshots WHERE document_id = ? AND cursor = ?`,
 		documentID, snapshotCursor,
 	).Scan(&state)
+	snapshotMissing := false
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		return RestoreResult{}, ErrSnapshotNotFound
+		snapshotMissing = true
 	case err != nil:
 		return RestoreResult{}, err
 	}
@@ -257,17 +272,40 @@ func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapsh
 		).Scan(&summaryDevice, &summaryDigest, &summaryCursor, &restoredFrom)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			// Genuinely new id; fall through to append below.
+			// Genuinely new id: the snapshot must exist to source the append.
+			if snapshotMissing {
+				return RestoreResult{}, ErrSnapshotNotFound
+			}
+			// Fall through to append below.
 		case err != nil:
 			return RestoreResult{}, err
 		default:
-			stateDigest, err := payloadDigest(state)
-			if err != nil {
-				return RestoreResult{}, err
-			}
-			if !restoredFrom.Valid || restoredFrom.Int64 != snapshotCursor ||
-				summaryDevice != deviceID || !bytes.Equal(summaryDigest, stateDigest) {
+			// The id is already recorded in a retained summary. A summary
+			// carrying restore provenance keeps that restore's idempotency and
+			// conflict verdicts on its own even after a prune removed the
+			// snapshot: a matching device and source cursor is idempotent (the
+			// source state also matches when the snapshot still exists),
+			// anything else is the restore's conflict. A summary of an
+			// ordinary trimmed change is not a restore record: against a
+			// missing snapshot the snapshot miss keeps coming first, exactly
+			// as it did before prune existed.
+			if !restoredFrom.Valid {
+				if snapshotMissing {
+					return RestoreResult{}, ErrSnapshotNotFound
+				}
 				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			if restoredFrom.Int64 != snapshotCursor || summaryDevice != deviceID {
+				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			if !snapshotMissing {
+				stateDigest, err := payloadDigest(state)
+				if err != nil {
+					return RestoreResult{}, err
+				}
+				if !bytes.Equal(summaryDigest, stateDigest) {
+					return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+				}
 			}
 			return RestoreResult{
 				ID:           changeID,
@@ -289,12 +327,22 @@ func restoreSnapshotTx(tx *sql.Tx, documentID, deviceID, changeID string, snapsh
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			// The id belongs to an ordinary change (or a batch/merge change),
-			// not a restore: never treat it as an idempotent restore.
+			// not a restore. Against a missing (pruned) snapshot the snapshot
+			// miss keeps coming first; otherwise it is the restore conflict.
+			if snapshotMissing {
+				return RestoreResult{}, ErrSnapshotNotFound
+			}
 			return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
 		case err != nil:
 			return RestoreResult{}, err
 		default:
-			if restDevice != deviceID || restSnapshotCursor != snapshotCursor || !store.JSONEqual(restState, state) {
+			if restDevice != deviceID || restSnapshotCursor != snapshotCursor {
+				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
+			}
+			// When the snapshot still exists its state must match the state
+			// recorded at restore time; a pruned snapshot leaves the recorded
+			// copy as the sole source of truth for the idempotent verdict.
+			if !snapshotMissing && !store.JSONEqual(restState, state) {
 				return RestoreResult{}, &ErrRestoreConflict{ID: changeID}
 			}
 			return RestoreResult{

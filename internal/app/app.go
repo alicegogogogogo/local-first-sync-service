@@ -241,6 +241,19 @@ func (a *App) RestoreSnapshotVersion(documentID, deviceID, changeID, name string
 	return a.events.RestoreSnapshotVersion(documentID, deviceID, changeID, name)
 }
 
+// PruneSnapshots keeps the keep most recent snapshots of a document and
+// hard-deletes every older one, delegating to the change event service's
+// gated transaction: the registration/permission verdict is taken before the
+// retention parameter is validated and before any snapshot is observed, so an
+// unregistered caller misses with 404 and a revoked one with 403 regardless of
+// the keep value, and a rejected prune deletes nothing. It returns the
+// greatest surviving snapshot cursor (zero when none remain) and the number of
+// snapshots deleted; a snapshot-less or unknown document succeeds with both
+// zero and creates no row.
+func (a *App) PruneSnapshots(documentID, deviceID string, keep json.RawMessage) (events.PruneResult, error) {
+	return a.events.PruneSnapshots(documentID, deviceID, keep)
+}
+
 // ListChanges delegates to the change event service.
 func (a *App) ListChanges(documentID string, after, limit int64) ([]events.ListedChange, int64, error) {
 	return a.events.ListChanges(documentID, after, limit)

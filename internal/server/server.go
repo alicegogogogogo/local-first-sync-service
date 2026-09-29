@@ -628,6 +628,18 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("GET /v1/documents/{documentID}/snapshots", func(w http.ResponseWriter, r *http.Request) {
 		handleExportSnapshots(s, w, r)
 	})
+	// The snapshot retention prune lives one prune segment below the snapshot
+	// collection: a strict JSON POST naming the calling device and the number
+	// of most recent snapshots to keep. A literal "prune" segment is more
+	// specific than the {cursor} single-read pattern and wins for its shape.
+	mux.HandleFunc("POST /v1/documents/{documentID}/snapshots/prune", func(w http.ResponseWriter, r *http.Request) {
+		handlePruneSnapshots(s, w, r)
+	})
+	// Non-POST verbs on the prune path get a JSON 400 rather than ServeMux's
+	// plain-text 405: the prune endpoint only accepts POST.
+	mux.HandleFunc("/v1/documents/{documentID}/snapshots/prune", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
 	// Non-GET verbs on the snapshot collection path: the exact GET pattern
 	// above is more specific, so only other verbs reach this method-less
 	// pattern and get a JSON 400 instead of ServeMux's plain-text 405.
@@ -882,6 +894,19 @@ func malformedNewDocumentPath(p string) bool {
 				return false
 			}
 			return !(len(segs) == 3 && segs[0] != "" && segs[1] == "changes")
+		}
+	}
+	// Snapshot retention prune: "prune" must be exactly the third segment,
+	// after a non-empty documentID and "snapshots". A prune keyword in any
+	// other position (including a bare {documentID}/prune missing the
+	// snapshots segment) is a malformed path. A version name inside the
+	// versions subtree may coincide with "prune" and is an ordinary name
+	// there, exactly as for the other keywords.
+	if len(segs) < 3 || segs[1] != "snapshots" || segs[2] != "versions" {
+		for i, seg := range segs {
+			if seg == "prune" && i > 0 {
+				return !(len(segs) == 3 && segs[0] != "" && segs[1] == "snapshots")
+			}
 		}
 	}
 	return false

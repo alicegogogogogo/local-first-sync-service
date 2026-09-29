@@ -125,7 +125,9 @@ func handleSessionExportSnapshots(s *app.App, w http.ResponseWriter, r *http.Req
 // is not at one of its exact locations:
 //
 //	GET  /v1/documents/{documentID}/snapshots                    (the batch export)
+//	POST /v1/documents/{documentID}/snapshots                   (snapshot creation)
 //	GET  /v1/documents/{documentID}/snapshots/{cursor}          (the single read)
+//	POST /v1/documents/{documentID}/snapshots/prune             (retention prune)
 //	*    /v1/documents/{documentID}/snapshots/versions          (named versions)
 //	*    /v1/documents/{documentID}/snapshots/versions/{name}
 //	POST /v1/documents/{documentID}/snapshots/versions/{name}/restore
@@ -150,15 +152,17 @@ func malformedSnapshotPath(p string) bool {
 		}
 		// Keyword position reached. The collection is exactly
 		// {documentID}/snapshots; the single read adds one non-empty cursor
-		// segment; the named-version subtree adds the versions collection, one
-		// non-empty name segment, and optionally a trailing restore segment.
-		// Anything else (trailing slash, missing/extra segments) is malformed.
+		// segment; the retention prune adds the literal prune segment; the
+		// named-version subtree adds the versions collection, one non-empty
+		// name segment, and optionally a trailing restore segment. Anything
+		// else (trailing slash, missing/extra segments) is malformed.
 		collection := len(segs) == 2 && segs[0] != ""
-		cursorItem := len(segs) == 3 && segs[0] != "" && segs[2] != ""
+		cursorItem := len(segs) == 3 && segs[0] != "" && segs[2] != "" && segs[2] != "prune" && segs[2] != "versions"
+		pruneItem := len(segs) == 3 && segs[0] != "" && segs[2] == "prune"
 		versionsCollection := len(segs) == 3 && segs[0] != "" && segs[2] == "versions"
 		versionsItem := len(segs) == 4 && segs[0] != "" && segs[2] == "versions" && segs[3] != ""
 		versionsRestore := len(segs) == 5 && segs[0] != "" && segs[2] == "versions" && segs[3] != "" && segs[4] == "restore"
-		return !(collection || cursorItem || versionsCollection || versionsItem || versionsRestore)
+		return !(collection || cursorItem || pruneItem || versionsCollection || versionsItem || versionsRestore)
 	}
 	return false
 }
