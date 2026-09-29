@@ -254,6 +254,14 @@ func (a *App) ListDeviceDocuments(deviceID string, limit, offset int64) ([]strin
 	return a.events.ListDeviceDocuments(deviceID, limit, offset)
 }
 
+// ListDevicePending delegates to the change event service's read-only pending
+// statistics: the page of per-document online change counts and maximum
+// cursors for the changes the device originated, sorted and paged like the
+// document listing.
+func (a *App) ListDevicePending(deviceID string, limit, offset int64) ([]events.PendingStat, error) {
+	return a.events.ListDevicePending(deviceID, limit, offset)
+}
+
 // ExportChanges delegates to the change event service. A nil to means the
 // interval has no upper bound.
 func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.ListedChange, error) {

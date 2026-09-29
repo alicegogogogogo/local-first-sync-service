@@ -188,12 +188,33 @@ func NewHandler(s *app.App) http.Handler {
 	})
 	// Any path carrying a segment past the collection is a malformed list
 	// read and answers a JSON 400 instead of the subtree's unknown-path 404,
-	// for every verb (the collection has no item subresource, so every deeper
-	// shape is malformed). A device id literally named "documents" stays an
-	// ordinary id — "documents" is the endpoint word only in this collection
-	// segment.
+	// for every verb — except the pending statistics one segment below: the
+	// exact "GET .../documents/pending" and method-less ".../pending" patterns
+	// registered below are more specific than this multi-segment wildcard and
+	// win for that one shape, so it reaches the statistics read (GET) or its
+	// method mismatch (400). Every other deeper shape is malformed. A device id
+	// literally named "documents" stays an ordinary id — "documents" is the
+	// endpoint word only in this collection segment.
 	mux.HandleFunc("/v1/devices/{deviceId}/documents/{rest...}", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "document list path is malformed")
+	})
+	// The read-only pending-change statistics sit one segment below the
+	// document collection: GET pages the per-document count of online changes
+	// and the maximum cursor for the documents this device's sessions once
+	// wrote changes to, by document id and limit/offset, the way the collection
+	// listing pages document ids. The path device id is the caller's only
+	// identity and the request carries no body. The exact literal "pending"
+	// segment is more specific than the {rest...} wildcard above, so it wins
+	// for this one path; a segment past "pending" stays the wildcard's 400.
+	mux.HandleFunc("GET /v1/devices/{deviceId}/documents/pending", func(w http.ResponseWriter, r *http.Request) {
+		handleListPending(s, w, r)
+	})
+	// The pending path accepts only GET; every other verb on its exact shape
+	// gets a JSON 400 rather than ServeMux's plain-text 405. A device id
+	// literally named "pending" stays an ordinary id — "pending" is the
+	// endpoint word only in this terminal segment.
+	mux.HandleFunc("/v1/devices/{deviceId}/documents/pending", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Device-scoped subscription management: a read-only list of the device's
 	// live push connections and a DELETE that actively cancels one of them.
