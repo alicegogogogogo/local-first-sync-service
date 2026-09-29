@@ -246,6 +246,14 @@ func (a *App) ListChanges(documentID string, after, limit int64) ([]events.Liste
 	return a.events.ListChanges(documentID, after, limit)
 }
 
+// ListDeviceDocuments delegates to the change event service's read-only
+// device document listing: the page of distinct document ids that still
+// carry an online change the device originated, sorted and paged like the
+// session and attachment listings.
+func (a *App) ListDeviceDocuments(deviceID string, limit, offset int64) ([]string, error) {
+	return a.events.ListDeviceDocuments(deviceID, limit, offset)
+}
+
 // ExportChanges delegates to the change event service. A nil to means the
 // interval has no upper bound.
 func (a *App) ExportChanges(documentID string, from int64, to *int64) ([]events.ListedChange, error) {
