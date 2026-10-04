@@ -227,8 +227,9 @@ func malformedSessionChangesPath(p string) bool {
 	// guard; the single-change merge adds one trailing "merge" segment and
 	// keeps its own guard; the change-log compaction adds one trailing
 	// "compact" segment and keeps its own guard; the batch lookup adds one
-	// trailing "query" segment and keeps its own guard. Anything else past the
-	// keyword is a malformed 400.
+	// trailing "query" segment and keeps its own guard; the durable checkpoint
+	// adds one trailing "checkpoint" segment and keeps its own guard. Anything
+	// else past the keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
@@ -236,7 +237,8 @@ func malformedSessionChangesPath(p string) bool {
 	merge := len(segs) == 5 && segs[4] == "merge"
 	compact := len(segs) == 5 && segs[4] == "compact"
 	query := len(segs) == 5 && segs[4] == "query"
-	return !(collection || subscribe || poll || replay || merge || compact || query)
+	checkpoint := len(segs) == 5 && segs[4] == "checkpoint"
+	return !(collection || subscribe || poll || replay || merge || compact || query || checkpoint)
 }
 
 // malformedSessionCompactPath reports whether p targets the session-scoped

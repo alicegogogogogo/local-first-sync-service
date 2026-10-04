@@ -387,8 +387,20 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := DeleteSessionTx(tx, deviceID, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeleteSessionTx is DeleteSession against an existing serialized transaction,
+// so the composition root can remove session-owned records in other services
+// (for example a session's sync checkpoints) as one judgment with the session
+// deletion. It returns ErrSessionNotFound on any owner/existence miss and
+// changes nothing in that case.
+func DeleteSessionTx(q DBTX, deviceID, sessionID string) error {
 	var owner string
-	err = tx.QueryRow(
+	err := q.QueryRow(
 		`SELECT device_id FROM sessions WHERE id = ?`, sessionID,
 	).Scan(&owner)
 	switch {
@@ -401,13 +413,13 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 		return ErrSessionNotFound
 	}
 
-	if _, err := tx.Exec(
+	if _, err := q.Exec(
 		`DELETE FROM sessions WHERE id = ? AND device_id = ?`,
 		sessionID, deviceID,
 	); err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // ListSessions returns the page of live session ids owned by deviceID, each

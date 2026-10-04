@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/alicegogogogogo/local-first-sync-service/internal/authz"
+	"github.com/alicegogogogogo/local-first-sync-service/internal/checkpoint"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/crdt"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/events"
 	"github.com/alicegogogogogo/local-first-sync-service/internal/push"
@@ -35,8 +36,9 @@ import (
 type App struct {
 	*store.Store
 
-	events *events.Service
-	crdt   *crdt.Service
+	events      *events.Service
+	crdt        *crdt.Service
+	checkpoints *checkpoint.Service
 
 	// pushSubs is the process-wide, in-memory registry of the live push
 	// connections across both channels. It backs the device-scoped
@@ -76,19 +78,33 @@ func Open(path string) (*App, error) {
 		_ = kernel.Close()
 		return nil, err
 	}
+	// The session checkpoint service is built after the event service (it
+	// reads the document boundary and high-water mark through its transaction
+	// interface) and the permission service (its gate and its in-transaction
+	// revoke hook).
+	checkpointService, err := checkpoint.New(kernel, permissions, eventService)
+	if err != nil {
+		_ = kernel.Close()
+		return nil, err
+	}
 
 	// A committed revoke ends the affected live subscriptions in both
 	// push channels. The dependency is an interface, registered once here, so
 	// the permission service never names either subscriber concretely.
 	permissions.AddRevokeSink(eventsRevokeSink{eventService})
 	permissions.AddRevokeSink(crdtService)
+	// A genuine revoke also clears the revoked device's session checkpoints on
+	// the document, inside the revoke's own transaction, so re-authorization
+	// starts from the unconfirmed state.
+	permissions.AddRevokeTxHook(checkpoint.NewRevokeHook(checkpointService))
 
 	return &App{
-		Store:    kernel,
-		events:   eventService,
-		crdt:     crdtService,
-		Authz:    permissions,
-		pushSubs: push.NewRegistry(),
+		Store:       kernel,
+		events:      eventService,
+		crdt:        crdtService,
+		checkpoints: checkpointService,
+		Authz:       permissions,
+		pushSubs:    push.NewRegistry(),
 	}, nil
 }
 
@@ -105,6 +121,47 @@ func (a *App) Events() *events.Service { return a.events }
 
 // CRDT returns the CRDT state service.
 func (a *App) CRDT() *crdt.Service { return a.crdt }
+
+// ---- Session sync checkpoints. ----
+
+// PutSessionCheckpoint confirms cursor as the session's applied position for
+// one document, delegating to the checkpoint service. See
+// checkpoint.Service.Put for the fixed verdict order and the monotonic,
+// boundary and high-water-mark rules.
+func (a *App) PutSessionCheckpoint(sessionID, documentID string, cursor int64) (checkpoint.PutResult, error) {
+	return a.checkpoints.Put(sessionID, documentID, cursor)
+}
+
+// GetSessionCheckpoint reads the session's recorded position for one document
+// together with its compaction boundary and high-water mark, delegating to the
+// checkpoint service.
+func (a *App) GetSessionCheckpoint(sessionID, documentID string) (checkpoint.GetResult, error) {
+	return a.checkpoints.Get(sessionID, documentID)
+}
+
+// DeleteSession removes the live session matching the (deviceID, sessionID)
+// pair together with every session-owned record — currently the session's sync
+// checkpoints — all in one serialized, synchronously committed transaction. An
+// owner/existence miss returns store.ErrSessionNotFound and writes nothing,
+// exactly as the kernel's own delete; running the checkpoint removal in the
+// same judgment means a deleted (and later re-created) session id never
+// inherits a consumption position. It shadows the promoted kernel method of
+// the same name so the HTTP layer has one DeleteSession call.
+func (a *App) DeleteSession(deviceID, sessionID string) error {
+	tx, err := a.Store.DB().Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := store.DeleteSessionTx(tx, deviceID, sessionID); err != nil {
+		return err
+	}
+	if err := a.checkpoints.DeleteSessionTx(tx, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
 // ---- Change event service boundary (promoted so the entry layer has one
 // object; each method delegates verbatim to the events service). ----
@@ -349,6 +406,12 @@ func (a *App) DeregisterDevice(deviceID string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Clear the checkpoints of the device's sessions in the same judgment,
+	// before DeleteDeviceTx removes those sessions: the checkpoint cleanup
+	// matches the rows through the still-existing session rows.
+	if err := a.checkpoints.DeleteDeviceTx(tx, deviceID); err != nil {
+		return err
+	}
 	if err := store.DeleteDeviceTx(tx, deviceID); err != nil {
 		return err
 	}
@@ -433,6 +496,12 @@ func (a *App) DeleteDocument(documentID, deviceID string) error {
 		return err
 	}
 	if err := a.Authz.DeleteDocumentPermissionsTx(tx, documentID); err != nil {
+		return err
+	}
+	// Session checkpoints name the document's old cursor space, which restarts
+	// at 1 when the id is re-created; remove them in the same judgment so no
+	// stale position survives the deletion.
+	if err := a.checkpoints.DeleteDocumentTx(tx, documentID); err != nil {
 		return err
 	}
 

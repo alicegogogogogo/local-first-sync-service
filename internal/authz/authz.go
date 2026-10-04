@@ -46,12 +46,30 @@ type RevokeSink interface {
 	PermissionRevoked(documentID, deviceID string)
 }
 
+// RevokeTxHook takes part in a revoke's own serialized transaction. It is
+// invoked inside SetDocumentPermission's transaction only when permission
+// actually changes from authorized to revoked, just before the commit, so any
+// state a revoke must clear (for example a device's session checkpoints on the
+// document) is removed as one judgment with the verdict rather than in a
+// separate write that could fail or interleave. A returned error aborts the
+// whole revoke and writes nothing. The permission service depends on this
+// interface alone and never reaches into the hook's tables.
+type RevokeTxHook interface {
+	PermissionRevokingTx(q Tx, documentID, deviceID string) error
+}
+
+// Tx is the subset of *sql.Tx an in-transaction revoke hook needs. It is
+// store.DBTX expressed locally so the hook signature does not import the store
+// package into hook implementers' wiring.
+type Tx = store.DBTX
+
 // Service is the permission service.
 type Service struct {
 	db *sql.DB
 
-	mu    sync.Mutex
-	sinks []RevokeSink
+	mu      sync.Mutex
+	sinks   []RevokeSink
+	txHooks []RevokeTxHook
 }
 
 // New constructs the permission service over the shared kernel handle and
@@ -70,6 +88,16 @@ func New(kernel *store.Store) (*Service, error) {
 func (s *Service) AddRevokeSink(sink RevokeSink) {
 	s.mu.Lock()
 	s.sinks = append(s.sinks, sink)
+	s.mu.Unlock()
+}
+
+// AddRevokeTxHook registers a hook invoked inside a genuine authorize→revoke
+// transition's own serialized transaction, just before it commits. It is
+// called by the composition root while wiring the services, so durable state
+// a revoke must clear is removed in the same judgment as the verdict.
+func (s *Service) AddRevokeTxHook(hook RevokeTxHook) {
+	s.mu.Lock()
+	s.txHooks = append(s.txHooks, hook)
 	s.mu.Unlock()
 }
 
@@ -166,6 +194,19 @@ func (s *Service) SetDocumentPermission(documentID, deviceID string, authorized 
 		documentID, deviceID, v,
 	); err != nil {
 		return false, err
+	}
+	// A genuine revoke clears every hook-owned durable state in the same
+	// serialized transaction, before the commit, so the ledger change and the
+	// cleanup are one judgment that cannot interleave or half-apply.
+	if !authorized {
+		s.mu.Lock()
+		hooks := append([]RevokeTxHook(nil), s.txHooks...)
+		s.mu.Unlock()
+		for _, hook := range hooks {
+			if err := hook.PermissionRevokingTx(tx, documentID, deviceID); err != nil {
+				return false, err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
