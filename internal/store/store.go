@@ -169,6 +169,12 @@ CREATE TABLE IF NOT EXISTS attachment_access (
 	granted_seq   INTEGER NOT NULL DEFAULT 0,
 	PRIMARY KEY (attachment_id, device_id)
 );
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+	session_id  TEXT NOT NULL,
+	document_id TEXT NOT NULL,
+	cursor      INTEGER NOT NULL,
+	PRIMARY KEY (session_id, document_id)
+);
 `)
 	if err != nil {
 		return err
@@ -407,6 +413,14 @@ func (s *Store) DeleteSession(deviceID, sessionID string) error {
 	); err != nil {
 		return err
 	}
+	// The session's sync checkpoints vanish with it: a later session of the
+	// same id starts unconfirmed on every document.
+	if _, err := tx.Exec(
+		`DELETE FROM session_checkpoints WHERE session_id = ?`,
+		sessionID,
+	); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -570,6 +584,16 @@ func DeleteDeviceTx(q DBTX, deviceID string) error {
 		}
 	}
 
+	// The sync checkpoints of the device's sessions vanish together with the
+	// sessions themselves, so a device that later re-registers the same id
+	// starts with no inherited confirmation state.
+	if _, err := q.Exec(
+		`DELETE FROM session_checkpoints
+		 WHERE session_id IN (SELECT id FROM sessions WHERE device_id = ?)`,
+		deviceID,
+	); err != nil {
+		return err
+	}
 	if _, err := q.Exec(
 		`DELETE FROM sessions WHERE device_id = ?`, deviceID,
 	); err != nil {

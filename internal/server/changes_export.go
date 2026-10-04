@@ -226,17 +226,19 @@ func malformedSessionChangesPath(p string) bool {
 	// offline replay adds one trailing "replay" segment and keeps its own
 	// guard; the single-change merge adds one trailing "merge" segment and
 	// keeps its own guard; the change-log compaction adds one trailing
-	// "compact" segment and keeps its own guard; the batch lookup adds one
-	// trailing "query" segment and keeps its own guard. Anything else past the
-	// keyword is a malformed 400.
+	// "compact" segment and keeps its own guard; the sync checkpoint adds one
+	// trailing "checkpoint" segment and keeps its own guard; the batch lookup
+	// adds one trailing "query" segment and keeps its own guard. Anything else
+	// past the keyword is a malformed 400.
 	collection := len(segs) == 4 && segs[0] != "" && segs[2] != ""
 	subscribe := len(segs) == 5 && segs[4] == "subscribe"
 	poll := len(segs) == 5 && segs[4] == "poll"
 	replay := len(segs) == 5 && segs[4] == "replay"
 	merge := len(segs) == 5 && segs[4] == "merge"
 	compact := len(segs) == 5 && segs[4] == "compact"
+	checkpoint := len(segs) == 5 && segs[4] == "checkpoint"
 	query := len(segs) == 5 && segs[4] == "query"
-	return !(collection || subscribe || poll || replay || merge || compact || query)
+	return !(collection || subscribe || poll || replay || merge || compact || checkpoint || query)
 }
 
 // malformedSessionCompactPath reports whether p targets the session-scoped

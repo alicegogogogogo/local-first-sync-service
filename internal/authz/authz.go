@@ -167,6 +167,14 @@ func (s *Service) SetDocumentPermission(documentID, deviceID string, authorized 
 	); err != nil {
 		return false, err
 	}
+	if !authorized {
+		// A revoke also retires the sync checkpoints the device's sessions
+		// recorded on the document, in the same transaction: a later re-grant
+		// finds them unconfirmed, exactly as if they had never confirmed.
+		if err := store.DeletePermissionCheckpointsTx(tx, documentID, deviceID); err != nil {
+			return false, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}

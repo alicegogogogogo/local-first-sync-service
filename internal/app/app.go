@@ -296,6 +296,25 @@ func (a *App) GetChangeStatus(documentID, deviceID string) (events.ChangeStatus,
 	return a.events.GetChangeStatus(documentID, deviceID)
 }
 
+// ConfirmSessionCheckpoint records a session's confirmed change cursor on a
+// document, delegating to the change event service's gated confirmation: the
+// registration/permission verdict and the monotonic, high-water and
+// first-confirmation boundary judgments are taken inside one serialized
+// transaction, so a revoked device confirms nothing, a rejected confirmation
+// writes nothing and concurrent confirmations never move the recorded cursor
+// backwards. The device identity is resolved from the session by the HTTP
+// layer before the call.
+func (a *App) ConfirmSessionCheckpoint(sessionID, deviceID, documentID string, cursor int64) (bool, error) {
+	return a.events.ConfirmCheckpoint(sessionID, deviceID, documentID, cursor)
+}
+
+// ReadSessionCheckpoint delegates to the change event service's read-only
+// checkpoint view: the recorded cursor (zero when never confirmed) together
+// with the document's compaction boundary and high-water mark.
+func (a *App) ReadSessionCheckpoint(sessionID, documentID string) (events.CheckpointState, error) {
+	return a.events.ReadCheckpoint(sessionID, documentID)
+}
+
 // WaitForChanges delegates to the change event service.
 func (a *App) WaitForChanges(ctx context.Context, documentID string, after, limit int64, wait time.Duration) ([]events.ListedChange, int64, bool, error) {
 	return a.events.WaitForChanges(ctx, documentID, after, limit, wait)
@@ -433,6 +452,11 @@ func (a *App) DeleteDocument(documentID, deviceID string) error {
 		return err
 	}
 	if err := a.Authz.DeleteDocumentPermissionsTx(tx, documentID); err != nil {
+		return err
+	}
+	// The sessions' sync checkpoints on the document vanish with it, so a
+	// re-created document of the same id inherits no confirmations.
+	if err := store.DeleteDocumentCheckpointsTx(tx, documentID); err != nil {
 		return err
 	}
 

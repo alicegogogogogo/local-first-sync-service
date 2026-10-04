@@ -358,6 +358,17 @@ func NewHandler(s *app.App) http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, r *http.Request) {
 		handleSessionCompactChanges(s, w, r)
 	})
+	// The session sync checkpoint lives one checkpoint segment below the
+	// session change collection: PUT confirms the last change cursor the
+	// session fully applied locally, GET reads the recorded position back
+	// together with the compaction boundary and the high-water mark. The
+	// calling device is the session's owning device resolved from the path.
+	mux.HandleFunc("PUT /v1/sessions/{sessionId}/documents/{documentId}/changes/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionPutCheckpoint(s, w, r)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionId}/documents/{documentId}/changes/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionGetCheckpoint(s, w, r)
+	})
 	// The read-only batch lookup lives one segment below the session change
 	// collection, alongside the poll, replay, merge and compaction
 	// subresources: a strict JSON POST naming only the change ids to answer;
@@ -384,6 +395,13 @@ func NewHandler(s *app.App) http.Handler {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/compact", func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
+	})
+	// Verbs other than PUT/GET on the session checkpoint path: the exact PUT
+	// and GET patterns above are more specific, so only other verbs reach this
+	// method-less pattern and get a JSON 400 instead of the subtree's
+	// unknown-path JSON 404.
+	mux.HandleFunc("/v1/sessions/{sessionId}/documents/{documentId}/changes/checkpoint", func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusBadRequest, "method is not allowed on this path")
 	})
 	// Non-POST verbs on the session batch lookup path get the same JSON 400:
@@ -811,7 +829,7 @@ func emptyIDGuard(next http.Handler) http.Handler {
 			newFamilySegmentEmpty = strings.Contains(p, "//") || strings.HasSuffix(p, "/")
 		}
 
-		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedChangeQueryPath(p) || malformedChangeStatusPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionQueryPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
+		if documentSegmentEmpty || newFamilySegmentEmpty || malformedDocumentDelete(r.Method, p) || malformedNewDocumentPath(p) || malformedSubscribePath(p) || malformedSessionCRDTPath(p) || malformedCRDTPath(p) || malformedSnapshotPath(p) || malformedPermissionPath(p) || malformedChangeExportPath(p) || malformedChangeQueryPath(p) || malformedChangeStatusPath(p) || malformedSessionChangesPath(p) || malformedSessionPollPath(p) || malformedSessionReplayPath(p) || malformedSessionMergePath(p) || malformedSessionCompactPath(p) || malformedSessionCheckpointPath(p) || malformedSessionQueryPath(p) || malformedSessionSnapshotsPath(p) || malformedSessionRestorePath(p) {
 			writeError(w, http.StatusBadRequest, "path identifiers must be non-empty strings")
 			return
 		}
